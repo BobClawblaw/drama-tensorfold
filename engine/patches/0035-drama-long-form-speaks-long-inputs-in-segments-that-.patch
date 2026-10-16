@@ -1,0 +1,1334 @@
+From 5e02ffe2da7cc3fdb4681dc2549022b33cc8b86a Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 17:54:46 +0800
+Subject: [PATCH 35/39] drama: --long-form speaks long inputs in segments that
+ hear the ones before
+
+With --long-form, a speech input longer than --long-form-chars (300) is cut at
+sentence ends, then clause marks, spaces or anywhere when one sentence is too
+long, and packed greedily into segments. Each segment's references are the
+request's, the voice's, then up to --long-form-history (1, at most 3) earlier
+segments as {their text, the codes they generated}, latest last, the oldest
+dropped when the prompt would not fit. The segments' PCM is joined with no
+added silence; each seed comes from its own rows. More than 12 segments are
+refused; 6000 frames are a budget, and a clipped segment ends the reply with
+length. X-Long-Form-Segments gives where each segment starts; streams send the
+segments in order with both headers as trailers. Without the flag, or for an
+input of one segment, nothing changes.
+
+The fixture gains the reference's rows for a voice plus one and two
+carry-overs; a scripted engine tests the joins, history, caps and streams.
+---
+ CHANGELOG.md                            |   1 +
+ docs/drama-voices.md                    |  21 ++
+ tools/zig/drama_voice_fixture.py        |  14 ++
+ zig/src/server/cli.zig                  |  41 +++-
+ zig/src/server/drama_long.zig           | 173 +++++++++++++++
+ zig/src/server/drama_voice_fixture.json |   2 +-
+ zig/src/server/drama_voice_test.zig     |  65 ++++--
+ zig/src/server/main.zig                 |   2 +-
+ zig/src/server/root.zig                 |   2 +
+ zig/src/server/serve.zig                |   6 +-
+ zig/src/server/server.zig               |   3 +
+ zig/src/server/speech.zig               |  56 +++--
+ zig/src/server/speech_long.zig          | 192 +++++++++++++++++
+ zig/src/server/speech_long_test.zig     | 275 ++++++++++++++++++++++++
+ zig/src/server/speech_stream_test.zig   |  26 ++-
+ 15 files changed, 816 insertions(+), 63 deletions(-)
+ create mode 100644 zig/src/server/drama_long.zig
+ create mode 100644 zig/src/server/speech_long.zig
+ create mode 100644 zig/src/server/speech_long_test.zig
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b292651e..ca02b0a6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
+ 
+ ## Unreleased
+ 
++- speech: `--long-form` speaks a long Drama 3 input in segments of up to `--long-form-chars` (default 300). Each segment hears the earlier segments' text and generated codes as references (`--long-form-history`, default 1), so prosody carries across the joins, and the audio is joined with no added silence. A reply has at most 12 segments and 6000 frames. `X-Long-Form-Segments` gives where each segment starts, and streams send the segments in order. With the flag off, or an input that fits in one segment, replies are unchanged ([docs](docs/drama-voices.md#long-form-replies))
+ - speech: Drama 3 speaks in a reference voice. A request can send `references: [{text, vq_codes}]`. `--voices DIR` loads voice files a request names with `voice`, and `--default-voice NAME` uses one when a request names no voice. `tools/zig/drama_voice.py` encodes a clip offline with the pinned reference's codec encoder. The prompt rows match the reference's `build_prompt_rows` (fixture-gated with the real tokenizer), and requests without a voice reference build the same prompt as before ([docs](docs/drama-voices.md))
+ - speech: `stream: true` with `response_format: pcm` streams HTTP/1.1 chunks while Drama 3 generates; incremental codec decode bit-identical to the whole decode (oracle-gated)
+ - speech: Drama 3 generates 1.66x faster on a GB10 (warm real-time factor 1.087 to 0.655 over the 23 warm items of a 48-request capture), with the audio of every normally finished reply byte for byte the same. The one-row backbone GEMVs stream their weights through a swizzled `cp.async` ring, add-norm, SwiGLU, MoE combine and attention glue are fused or pipelined in the same float order, the tower runs its one-row decode attention as a cluster kernel and samples with a radix select, and the backbone chain launches with programmatic dependent launch when both embedded kernel images carry the `drama_pdl` marker. The tower's one-row projections run on `drama_tower_gemv`, which reproduces cuBLASLt 130101's gemv summation; `Model.init` checks each projection against its actual cuBLASLt plan on probe rows and keeps cuBLASLt for any projection that differs by one bit, or on any other GPU or library.
+diff --git a/docs/drama-voices.md b/docs/drama-voices.md
+index e579eff5..2a374980 100644
+--- a/docs/drama-voices.md
++++ b/docs/drama-voices.md
+@@ -59,3 +59,24 @@ The model card's documented controls are written in the input text:
+ 
+ The prompt builder treats point tags as ordinary text, so they reach the model unchanged.
+ Pacing also follows the reference clip and the punctuation.
++
++## Long-form replies
++
++```sh
++tensorfold serve DRAMA3_DIR --voices voices/ --default-voice NAME --long-form
++```
++
++With `--long-form`, a speech input longer than `--long-form-chars` (default 300 code points) is spoken in segments instead of in one synthesis. Each segment hears the segments before it: the earlier segments' text and generated codes are added as references after the request's references and the voice's, with the latest last. This follows the way Fish's long-form inference keeps earlier segments in context.
++
++- **Segments.** The input is cut at sentence ends (`.` `!` `?` `…` followed by white space, keeping closing quotes and brackets) and at line breaks. Sentences are packed greedily up to the limit. A sentence longer than the limit is cut at `;` `:` `,`, then at spaces, then anywhere.
++- **History.** `--long-form-history K` (0 to 3, default 1) sets how many earlier segments a segment hears. The oldest is dropped when the prompt would exceed the engine's prompt limit.
++- **Audio.** The segments' audio is joined with no added silence: the pauses at the joins are the model's own.
++- **Seeds.** Each segment's seed comes from its own prompt rows, as a single synthesis's does.
++- **Limits.**
++  - More than 12 segments are refused up front.
++  - A reply may use 6000 frames in all; each segment gets at most what is left.
++  - A segment that is clipped (by the engine's frame limit or the budget) ends the reply, and its audio is kept.
++- **Response headers.** `X-Finish-Reason` is `stop` only when every segment stopped by itself. `X-Long-Form-Segments: N;S2,S3,…` gives the number of segments spoken and the sample offset at which each segment after the first starts.
++- **Streaming.** With `stream: true` the segments stream in order; first audio arrives after segment 1. Both headers come as trailers, declared by `Trailer: X-Finish-Reason, X-Long-Form-Segments`.
++
++An input that fits in one segment, and every request when `--long-form` is off, is served exactly as before.
+diff --git a/tools/zig/drama_voice_fixture.py b/tools/zig/drama_voice_fixture.py
+index 4c4f9e99..8414d843 100644
+--- a/tools/zig/drama_voice_fixture.py
++++ b/tools/zig/drama_voice_fixture.py
+@@ -29,6 +29,15 @@ ROWS = [
+     ("point-tags", "[sighs] Fine. If we miss it, it's on you. [laughs] Well, maybe that's fair.", [{"text": LIGHTHOUSE, "vq_codes": grid(5, 10)}]),
+ ]
+ 
++# Long-form segments: the voice's reference, then earlier segments as references, the latest last.
++CARRY = [
++    ("voice-and-carry", "And the second sentence follows it.", {"text": LIGHTHOUSE, "vq_codes": grid(20, 11)},
++     [{"text": "The first segment of a long reply ends here.", "vq_codes": grid(12, 12)}]),
++    ("voice-and-two-carries", "Third, and last.", {"text": LIGHTHOUSE, "vq_codes": grid(6, 13)},
++     [{"text": "One.", "vq_codes": grid(3, 14)}, {"text": "<|speaker:0|> Two, then.", "vq_codes": grid(4, 15)}]),
++    ("carry-only", "Plain voice, second part.", None, [{"text": "Plain voice, first part!", "vq_codes": grid(5, 16)}]),
++]
++
+ TEN = grid(1, 9)
+ REFUSALS = [
+     ("references-object", "hi", {"text": "x"}),
+@@ -97,6 +106,10 @@ def main() -> int:
+     for name, text, references in ROWS:
+         out = run(text, references)
+         rows.append({"name": name, "input": text, "references": references, "rows": out, "rows_sha256": rows_sha256(out)})
++    carries = []
++    for name, text, voice, carry in CARRY:
++        out = run(text, ([voice] if voice else []) + carry)
++        carries.append({"name": name, "input": text, "voice": voice, "carry": carry, "rows": out, "rows_sha256": rows_sha256(out)})
+     refusals = []
+     for name, text, references in REFUSALS:
+         try:
+@@ -111,6 +124,7 @@ def main() -> int:
+         "reference_commit": subprocess.run(["git", "-C", str(args.reference), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip(),
+         "tokenizer_sha256": hashlib.sha256(tokenizer).hexdigest(),
+         "rows": rows,
++        "carry": carries,
+         "refusals": refusals,
+     }
+     OUT.write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index 2a038e0b..4b9da3f0 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -116,6 +116,10 @@ pub const flags = [_]Flag{
+     // the native server's own: Drama 3 voice files (tools/zig/drama_voice.py), and the one ``default`` names
+     .{ .name = "--voices", .native = true },
+     .{ .name = "--default-voice", .native = true },
++    // the native server's own: long speech inputs spoken in segments that hear the ones before them
++    .{ .name = "--long-form", .kind = .store_true, .native = true },
++    .{ .name = "--long-form-chars", .native = true },
++    .{ .name = "--long-form-history", .native = true },
+ };
+ 
+ /// The variables this binary honours as the Python engine does, then the CUDA build's.
+@@ -175,6 +179,10 @@ pub const Args = struct {
+     cortheon: bool = false, // Cortheon's program, research before building, and cortheon_search/cortheon_fetch run by the server
+     voices: ?[]const u8 = null, // the directory of Drama 3 voice files a speech request's voice names
+     default_voice: ?[]const u8 = null, // the voice ``default`` (or no voice) names instead of the built-in one
++    long_form: bool = false, // a speech input longer than --long-form-chars is spoken in segments that hear earlier ones
++    long_form_chars: u32 = 300,
++    long_form_history: u8 = 1,
++    long_form_set: bool = false, // --long-form-chars or --long-form-history was given
+ };
+ 
+ /// A usage error's message (argparse's ``error:`` line); the caller exits 2.
+@@ -225,6 +233,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
+         try apply(a, &out, name, value, u, &alias, &keys);
+     }
+     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
++    if (out.long_form_set and !out.long_form) return fail(u, a, "--long-form-chars and --long-form-history need --long-form", .{});
+     try ranks(u, a, out);
+     out.alias = alias.items;
+     out.api_key = keys.items;
+@@ -253,19 +262,11 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
+             return std.mem.eql(u8, x, y);
+         }
+     }.f;
+-    if (try cudaFlag(a, out, name, v, u) or try gpuFlag(a, out, name, v, u)) return;
++    if (try cudaFlag(a, out, name, v, u) or try gpuFlag(a, out, name, v, u) or try speechFlag(a, out, name, v, u)) return;
+     if (is(name, "--chat-template")) {
+         out.chat_template = v;
+         return;
+     }
+-    if (is(name, "--voices")) {
+-        out.voices = v;
+-        return;
+-    }
+-    if (is(name, "--default-voice")) {
+-        out.default_voice = v;
+-        return;
+-    }
+     if (is(name, "--host")) out.host = v else if (is(name, "--port")) {
+         const p = try int(u, a, name, v);
+         if (p < 0 or p > 65535) return fail(u, a, "argument --port: invalid port: '{s}'", .{v});
+@@ -291,6 +292,23 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
+     } else if (is(name, "--compact-memory")) out.compact_memory = v else if (is(name, "--slide")) out.slide = true else if (is(name, "--slide-graph")) out.slide_graph = v else if (is(name, "--parallel")) out.parallel = v else if (is(name, "--backend")) out.backend = v else if (is(name, "--cortheon")) out.cortheon = true;
+ }
+ 
++/// The speech flags: voice files, the default voice, long-form and its settings; false for any other flag.
++fn speechFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage) error{ Usage, OutOfMemory }!bool {
++    const is = std.mem.eql;
++    if (is(u8, name, "--voices")) out.voices = v else if (is(u8, name, "--default-voice")) out.default_voice = v else if (is(u8, name, "--long-form")) out.long_form = true else if (is(u8, name, "--long-form-chars")) {
++        const n = try int(u, a, name, v);
++        if (n < 1 or n > 4096) return fail(u, a, "argument --long-form-chars: characters a segment holds, from 1 to 4096: '{s}'", .{v});
++        out.long_form_chars = @intCast(n);
++        out.long_form_set = true;
++    } else if (is(u8, name, "--long-form-history")) {
++        const n = try int(u, a, name, v);
++        if (n < 0 or n > 3) return fail(u, a, "argument --long-form-history: earlier segments a segment hears, from 0 to 3: '{s}'", .{v});
++        out.long_form_history = @intCast(n);
++        out.long_form_set = true;
++    } else return false;
++    return true;
++}
++
+ /// The CUDA build's --device and --segments; false for any other flag.
+ fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage) error{ Usage, OutOfMemory }!bool {
+     if (std.mem.eql(u8, name, "--device")) {
+@@ -462,6 +480,11 @@ test "parse and capabilities share the table" {
+     const voiced = try parse(a, &.{ "m", "--voices", "/v", "--default-voice=me" }, &u);
+     try std.testing.expect(std.mem.eql(u8, "/v", voiced.voices.?) and std.mem.eql(u8, "me", voiced.default_voice.?));
+     try std.testing.expect(std.mem.indexOf(u8, doc, "\"--voices\": {}") != null and std.mem.indexOf(u8, doc, "\"--default-voice\": {}") != null);
++    const plain = try parse(a, &.{"m"}, &u);
++    try std.testing.expect(!plain.long_form and plain.long_form_chars == 300 and plain.long_form_history == 1);
++    const long = try parse(a, &.{ "m", "--long-form", "--long-form-chars", "120", "--long-form-history=3" }, &u);
++    try std.testing.expect(long.long_form and long.long_form_chars == 120 and long.long_form_history == 3);
++    for ([_][]const []const u8{ &.{ "m", "--long-form-chars", "100" }, &.{ "m", "--long-form", "--long-form-history", "4" }, &.{ "m", "--long-form", "--long-form-chars", "0" } }) |bad| try std.testing.expectError(error.Usage, parse(a, bad, &u));
+     try std.testing.expect(std.mem.indexOf(u8, doc, "\"--cortheon\": {}") != null);
+     try std.testing.expectEqual(@as(?f64, 0.5), (try parse(a, &.{ "m", "--compact-at", "0.5" }, &u)).compact_fraction);
+     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--compact-at", "0" }, &u));
+diff --git a/zig/src/server/drama_long.zig b/zig/src/server/drama_long.zig
+new file mode 100644
+index 00000000..ad3dd050
+--- /dev/null
++++ b/zig/src/server/drama_long.zig
+@@ -0,0 +1,173 @@
++//! Drama 3 long-form speech: an input cut at sentence ends into segments, each spoken after hearing those before it.
++const std = @import("std");
++const drama_prompt = @import("drama_prompt.zig");
++const Reference = drama_prompt.Reference;
++const Allocator = std.mem.Allocator;
++
++/// --long-form's settings: segments of at most `chars` code points, each hearing up to `history` earlier ones.
++pub const Options = struct { chars: u32 = 300, history: u8 = 1 };
++
++pub const max_history = 3;
++pub const max_segments = 12;
++/// Frames one long-form reply may take in all; each segment gets what is left, up to the engine's own limit.
++pub const max_frames = 6000;
++
++/// Where text may be cut, coarsest first.
++const Level = enum { sentence, clause, space, any };
++
++/// The input's segments, slices of it; a sentence over `chars` is cut at ``; : ,``, then spaces, then anywhere.
++pub fn split(a: Allocator, input: []const u8, chars: u32) Allocator.Error![]const []const u8 {
++    var out: std.ArrayList([]const u8) = .empty;
++    try pack(a, &out, input, .sentence, chars);
++    return out.items;
++}
++
++/// Packs `text`'s pieces at `level` greedily into segments of at most `chars`; a longer piece is cut one level finer.
++fn pack(a: Allocator, out: *std.ArrayList([]const u8), text: []const u8, level: Level, chars: u32) Allocator.Error!void {
++    var current: ?[]const u8 = null;
++    var at: usize = 0;
++    while (nextPiece(text, &at, level, chars)) |piece| {
++        if (count(piece) > chars) {
++            if (current) |c| try out.append(a, c);
++            current = null;
++            try pack(a, out, piece, @fromBackingInt(@intCast(@backingInt(level) + 1)), chars);
++        } else if (current) |c| {
++            const joined = c.ptr[0 .. @intFromPtr(piece.ptr) + piece.len - @intFromPtr(c.ptr)];
++            if (count(joined) <= chars) {
++                current = joined;
++            } else {
++                try out.append(a, c);
++                current = piece;
++            }
++        } else current = piece;
++    }
++    if (current) |c| try out.append(a, c);
++}
++
++fn count(text: []const u8) usize {
++    return std.unicode.utf8CountCodepoints(text) catch unreachable;
++}
++
++/// Ends a sentence when followed by white space or the end; closing quotes and brackets stay with it.
++fn terminal(cp: u21) bool {
++    return cp == '.' or cp == '!' or cp == '?' or cp == 0x2026;
++}
++
++fn closer(cp: u21) bool {
++    return switch (cp) {
++        '"', '\'', ')', ']', 0x201d, 0x2019, 0xbb => true,
++        else => false,
++    };
++}
++
++fn newline(cp: u21) bool {
++    return cp == '\n' or cp == '\r' or cp == 0x2028 or cp == 0x2029;
++}
++
++/// The next non-empty piece of `text` from `at.*`, trimmed of white space, with `at.*` moved past it.
++fn nextPiece(text: []const u8, at: *usize, level: Level, chars: u32) ?[]const u8 {
++    while (at.* < text.len) {
++        const begin = at.*;
++        const end = cut(text, begin, level, chars);
++        at.* = end;
++        const piece = trim(text[begin..end]);
++        if (piece.len > 0) return piece;
++    }
++    return null;
++}
++
++/// Where the piece starting at `begin` ends (its cut point, or the end of `text`).
++fn cut(text: []const u8, begin: usize, level: Level, chars: u32) usize {
++    var it = std.unicode.Utf8View.initUnchecked(text[begin..]).iterator();
++    var seen: usize = 0;
++    while (it.nextCodepoint()) |cp| {
++        seen += 1;
++        switch (level) {
++            .sentence => {
++                if (newline(cp)) return begin + it.i;
++                if (!terminal(cp)) continue;
++                var after = it;
++                while (after.peek(1).len > 0) {
++                    const next = std.unicode.utf8Decode(after.peek(1)) catch unreachable;
++                    if (!terminal(next) and !closer(next)) break;
++                    _ = after.nextCodepoint();
++                }
++                it = after;
++                if (endsWord(text[begin..], it.i)) return begin + it.i;
++            },
++            .clause => if ((cp == ';' or cp == ':' or cp == ',') and endsWord(text[begin..], it.i)) return begin + it.i,
++            .space => if (drama_prompt.isWhiteSpace(cp)) return begin + it.i,
++            .any => if (seen == chars) return begin + it.i,
++        }
++    }
++    return text.len;
++}
++
++/// True at the end of `text` or before white space.
++fn endsWord(text: []const u8, i: usize) bool {
++    if (i == text.len) return true;
++    var it = std.unicode.Utf8View.initUnchecked(text[i..]).iterator();
++    return drama_prompt.isWhiteSpace(it.nextCodepoint().?);
++}
++
++/// `text` without leading or trailing Unicode white space.
++fn trim(text: []const u8) []const u8 {
++    const body = drama_prompt.trimStart(text);
++    var end: usize = 0;
++    var it = std.unicode.Utf8View.initUnchecked(body).iterator();
++    while (it.nextCodepoint()) |cp| if (!drama_prompt.isWhiteSpace(cp)) {
++        end = it.i;
++    };
++    return body[0..end];
++}
++
++/// A segment's references: the request's and the voice's (`base`), then the last `keep` segments heard, latest last.
++pub fn carried(a: Allocator, base: []const Reference, heard: []const Reference, keep: usize) Allocator.Error![]const Reference {
++    return std.mem.concat(a, Reference, &.{ base, heard[heard.len - keep ..] });
++}
++
++/// The X-Long-Form-Segments value: the segments spoken, then where each after the first starts, in samples.
++pub fn segmentsHeader(a: Allocator, starts: []const usize) Allocator.Error![]const u8 {
++    var out: std.ArrayList(u8) = .empty;
++    try out.print(a, "{d};", .{starts.len});
++    for (starts[1..], 0..) |start, i| try out.print(a, "{s}{d}", .{ if (i == 0) "" else ",", start });
++    return out.items;
++}
++
++fn expectSplit(input: []const u8, chars: u32, want: []const []const u8) !void {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const got = try split(arena.allocator(), input, chars);
++    std.testing.expectEqual(want.len, got.len) catch |e| {
++        for (got) |s| std.debug.print("[{s}]\n", .{s});
++        return e;
++    };
++    for (want, got) |w, g| try std.testing.expectEqualStrings(w, g);
++}
++
++test "sentences pack greedily up to the limit and keep their punctuation" {
++    try expectSplit("One. Two! Three? Four\u{2026} Five.", 10, &.{ "One. Two!", "Three?", "Four\u{2026}", "Five." });
++    try expectSplit("One. Two! Three?", 16, &.{"One. Two! Three?"});
++    try expectSplit("  First line\nSecond line.\n\n  Third  ", 12, &.{ "First line", "Second line.", "Third" });
++    // a full stop inside a number, or before a closing quote, does not end the sentence there
++    try expectSplit("Pi is 3.14 today. \"Stop.\" Then go.", 18, &.{ "Pi is 3.14 today.", "\"Stop.\" Then go." });
++    try expectSplit("Wait... what?! Yes.", 7, &.{ "Wait...", "what?!", "Yes." });
++    try expectSplit("ab", 1, &.{ "a", "b" });
++    try expectSplit(" \n\t ", 5, &.{});
++}
++
++test "a sentence longer than the limit is cut at clause marks, then spaces, then anywhere" {
++    try expectSplit("alpha, beta; gamma: delta.", 13, &.{ "alpha, beta;", "gamma: delta." });
++    // a colon inside a speaker tag is not a clause mark
++    try expectSplit("<|speaker:0|> one two, three", 14, &.{ "<|speaker:0|>", "one two,", "three" });
++    try expectSplit("aaaa bbbb cccc dddd.", 9, &.{ "aaaa bbbb", "cccc", "dddd." });
++    try expectSplit("abcdefghij k", 4, &.{ "abcd", "efgh", "ij", "k" });
++    try expectSplit("\u{3042}\u{3044}\u{3046}\u{3048}\u{304a}", 2, &.{ "\u{3042}\u{3044}", "\u{3046}\u{3048}", "\u{304a}" });
++}
++
++test "the segments header lists where each segment after the first starts" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    try std.testing.expectEqualStrings("3;2048,6144", try segmentsHeader(arena.allocator(), &.{ 0, 2048, 6144 }));
++    try std.testing.expectEqualStrings("1;", try segmentsHeader(arena.allocator(), &.{0}));
++}
+diff --git a/zig/src/server/drama_voice_fixture.json b/zig/src/server/drama_voice_fixture.json
+index 2e3166f7..573548a2 100644
+--- a/zig/src/server/drama_voice_fixture.json
++++ b/zig/src/server/drama_voice_fixture.json
+@@ -1 +1 @@
+-{"source": "sglang-omni Drama3SpeechPreprocessor; rows_sha256 hashes the rows as little-endian int64, row-major", "reference_commit": "ab095ef9e779e56af33b6ed2c863645c9903372d", "tokenizer_sha256": "0e9b9db76b2f0389b04b6ef057a2ac3b89100b7e96f2dd7034d19580a09654d6", "rows": [{"name": "plain", "input": "Hello there.", "references": [], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [21251, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1017, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "852e498e1c339892b35872d81181bd4ceff95d910b9641c83d1ba2a8e7e767b3"}, {"name": "one", "input": "Hello there.", "references": [{"text": "Hi, this is a test.", "vq_codes": [[0, 2508, 4039], [1386, 2917, 352], [1795, 3326, 761], [2204, 3735, 1170], [2613, 48, 1579], [3022, 457, 0], [3431, 4095, 2397], [0, 1275, 2806], [153, 1684, 3215], [562, 2093, 3624]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [20375, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [411, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [369, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [264, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1228, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 1386, 1795, 2204, 2613, 3022, 3431, 0, 153, 562], [250607, 2508, 2917, 3326, 3735, 48, 457, 4095, 1275, 1684, 2093], [252138, 4039, 352, 761, 1170, 1579, 0, 2397, 2806, 3215, 3624], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [21251, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1017, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "7693574947c518ac47321a8f75355a28e2c69ac3a5314f9191fb067bb52d0cce"}, {"name": "two", "input": "<|speaker:0|> Good morning, everyone.", "references": [{"text": "First clip.", "vq_codes": [[0, 3485], [2363, 3894], [2772, 207], [3181, 616], [3590, 1025], [3999, 1434], [312, 4095], [0, 2252], [1130, 2661], [1539, 3070]]}, {"text": "  <|speaker:0|> second clip", "vq_codes": [[0, 366, 1897, 3428], [3340, 775, 2306, 3837], [3749, 1184, 2715, 150], [62, 1593, 3124, 559], [471, 2002, 3533, 4095], [880, 2411, 0, 1377], [1289, 4095, 255, 1786], [0, 3229, 664, 2195], [2107, 3638, 1073, 2604], [2516, 4047, 1482, 3013]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5339, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11974, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 2363, 2772, 3181, 3590, 3999, 312, 0, 1130, 1539], [251584, 3485, 3894, 207, 616, 1025, 1434, 4095, 2252, 2661, 3070], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2018, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11974, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 3340, 3749, 62, 471, 880, 1289, 0, 2107, 2516], [248465, 366, 775, 1184, 1593, 2002, 2411, 4095, 3229, 3638, 4047], [249996, 1897, 2306, 2715, 3124, 3533, 0, 255, 664, 1073, 1482], [251527, 3428, 3837, 150, 559, 4095, 1377, 1786, 2195, 2604, 3013], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [7441, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [6353, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [4858, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "3a58aad27ae81d503317e7f3827cba37261f9ed4ba7ca46604c83440f1fe4ec9"}, {"name": "empty-transcript", "input": "Short.", "references": [{"text": "", "vq_codes": [[0], [221], [630], [1039], [1448], [1857], [2266], [0], [3084], [3493]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [695, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 221, 630, 1039, 1448, 1857, 2266, 0, 3084, 3493], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [10382, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "a5f6e3c971bcd16cd975af453f535e106c19f4d73fe276d658c1c6a968867c84"}, {"name": "missing-transcript", "input": "Short.", "references": [{"vq_codes": [[0, 2320], [1198, 2729], [1607, 3138], [2016, 3547], [2425, 3956], [2834, 269], [3243, 4095], [0, 1087], [4061, 1496], [374, 1905]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [695, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 1198, 1607, 2016, 2425, 2834, 3243, 0, 4061, 374], [250419, 2320, 2729, 3138, 3547, 3956, 269, 4095, 1087, 1496, 1905], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [10382, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "7a9f38f8e6e5eba79a7c357fa58ebba90dcb2aef2c8ad5781d68e9a1703d4a37"}, {"name": "white-space", "input": "　mid <|speaker:0|> tag", "references": [{"text": "　\n<|speaker:0|>\tspaced <|speaker:0|> twice\n", "vq_codes": [[0, 3297], [2175, 3706], [2584, 19], [2993, 428], [3402, 837], [3811, 1246], [124, 4095], [0, 2064], [942, 2473], [1351, 2882]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [21742, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [40010, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [4289, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [10598, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 2175, 2584, 2993, 3402, 3811, 124, 0, 942, 1351], [251396, 3297, 3706, 19, 428, 837, 1246, 4095, 2064, 2473, 2882], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [21742, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [15632, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [4619, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "32513a77f801a4420bedeffbf84c78483fc3e8b6da48d9ca26560bd7c1f15ecc"}, {"name": "content-tokens", "input": "hi <|audio_separator|> there", "references": [{"text": "a <|fim_prefix|> b", "vq_codes": [[0], [3152], [3561], [3970], [283], [692], [1101], [0], [1919], [2328]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [264, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248060, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [292, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 3152, 3561, 3970, 283, 692, 1101, 0, 1919, 2328], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [15131, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [252196, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1017, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "d9f5802ac93c47e8e74ff5473e3babbdf77deb840a51e89c30d9dfb0599f6878"}, {"name": "lighthouse", "input": "Attention please: the next train departs at nine.", "references": [{"text": "The old lighthouse on the northern point has guided ships through fog and storm for more than a century.", "vq_codes": [[0, 1155, 2686, 121, 1652, 3183, 618, 4095, 3680, 1115, 2646, 81, 1612, 3143, 0, 2109, 3640, 1075, 2606, 41], [33, 1564, 3095, 530, 2061, 3592, 0, 2558, 4089, 1524, 3055, 490, 2021, 4095, 987, 2518, 4049, 1484, 3015, 450], [442, 1973, 3504, 939, 2470, 4095, 1436, 2967, 402, 1933, 3464, 899, 0, 3961, 1396, 2927, 362, 1893, 3424, 4095], [851, 2382, 3913, 1348, 0, 314, 1845, 3376, 811, 2342, 3873, 4095, 2839, 274, 1805, 3336, 771, 2302, 0, 1268], [1260, 2791, 226, 4095, 3288, 723, 2254, 3785, 1220, 2751, 0, 1717, 3248, 683, 2214, 3745, 1180, 4095, 146, 1677], [1669, 3200, 0, 2166, 3697, 1132, 2663, 98, 1629, 4095, 595, 2126, 3657, 1092, 2623, 58, 0, 3120, 555, 2086], [2078, 4095, 1044, 2575, 10, 1541, 3072, 507, 0, 3569, 1004, 2535, 4066, 1501, 3032, 4095, 1998, 3529, 964, 2495], [0, 4018, 1453, 2984, 419, 1950, 3481, 4095, 2447, 3978, 1413, 2944, 379, 1910, 0, 876, 2407, 3938, 1373, 2904], [2896, 331, 1862, 3393, 828, 2359, 0, 1325, 2856, 291, 1822, 3353, 788, 4095, 3850, 1285, 2816, 251, 1782, 3313], [3305, 740, 2271, 3802, 1237, 4095, 203, 1734, 3265, 700, 2231, 3762, 0, 2728, 163, 1694, 3225, 660, 2191, 4095]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [561, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2235, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [324, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [55965, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [383, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17631, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1406, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [682, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [31511, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17199, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1472, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [29262, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [321, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13071, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [364, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [777, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1056, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [264, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [9018, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 33, 442, 851, 1260, 1669, 2078, 0, 2896, 3305], [249254, 1155, 1564, 1973, 2382, 2791, 3200, 4095, 4018, 331, 740], [250785, 2686, 3095, 3504, 3913, 226, 0, 1044, 1453, 1862, 2271], [248220, 121, 530, 939, 1348, 4095, 2166, 2575, 2984, 3393, 3802], [249751, 1652, 2061, 2470, 0, 3288, 3697, 10, 419, 828, 1237], [251282, 3183, 3592, 4095, 314, 723, 1132, 1541, 1950, 2359, 4095], [248717, 618, 0, 1436, 1845, 2254, 2663, 3072, 3481, 0, 203], [252194, 4095, 2558, 2967, 3376, 3785, 98, 507, 4095, 1325, 1734], [251779, 3680, 4089, 402, 811, 1220, 1629, 0, 2447, 2856, 3265], [249214, 1115, 1524, 1933, 2342, 2751, 4095, 3569, 3978, 291, 700], [250745, 2646, 3055, 3464, 3873, 0, 595, 1004, 1413, 1822, 2231], [248180, 81, 490, 899, 4095, 1717, 2126, 2535, 2944, 3353, 3762], [249711, 1612, 2021, 0, 2839, 3248, 3657, 4066, 379, 788, 0], [251242, 3143, 4095, 3961, 274, 683, 1092, 1501, 1910, 4095, 2728], [248099, 0, 987, 1396, 1805, 2214, 2623, 3032, 0, 3850, 163], [250208, 2109, 2518, 2927, 3336, 3745, 58, 4095, 876, 1285, 1694], [251739, 3640, 4049, 362, 771, 1180, 0, 1998, 2407, 2816, 3225], [249174, 1075, 1484, 1893, 2302, 4095, 3120, 3529, 3938, 251, 660], [250705, 2606, 3015, 3424, 0, 146, 555, 964, 1373, 1782, 2191], [248140, 41, 450, 4095, 1268, 1677, 2086, 2495, 2904, 3313, 4095], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [59930, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [4338, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1727, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5257, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [6819, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [506, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11292, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "438bc92e9a3d05977406179170a88644756af654597f27358d8ba7b9e98260ab"}, {"name": "point-tags", "input": "[sighs] Fine. If we miss it, it's on you. [laughs] Well, maybe that's fair.", "references": [{"text": "The old lighthouse on the northern point has guided ships through fog and storm for more than a century.", "vq_codes": [[0, 3109, 544, 2075, 3606], [1987, 3518, 953, 2484, 4015], [2396, 3927, 1362, 2893, 328], [2805, 240, 1771, 3302, 0], [3214, 649, 2180, 4095, 1146], [3623, 1058, 0, 24, 1555], [4032, 4095, 2998, 433, 1964], [0, 1876, 3407, 842, 2373], [754, 2285, 3816, 1251, 2782], [1163, 2694, 129, 1660, 3191]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [561, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2235, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [324, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [55965, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [383, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17631, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1406, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [682, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [31511, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17199, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1472, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [29262, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [321, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13071, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [364, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [777, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1056, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [264, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [9018, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 1987, 2396, 2805, 3214, 3623, 4032, 0, 754, 1163], [251208, 3109, 3518, 3927, 240, 649, 1058, 4095, 1876, 2285, 2694], [248643, 544, 953, 1362, 1771, 2180, 0, 2998, 3407, 3816, 129], [250174, 2075, 2484, 2893, 3302, 4095, 24, 433, 842, 1251, 1660], [251705, 3606, 4015, 328, 0, 1146, 1555, 1964, 2373, 2782, 3191], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [498, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [82, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1055, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [82, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [29169, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1368, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [567, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3016, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [424, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [424, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [579, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [383, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [488, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [498, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [69997, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8066, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [6970, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [421, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [579, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [6415, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "c15d3b6103f94b82a8271949978aa79bb409c446600e7e2c74776d9c728b888b"}], "refusals": [{"name": "references-object", "input": "hi", "references": {"text": "x"}, "message": "Drama 3 request: references must be a list of objects"}, {"name": "references-scalar", "input": "hi", "references": [1], "message": "Drama 3 request: references must be a list of objects"}, {"name": "text-number", "input": "hi", "references": [{"text": 3, "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: references.0.text must be a string"}, {"name": "other-speaker", "input": "hi", "references": [{"text": "<|speaker:3|> x", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: only speaker 0 is supported; got speaker tags [3]"}, {"name": "other-speaker-input", "input": "<|speaker:2|> hi", "references": [{"text": "<|speaker:5|> x", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: only speaker 0 is supported; got speaker tags [2, 5]"}, {"name": "no-codes", "input": "hi", "references": [{"text": "x"}], "message": "Drama 3 request: references.0 needs audio or vq_codes"}, {"name": "null-codes", "input": "hi", "references": [{"text": "x", "vq_codes": null}], "message": "Drama 3 request: references.0 needs audio or vq_codes"}, {"name": "ragged", "input": "hi", "references": [{"text": "x", "vq_codes": [[1, 2], [3]]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "empty-grid", "input": "hi", "references": [{"text": "x", "vq_codes": []}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "empty-row", "input": "hi", "references": [{"text": "x", "vq_codes": [[]]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "float", "input": "hi", "references": [{"text": "x", "vq_codes": [[1.5]]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "bool", "input": "hi", "references": [{"text": "x", "vq_codes": [[true]]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "flat", "input": "hi", "references": [{"text": "x", "vq_codes": [1, 2]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "past-int64", "input": "hi", "references": [{"text": "x", "vq_codes": [[9223372036854775808]]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "codebooks", "input": "hi", "references": [{"text": "x", "vq_codes": [[1, 2]]}], "message": "Drama 3 request: references.0: audio codes must be an int32 or int64 [10, frames] tensor with at least one frame; got torch.int64 (1, 2)"}, {"name": "too-high", "input": "hi", "references": [{"text": "x", "vq_codes": [[4096], [4096], [4096], [4096], [4096], [4096], [4096], [4096], [4096], [4096]]}], "message": "Drama 3 request: references.0: audio codes must be in [0, 4096)"}, {"name": "negative", "input": "hi", "references": [{"text": "x", "vq_codes": [[-1], [-1], [-1], [-1], [-1], [-1], [-1], [-1], [-1], [-1]]}], "message": "Drama 3 request: references.0: audio codes must be in [0, 4096)"}, {"name": "huge-in-range-shape", "input": "hi", "references": [{"text": "x", "vq_codes": [[-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808]]}], "message": "Drama 3 request: references.0: audio codes must be in [0, 4096)"}, {"name": "structural", "input": "hi", "references": [{"text": "a <|im_end|> b", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: references.0: <|im_end|> is written by the prompt builder and must not appear in caller text"}, {"name": "bad-tag", "input": "hi", "references": [{"text": "<|speaker:01|> x", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: references.0: speaker tags must be written <|speaker:N|> with N in 0..15 and no leading zero; got '<|speaker:01|> x'"}, {"name": "bad-tag-inside", "input": "hi", "references": [{"text": "a <|speaker:99|>", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: references.0: speaker tags must be written <|speaker:N|> with N in 0..15 and no leading zero; got '<|speaker:0|> a <|speaker:99|>'"}, {"name": "grid-before-text", "input": "hi", "references": [{"text": "<|voice|>", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}, {"text": "y", "vq_codes": [[1], [2, 3]]}], "message": "Drama 3 request: references.1.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "text-before-shape", "input": "hi", "references": [{"text": "<|voice|>", "vq_codes": [[1]]}], "message": "Drama 3 request: references.0: <|voice|> is written by the prompt builder and must not appear in caller text"}, {"name": "second-reference", "input": "hi", "references": [{"text": "fine", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}, {"text": "fine", "vq_codes": [[7], [7], [7], [7], [7], [7], [7], [7], [7]]}], "message": "Drama 3 request: references.1: audio codes must be an int32 or int64 [10, frames] tensor with at least one frame; got torch.int64 (9, 1)"}, {"name": "input-empty", "input": " 　", "references": [{"text": "fine", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: input: text must not be empty"}, {"name": "input-structural", "input": "say <|semantic:3|>", "references": [{"text": "fine", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: input: <|semantic: is written by the prompt builder and must not appear in caller text"}]}
++{"source": "sglang-omni Drama3SpeechPreprocessor; rows_sha256 hashes the rows as little-endian int64, row-major", "reference_commit": "ab095ef9e779e56af33b6ed2c863645c9903372d", "tokenizer_sha256": "0e9b9db76b2f0389b04b6ef057a2ac3b89100b7e96f2dd7034d19580a09654d6", "rows": [{"name": "plain", "input": "Hello there.", "references": [], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [21251, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1017, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "852e498e1c339892b35872d81181bd4ceff95d910b9641c83d1ba2a8e7e767b3"}, {"name": "one", "input": "Hello there.", "references": [{"text": "Hi, this is a test.", "vq_codes": [[0, 2508, 4039], [1386, 2917, 352], [1795, 3326, 761], [2204, 3735, 1170], [2613, 48, 1579], [3022, 457, 0], [3431, 4095, 2397], [0, 1275, 2806], [153, 1684, 3215], [562, 2093, 3624]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [20375, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [411, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [369, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [264, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1228, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 1386, 1795, 2204, 2613, 3022, 3431, 0, 153, 562], [250607, 2508, 2917, 3326, 3735, 48, 457, 4095, 1275, 1684, 2093], [252138, 4039, 352, 761, 1170, 1579, 0, 2397, 2806, 3215, 3624], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [21251, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1017, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "7693574947c518ac47321a8f75355a28e2c69ac3a5314f9191fb067bb52d0cce"}, {"name": "two", "input": "<|speaker:0|> Good morning, everyone.", "references": [{"text": "First clip.", "vq_codes": [[0, 3485], [2363, 3894], [2772, 207], [3181, 616], [3590, 1025], [3999, 1434], [312, 4095], [0, 2252], [1130, 2661], [1539, 3070]]}, {"text": "  <|speaker:0|> second clip", "vq_codes": [[0, 366, 1897, 3428], [3340, 775, 2306, 3837], [3749, 1184, 2715, 150], [62, 1593, 3124, 559], [471, 2002, 3533, 4095], [880, 2411, 0, 1377], [1289, 4095, 255, 1786], [0, 3229, 664, 2195], [2107, 3638, 1073, 2604], [2516, 4047, 1482, 3013]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5339, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11974, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 2363, 2772, 3181, 3590, 3999, 312, 0, 1130, 1539], [251584, 3485, 3894, 207, 616, 1025, 1434, 4095, 2252, 2661, 3070], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2018, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11974, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 3340, 3749, 62, 471, 880, 1289, 0, 2107, 2516], [248465, 366, 775, 1184, 1593, 2002, 2411, 4095, 3229, 3638, 4047], [249996, 1897, 2306, 2715, 3124, 3533, 0, 255, 664, 1073, 1482], [251527, 3428, 3837, 150, 559, 4095, 1377, 1786, 2195, 2604, 3013], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [7441, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [6353, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [4858, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "3a58aad27ae81d503317e7f3827cba37261f9ed4ba7ca46604c83440f1fe4ec9"}, {"name": "empty-transcript", "input": "Short.", "references": [{"text": "", "vq_codes": [[0], [221], [630], [1039], [1448], [1857], [2266], [0], [3084], [3493]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [695, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 221, 630, 1039, 1448, 1857, 2266, 0, 3084, 3493], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [10382, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "a5f6e3c971bcd16cd975af453f535e106c19f4d73fe276d658c1c6a968867c84"}, {"name": "missing-transcript", "input": "Short.", "references": [{"vq_codes": [[0, 2320], [1198, 2729], [1607, 3138], [2016, 3547], [2425, 3956], [2834, 269], [3243, 4095], [0, 1087], [4061, 1496], [374, 1905]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [695, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 1198, 1607, 2016, 2425, 2834, 3243, 0, 4061, 374], [250419, 2320, 2729, 3138, 3547, 3956, 269, 4095, 1087, 1496, 1905], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [10382, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "7a9f38f8e6e5eba79a7c357fa58ebba90dcb2aef2c8ad5781d68e9a1703d4a37"}, {"name": "white-space", "input": "　mid <|speaker:0|> tag", "references": [{"text": "　\n<|speaker:0|>\tspaced <|speaker:0|> twice\n", "vq_codes": [[0, 3297], [2175, 3706], [2584, 19], [2993, 428], [3402, 837], [3811, 1246], [124, 4095], [0, 2064], [942, 2473], [1351, 2882]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [21742, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [40010, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [4289, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [10598, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 2175, 2584, 2993, 3402, 3811, 124, 0, 942, 1351], [251396, 3297, 3706, 19, 428, 837, 1246, 4095, 2064, 2473, 2882], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [21742, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [15632, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [4619, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "32513a77f801a4420bedeffbf84c78483fc3e8b6da48d9ca26560bd7c1f15ecc"}, {"name": "content-tokens", "input": "hi <|audio_separator|> there", "references": [{"text": "a <|fim_prefix|> b", "vq_codes": [[0], [3152], [3561], [3970], [283], [692], [1101], [0], [1919], [2328]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [264, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248060, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [292, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 3152, 3561, 3970, 283, 692, 1101, 0, 1919, 2328], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [15131, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [252196, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1017, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "d9f5802ac93c47e8e74ff5473e3babbdf77deb840a51e89c30d9dfb0599f6878"}, {"name": "lighthouse", "input": "Attention please: the next train departs at nine.", "references": [{"text": "The old lighthouse on the northern point has guided ships through fog and storm for more than a century.", "vq_codes": [[0, 1155, 2686, 121, 1652, 3183, 618, 4095, 3680, 1115, 2646, 81, 1612, 3143, 0, 2109, 3640, 1075, 2606, 41], [33, 1564, 3095, 530, 2061, 3592, 0, 2558, 4089, 1524, 3055, 490, 2021, 4095, 987, 2518, 4049, 1484, 3015, 450], [442, 1973, 3504, 939, 2470, 4095, 1436, 2967, 402, 1933, 3464, 899, 0, 3961, 1396, 2927, 362, 1893, 3424, 4095], [851, 2382, 3913, 1348, 0, 314, 1845, 3376, 811, 2342, 3873, 4095, 2839, 274, 1805, 3336, 771, 2302, 0, 1268], [1260, 2791, 226, 4095, 3288, 723, 2254, 3785, 1220, 2751, 0, 1717, 3248, 683, 2214, 3745, 1180, 4095, 146, 1677], [1669, 3200, 0, 2166, 3697, 1132, 2663, 98, 1629, 4095, 595, 2126, 3657, 1092, 2623, 58, 0, 3120, 555, 2086], [2078, 4095, 1044, 2575, 10, 1541, 3072, 507, 0, 3569, 1004, 2535, 4066, 1501, 3032, 4095, 1998, 3529, 964, 2495], [0, 4018, 1453, 2984, 419, 1950, 3481, 4095, 2447, 3978, 1413, 2944, 379, 1910, 0, 876, 2407, 3938, 1373, 2904], [2896, 331, 1862, 3393, 828, 2359, 0, 1325, 2856, 291, 1822, 3353, 788, 4095, 3850, 1285, 2816, 251, 1782, 3313], [3305, 740, 2271, 3802, 1237, 4095, 203, 1734, 3265, 700, 2231, 3762, 0, 2728, 163, 1694, 3225, 660, 2191, 4095]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [561, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2235, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [324, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [55965, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [383, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17631, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1406, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [682, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [31511, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17199, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1472, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [29262, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [321, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13071, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [364, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [777, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1056, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [264, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [9018, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 33, 442, 851, 1260, 1669, 2078, 0, 2896, 3305], [249254, 1155, 1564, 1973, 2382, 2791, 3200, 4095, 4018, 331, 740], [250785, 2686, 3095, 3504, 3913, 226, 0, 1044, 1453, 1862, 2271], [248220, 121, 530, 939, 1348, 4095, 2166, 2575, 2984, 3393, 3802], [249751, 1652, 2061, 2470, 0, 3288, 3697, 10, 419, 828, 1237], [251282, 3183, 3592, 4095, 314, 723, 1132, 1541, 1950, 2359, 4095], [248717, 618, 0, 1436, 1845, 2254, 2663, 3072, 3481, 0, 203], [252194, 4095, 2558, 2967, 3376, 3785, 98, 507, 4095, 1325, 1734], [251779, 3680, 4089, 402, 811, 1220, 1629, 0, 2447, 2856, 3265], [249214, 1115, 1524, 1933, 2342, 2751, 4095, 3569, 3978, 291, 700], [250745, 2646, 3055, 3464, 3873, 0, 595, 1004, 1413, 1822, 2231], [248180, 81, 490, 899, 4095, 1717, 2126, 2535, 2944, 3353, 3762], [249711, 1612, 2021, 0, 2839, 3248, 3657, 4066, 379, 788, 0], [251242, 3143, 4095, 3961, 274, 683, 1092, 1501, 1910, 4095, 2728], [248099, 0, 987, 1396, 1805, 2214, 2623, 3032, 0, 3850, 163], [250208, 2109, 2518, 2927, 3336, 3745, 58, 4095, 876, 1285, 1694], [251739, 3640, 4049, 362, 771, 1180, 0, 1998, 2407, 2816, 3225], [249174, 1075, 1484, 1893, 2302, 4095, 3120, 3529, 3938, 251, 660], [250705, 2606, 3015, 3424, 0, 146, 555, 964, 1373, 1782, 2191], [248140, 41, 450, 4095, 1268, 1677, 2086, 2495, 2904, 3313, 4095], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [59930, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [4338, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1727, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5257, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [6819, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [506, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11292, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "438bc92e9a3d05977406179170a88644756af654597f27358d8ba7b9e98260ab"}, {"name": "point-tags", "input": "[sighs] Fine. If we miss it, it's on you. [laughs] Well, maybe that's fair.", "references": [{"text": "The old lighthouse on the northern point has guided ships through fog and storm for more than a century.", "vq_codes": [[0, 3109, 544, 2075, 3606], [1987, 3518, 953, 2484, 4015], [2396, 3927, 1362, 2893, 328], [2805, 240, 1771, 3302, 0], [3214, 649, 2180, 4095, 1146], [3623, 1058, 0, 24, 1555], [4032, 4095, 2998, 433, 1964], [0, 1876, 3407, 842, 2373], [754, 2285, 3816, 1251, 2782], [1163, 2694, 129, 1660, 3191]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [561, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2235, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [324, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [55965, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [383, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17631, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1406, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [682, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [31511, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17199, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1472, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [29262, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [321, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13071, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [364, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [777, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1056, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [264, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [9018, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 1987, 2396, 2805, 3214, 3623, 4032, 0, 754, 1163], [251208, 3109, 3518, 3927, 240, 649, 1058, 4095, 1876, 2285, 2694], [248643, 544, 953, 1362, 1771, 2180, 0, 2998, 3407, 3816, 129], [250174, 2075, 2484, 2893, 3302, 4095, 24, 433, 842, 1251, 1660], [251705, 3606, 4015, 328, 0, 1146, 1555, 1964, 2373, 2782, 3191], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [498, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [82, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1055, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [82, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [29169, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1368, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [567, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3016, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [424, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [424, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [579, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [383, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [488, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [498, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [69997, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8066, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [6970, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [421, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [579, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [6415, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "c15d3b6103f94b82a8271949978aa79bb409c446600e7e2c74776d9c728b888b"}], "carry": [{"name": "voice-and-carry", "input": "And the second sentence follows it.", "voice": {"text": "The old lighthouse on the northern point has guided ships through fog and storm for more than a century.", "vq_codes": [[0, 4086, 1521, 3052, 487, 2018, 3549, 4095, 2515, 4046, 1481, 3012, 447, 1978, 0, 944, 2475, 4006, 1441, 2972], [2964, 399, 1930, 3461, 896, 2427, 0, 1393, 2924, 359, 1890, 3421, 856, 4095, 3918, 1353, 2884, 319, 1850, 3381], [3373, 808, 2339, 3870, 1305, 4095, 271, 1802, 3333, 768, 2299, 3830, 0, 2796, 231, 1762, 3293, 728, 2259, 4095], [3782, 1217, 2748, 183, 0, 3245, 680, 2211, 3742, 1177, 2708, 4095, 1674, 3205, 640, 2171, 3702, 1137, 0, 103], [95, 1626, 3157, 4095, 2123, 3654, 1089, 2620, 55, 1586, 0, 552, 2083, 3614, 1049, 2580, 15, 4095, 3077, 512], [504, 2035, 0, 1001, 2532, 4063, 1498, 3029, 464, 4095, 3526, 961, 2492, 4023, 1458, 2989, 0, 1955, 3486, 921], [913, 4095, 3975, 1410, 2941, 376, 1907, 3438, 0, 2404, 3935, 1370, 2901, 336, 1867, 4095, 833, 2364, 3895, 1330], [0, 2853, 288, 1819, 3350, 785, 2316, 4095, 1282, 2813, 248, 1779, 3310, 745, 0, 3807, 1242, 2773, 208, 1739], [1731, 3262, 697, 2228, 3759, 1194, 0, 160, 1691, 3222, 657, 2188, 3719, 4095, 2685, 120, 1651, 3182, 617, 2148], [2140, 3671, 1106, 2637, 72, 4095, 3134, 569, 2100, 3631, 1066, 2597, 0, 1563, 3094, 529, 2060, 3591, 1026, 4095]]}, "carry": [{"text": "The first segment of a long reply ends here.", "vq_codes": [[0, 967, 2498, 4029, 1464, 2995, 430, 4095, 3492, 927, 2458, 3989], [3941, 1376, 2907, 342, 1873, 3404, 0, 2370, 3901, 1336, 2867, 302], [254, 1785, 3316, 751, 2282, 4095, 1248, 2779, 214, 1745, 3276, 711], [663, 2194, 3725, 1160, 0, 126, 1657, 3188, 623, 2154, 3685, 4095], [1072, 2603, 38, 4095, 3100, 535, 2066, 3597, 1032, 2563, 0, 1529], [1481, 3012, 0, 1978, 3509, 944, 2475, 4006, 1441, 4095, 407, 1938], [1890, 4095, 856, 2387, 3918, 1353, 2884, 319, 0, 3381, 816, 2347], [0, 3830, 1265, 2796, 231, 1762, 3293, 4095, 2259, 3790, 1225, 2756], [2708, 143, 1674, 3205, 640, 2171, 0, 1137, 2668, 103, 1634, 3165], [3117, 552, 2083, 3614, 1049, 4095, 15, 1546, 3077, 512, 2043, 3574]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [561, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2235, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [324, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [55965, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [383, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17631, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1406, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [682, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [31511, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17199, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1472, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [29262, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [321, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13071, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [364, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [777, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1056, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [264, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [9018, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 2964, 3373, 3782, 95, 504, 913, 0, 1731, 2140], [252185, 4086, 399, 808, 1217, 1626, 2035, 4095, 2853, 3262, 3671], [249620, 1521, 1930, 2339, 2748, 3157, 0, 3975, 288, 697, 1106], [251151, 3052, 3461, 3870, 183, 4095, 1001, 1410, 1819, 2228, 2637], [248586, 487, 896, 1305, 0, 2123, 2532, 2941, 3350, 3759, 72], [250117, 2018, 2427, 4095, 3245, 3654, 4063, 376, 785, 1194, 4095], [251648, 3549, 0, 271, 680, 1089, 1498, 1907, 2316, 0, 3134], [252194, 4095, 1393, 1802, 2211, 2620, 3029, 3438, 4095, 160, 569], [250614, 2515, 2924, 3333, 3742, 55, 464, 0, 1282, 1691, 2100], [252145, 4046, 359, 768, 1177, 1586, 4095, 2404, 2813, 3222, 3631], [249580, 1481, 1890, 2299, 2708, 0, 3526, 3935, 248, 657, 1066], [251111, 3012, 3421, 3830, 4095, 552, 961, 1370, 1779, 2188, 2597], [248546, 447, 856, 0, 1674, 2083, 2492, 2901, 3310, 3719, 0], [250077, 1978, 4095, 2796, 3205, 3614, 4023, 336, 745, 4095, 1563], [248099, 0, 3918, 231, 640, 1049, 1458, 1867, 0, 2685, 3094], [249043, 944, 1353, 1762, 2171, 2580, 2989, 4095, 3807, 120, 529], [250574, 2475, 2884, 3293, 3702, 15, 0, 833, 1242, 1651, 2060], [252105, 4006, 319, 728, 1137, 4095, 1955, 2364, 2773, 3182, 3591], [249540, 1441, 1850, 2259, 0, 3077, 3486, 3895, 208, 617, 1026], [251071, 2972, 3381, 4095, 103, 512, 921, 1330, 1739, 2148, 4095], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [561, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1118, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [9933, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [314, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [264, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1248, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [9559, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [10029, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1532, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 3941, 254, 663, 1072, 1481, 1890, 0, 2708, 3117], [249066, 967, 1376, 1785, 2194, 2603, 3012, 4095, 3830, 143, 552], [250597, 2498, 2907, 3316, 3725, 38, 0, 856, 1265, 1674, 2083], [252128, 4029, 342, 751, 1160, 4095, 1978, 2387, 2796, 3205, 3614], [249563, 1464, 1873, 2282, 0, 3100, 3509, 3918, 231, 640, 1049], [251094, 2995, 3404, 4095, 126, 535, 944, 1353, 1762, 2171, 4095], [248529, 430, 0, 1248, 1657, 2066, 2475, 2884, 3293, 0, 15], [252194, 4095, 2370, 2779, 3188, 3597, 4006, 319, 4095, 1137, 1546], [251591, 3492, 3901, 214, 623, 1032, 1441, 0, 2259, 2668, 3077], [249026, 927, 1336, 1745, 2154, 2563, 4095, 3381, 3790, 103, 512], [250557, 2458, 2867, 3276, 3685, 0, 407, 816, 1225, 1634, 2043], [252088, 3989, 302, 711, 4095, 1529, 1938, 2347, 2756, 3165, 3574], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1541, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2018, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11316, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [10695, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [424, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "69fa1b4e0b88a872e3a57355249193257c8e3292d6194359bc24a1ab212db66e"}, {"name": "voice-and-two-carries", "input": "Third, and last.", "voice": {"text": "The old lighthouse on the northern point has guided ships through fog and storm for more than a century.", "vq_codes": [[0, 1944, 3475, 910, 2441, 3972], [822, 2353, 3884, 1319, 2850, 285], [1231, 2762, 197, 1728, 3259, 4095], [1640, 3171, 606, 2137, 0, 1103], [2049, 3580, 1015, 4095, 4077, 1512], [2458, 3989, 0, 2955, 390, 1921], [2867, 4095, 1833, 3364, 799, 2330], [0, 711, 2242, 3773, 1208, 2739], [3685, 1120, 2651, 86, 1617, 3148], [4094, 1529, 3060, 495, 2026, 4095]]}, "carry": [{"text": "One.", "vq_codes": [[0, 2921, 356], [1799, 3330, 765], [2208, 3739, 1174], [2617, 52, 1583], [3026, 461, 1992], [3435, 870, 0], [3844, 4095, 2810], [0, 1688, 3219], [566, 2097, 3628], [975, 2506, 4037]]}, {"text": "<|speaker:0|> Two, then.", "vq_codes": [[0, 3898, 1333, 2864], [2776, 211, 1742, 3273], [3185, 620, 2151, 3682], [3594, 1029, 2560, 4091], [4003, 1438, 2969, 4095], [316, 1847, 0, 813], [725, 4095, 3787, 1222], [0, 2665, 100, 1631], [1543, 3074, 509, 2040], [1952, 3483, 918, 2449]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [561, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2235, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [324, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [55965, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [383, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17631, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1406, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [682, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [31511, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17199, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1472, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [29262, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [321, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13071, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [364, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [777, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1056, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [264, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [9018, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 822, 1231, 1640, 2049, 2458, 2867, 0, 3685, 4094], [250043, 1944, 2353, 2762, 3171, 3580, 3989, 4095, 711, 1120, 1529], [251574, 3475, 3884, 197, 606, 1015, 0, 1833, 2242, 2651, 3060], [249009, 910, 1319, 1728, 2137, 4095, 2955, 3364, 3773, 86, 495], [250540, 2441, 2850, 3259, 0, 4077, 390, 799, 1208, 1617, 2026], [252071, 3972, 285, 4095, 1103, 1512, 1921, 2330, 2739, 3148, 4095], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3648, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 1799, 2208, 2617, 3026, 3435, 3844, 0, 566, 975], [251020, 2921, 3330, 3739, 52, 461, 870, 4095, 1688, 2097, 2506], [248455, 356, 765, 1174, 1583, 1992, 0, 2810, 3219, 3628, 4037], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8771, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1179, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 2776, 3185, 3594, 4003, 316, 725, 0, 1543, 1952], [251997, 3898, 211, 620, 1029, 1438, 1847, 4095, 2665, 3074, 3483], [249432, 1333, 1742, 2151, 2560, 2969, 0, 3787, 100, 509, 918], [250963, 2864, 3273, 3682, 4091, 4095, 813, 1222, 1631, 2040, 2449], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [20226, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [321, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1483, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "7bd0ae46537adac02474899891aa9600af242b0280cdf9c9ea039161df0f55ae"}, {"name": "carry-only", "input": "Plain voice, second part.", "voice": null, "carry": [{"text": "Plain voice, first part!", "vq_codes": [[0, 779, 2310, 3841, 1276], [3753, 1188, 2719, 154, 1685], [66, 1597, 3128, 563, 2094], [475, 2006, 3537, 972, 0], [884, 2415, 3946, 4095, 2912], [1293, 2824, 0, 1790, 3321], [1702, 4095, 668, 2199, 3730], [0, 3642, 1077, 2608, 43], [2520, 4051, 1486, 3017, 452], [2929, 364, 1895, 3426, 861]]}], "rows": [[248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8678, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13761, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [3766, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1414, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8540, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [5604, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [310, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [279, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2614, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [271, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [8589, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [41774, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [7497, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [1118, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [919, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [53757, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [220, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248099, 0, 3753, 66, 475, 884, 1293, 1702, 0, 2520, 2929], [248878, 779, 1188, 1597, 2006, 2415, 2824, 4095, 3642, 4051, 364], [250409, 2310, 2719, 3128, 3537, 3946, 0, 668, 1077, 1486, 1895], [251940, 3841, 154, 563, 972, 4095, 1790, 2199, 2608, 3017, 3426], [249375, 1276, 1685, 2094, 0, 2912, 3321, 3730, 43, 452, 861], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [846, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248083, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [41774, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [7497, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [2018, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [919, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248046, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248045, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [74455, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [248081, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], "rows_sha256": "bd65c8c110be58df27d8c9a26262cc34ec7d23daf5b605f6ac3b26c16a5f5cb8"}], "refusals": [{"name": "references-object", "input": "hi", "references": {"text": "x"}, "message": "Drama 3 request: references must be a list of objects"}, {"name": "references-scalar", "input": "hi", "references": [1], "message": "Drama 3 request: references must be a list of objects"}, {"name": "text-number", "input": "hi", "references": [{"text": 3, "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: references.0.text must be a string"}, {"name": "other-speaker", "input": "hi", "references": [{"text": "<|speaker:3|> x", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: only speaker 0 is supported; got speaker tags [3]"}, {"name": "other-speaker-input", "input": "<|speaker:2|> hi", "references": [{"text": "<|speaker:5|> x", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: only speaker 0 is supported; got speaker tags [2, 5]"}, {"name": "no-codes", "input": "hi", "references": [{"text": "x"}], "message": "Drama 3 request: references.0 needs audio or vq_codes"}, {"name": "null-codes", "input": "hi", "references": [{"text": "x", "vq_codes": null}], "message": "Drama 3 request: references.0 needs audio or vq_codes"}, {"name": "ragged", "input": "hi", "references": [{"text": "x", "vq_codes": [[1, 2], [3]]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "empty-grid", "input": "hi", "references": [{"text": "x", "vq_codes": []}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "empty-row", "input": "hi", "references": [{"text": "x", "vq_codes": [[]]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "float", "input": "hi", "references": [{"text": "x", "vq_codes": [[1.5]]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "bool", "input": "hi", "references": [{"text": "x", "vq_codes": [[true]]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "flat", "input": "hi", "references": [{"text": "x", "vq_codes": [1, 2]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "past-int64", "input": "hi", "references": [{"text": "x", "vq_codes": [[9223372036854775808]]}], "message": "Drama 3 request: references.0.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "codebooks", "input": "hi", "references": [{"text": "x", "vq_codes": [[1, 2]]}], "message": "Drama 3 request: references.0: audio codes must be an int32 or int64 [10, frames] tensor with at least one frame; got torch.int64 (1, 2)"}, {"name": "too-high", "input": "hi", "references": [{"text": "x", "vq_codes": [[4096], [4096], [4096], [4096], [4096], [4096], [4096], [4096], [4096], [4096]]}], "message": "Drama 3 request: references.0: audio codes must be in [0, 4096)"}, {"name": "negative", "input": "hi", "references": [{"text": "x", "vq_codes": [[-1], [-1], [-1], [-1], [-1], [-1], [-1], [-1], [-1], [-1]]}], "message": "Drama 3 request: references.0: audio codes must be in [0, 4096)"}, {"name": "huge-in-range-shape", "input": "hi", "references": [{"text": "x", "vq_codes": [[-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808], [-9223372036854775808]]}], "message": "Drama 3 request: references.0: audio codes must be in [0, 4096)"}, {"name": "structural", "input": "hi", "references": [{"text": "a <|im_end|> b", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: references.0: <|im_end|> is written by the prompt builder and must not appear in caller text"}, {"name": "bad-tag", "input": "hi", "references": [{"text": "<|speaker:01|> x", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: references.0: speaker tags must be written <|speaker:N|> with N in 0..15 and no leading zero; got '<|speaker:01|> x'"}, {"name": "bad-tag-inside", "input": "hi", "references": [{"text": "a <|speaker:99|>", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: references.0: speaker tags must be written <|speaker:N|> with N in 0..15 and no leading zero; got '<|speaker:0|> a <|speaker:99|>'"}, {"name": "grid-before-text", "input": "hi", "references": [{"text": "<|voice|>", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}, {"text": "y", "vq_codes": [[1], [2, 3]]}], "message": "Drama 3 request: references.1.vq_codes must be a [codebooks, frames] grid of int64 integers"}, {"name": "text-before-shape", "input": "hi", "references": [{"text": "<|voice|>", "vq_codes": [[1]]}], "message": "Drama 3 request: references.0: <|voice|> is written by the prompt builder and must not appear in caller text"}, {"name": "second-reference", "input": "hi", "references": [{"text": "fine", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}, {"text": "fine", "vq_codes": [[7], [7], [7], [7], [7], [7], [7], [7], [7]]}], "message": "Drama 3 request: references.1: audio codes must be an int32 or int64 [10, frames] tensor with at least one frame; got torch.int64 (9, 1)"}, {"name": "input-empty", "input": " 　", "references": [{"text": "fine", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: input: text must not be empty"}, {"name": "input-structural", "input": "say <|semantic:3|>", "references": [{"text": "fine", "vq_codes": [[0], [1010], [1419], [1828], [2237], [2646], [3055], [0], [3873], [186]]}], "message": "Drama 3 request: input: <|semantic: is written by the prompt builder and must not appear in caller text"}]}
+diff --git a/zig/src/server/drama_voice_test.zig b/zig/src/server/drama_voice_test.zig
+index e61a7273..e54c5d23 100644
+--- a/zig/src/server/drama_voice_test.zig
++++ b/zig/src/server/drama_voice_test.zig
+@@ -5,6 +5,7 @@ const errors = @import("errors.zig");
+ const hf_text = @import("hf_text.zig");
+ const drama_prompt = @import("drama_prompt.zig");
+ const drama_voice = @import("drama_voice.zig");
++const drama_long = @import("drama_long.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ const Reference = drama_prompt.Reference;
+@@ -99,34 +100,62 @@ fn rowsOf(a: std.mem.Allocator, rows: drama_prompt.Rows) ![]const [11]i64 {
+     return out;
+ }
+ 
+-test "prompt rows equal the reference's build_prompt_rows with the real tokenizer (TF_DRAMA3_DIR)" {
+-    const dir = std.testing.environ.getPosix("TF_DRAMA3_DIR") orelse return error.SkipZigTest;
+-    const gpa = std.testing.allocator;
+-    var arena: std.heap.ArenaAllocator = .init(gpa);
+-    defer arena.deinit();
+-    const a = arena.allocator();
+-    const doc = (try json.parse(a, fixture)).ok;
++/// The real tokenizer at TF_DRAMA3_DIR, checked against the one the fixture was captured with; null: skipped.
++fn realText(a: std.mem.Allocator, doc: Value) !?*hf_text.HfText {
++    const dir = std.testing.environ.getPosix("TF_DRAMA3_DIR") orelse return null;
+     const tokenizer = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, try std.fs.path.join(a, &.{ dir, "tokenizer.json" }), a, .limited(256 << 20));
+     var digest: [32]u8 = undefined;
+     std.crypto.hash.sha2.Sha256.hash(tokenizer, &digest, .{});
+     try std.testing.expectEqualStrings(doc.strField("tokenizer_sha256").?, &std.fmt.bytesToHex(digest, .lower));
+     var problem: []const u8 = "";
+-    const text = try hf_text.HfText.load(gpa, std.testing.io, dir, null, a, &problem);
++    return try hf_text.HfText.load(std.testing.allocator, std.testing.io, dir, null, a, &problem);
++}
++
++/// `rows` equal the fixture case's, by its digest and row by row.
++fn expectRows(a: std.mem.Allocator, case: Value, rows: drama_prompt.Rows) !void {
++    const got = try rowsOf(a, rows);
++    var h = std.crypto.hash.sha2.Sha256.init(.{});
++    for (got) |row| for (row) |v| h.update(&std.mem.toBytes(std.mem.nativeToLittle(i64, v)));
++    const want = case.get("rows").?.array;
++    std.testing.expectEqualStrings(case.strField("rows_sha256").?, &std.fmt.bytesToHex(h.finalResult(), .lower)) catch |e| {
++        std.debug.print("{s}: {d} rows, the reference's {d}\n", .{ case.strField("name").?, got.len, want.len });
++        return e;
++    };
++    for (want, got) |row, mine| for (row.array, mine) |v, m| try std.testing.expectEqual(v.int64().?, m);
++}
++
++test "prompt rows equal the reference's build_prompt_rows with the real tokenizer (TF_DRAMA3_DIR)" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const doc = (try json.parse(a, fixture)).ok;
++    const text = try realText(a, doc) orelse return error.SkipZigTest;
+     defer text.deinit();
+     for (doc.get("rows").?.array) |case| {
+         var cx: Cx = .{ .a = a };
+         const input = case.strField("input").?;
+         const references = try drama_voice.lower(&cx, input, case.get("references").?, &.{});
+-        const rows: drama_prompt.Rows = if (references.len == 0) .{ .tokens = try drama_prompt.encode(a, text.text(), input), .codes = &.{} } else try drama_prompt.encodeReferenced(a, text.text(), input, references);
+-        const got = try rowsOf(a, rows);
+-        var h = std.crypto.hash.sha2.Sha256.init(.{});
+-        for (got) |row| for (row) |v| h.update(&std.mem.toBytes(std.mem.nativeToLittle(i64, v)));
+-        const want = case.get("rows").?.array;
+-        std.testing.expectEqualStrings(case.strField("rows_sha256").?, &std.fmt.bytesToHex(h.finalResult(), .lower)) catch |e| {
+-            std.debug.print("{s}: {d} rows, the reference's {d}\n", .{ case.strField("name").?, got.len, want.len });
+-            return e;
+-        };
+-        for (want, got) |row, mine| for (row.array, mine) |v, m| try std.testing.expectEqual(v.int64().?, m);
++        try expectRows(a, case, if (references.len == 0) .{ .tokens = try drama_prompt.encode(a, text.text(), input), .codes = &.{} } else try drama_prompt.encodeReferenced(a, text.text(), input, references));
++    }
++}
++
++test "long-form segments' rows, the voice then earlier segments latest last, equal the reference's (TF_DRAMA3_DIR)" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const doc = (try json.parse(a, fixture)).ok;
++    const text = try realText(a, doc) orelse return error.SkipZigTest;
++    defer text.deinit();
++    const cases = doc.get("carry").?.array;
++    try std.testing.expectEqual(@as(usize, 3), cases.len);
++    for (cases) |case| {
++        var cx: Cx = .{ .a = a };
++        const input = case.strField("input").?;
++        var voice_file = [_]Value{case.get("voice").?};
++        const voice = if (voice_file[0] == .null) &.{} else try drama_voice.lower(&cx, input, .{ .array = &voice_file }, &.{});
++        const heard = try drama_voice.lower(&cx, input, case.get("carry").?, &.{});
++        const base = try drama_voice.lower(&cx, input, .null, voice);
++        try expectRows(a, case, try drama_prompt.encodeReferenced(a, text.text(), input, try drama_long.carried(a, base, heard, heard.len)));
+     }
+ }
+ 
+diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
+index 800d4e09..0177f448 100644
+--- a/zig/src/server/main.zig
++++ b/zig/src/server/main.zig
+@@ -10,7 +10,7 @@ const hf_text = @import("hf_text.zig");
+ const startup = @import("startup.zig");
+ const checkpoint_cli = @import("checkpoint_cli");
+ 
+-const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--chat-template FILE] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--drafter DRAFTER] [--drafter-bits {0,4}] [--keep-warm SECONDS] [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--compact-memory COMPACT_MEMORY] [--slide] [--slide-graph SLIDE_GRAPH] [--parallel PARALLEL] [--cortheon] [--voices DIR] [--default-voice NAME] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE] [--segments SEGMENTS] model\n";
++const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--chat-template FILE] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--drafter DRAFTER] [--drafter-bits {0,4}] [--keep-warm SECONDS] [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--compact-memory COMPACT_MEMORY] [--slide] [--slide-graph SLIDE_GRAPH] [--parallel PARALLEL] [--cortheon] [--voices DIR] [--default-voice NAME] [--long-form] [--long-form-chars N] [--long-form-history K] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE] [--segments SEGMENTS] model\n";
+ 
+ /// The flags past the common ones this binary's backend serves; cli.zig reads them from the root.
+ pub const serves = engines.serves;
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index b2661786..12c2a612 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -39,6 +39,8 @@ test {
+     _ = @import("speech_stream_test.zig");
+     _ = @import("drama_prompt.zig");
+     _ = @import("drama_voice_test.zig");
++    _ = @import("drama_long.zig");
++    _ = @import("speech_long_test.zig");
+     _ = @import("memory_routes.zig");
+     _ = @import("process_memory.zig");
+     _ = @import("log.zig");
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index 8aa165fa..60be6f42 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -105,8 +105,8 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         std.debug.print("tensorfold: TENSORFOLD_SEED_SALT={s}: an integer\n", .{t});
+         return 1;
+     } else 0;
+-    if (args.voices != null and s.engine.info().speech == null) {
+-        std.debug.print("tensorfold: --voices needs a speech model\n", .{});
++    if ((args.voices != null or args.long_form) and s.engine.info().speech == null) {
++        std.debug.print("tensorfold: {s} needs a speech model\n", .{if (args.long_form) "--long-form" else "--voices"});
+         return 2;
+     }
+     const voices: []const drama_voice.Voice = if (args.voices) |dir| (drama_voice.load(a, io, dir, &problem) catch return 1) orelse {
+@@ -140,6 +140,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         .cortheon_search_key = env(s, "BRAVE_SEARCH_API_KEY"),
+         .voices = voices,
+         .default_voice = default_voice,
++        .long_form = if (args.long_form) .{ .chars = args.long_form_chars, .history = args.long_form_history } else null,
+     };
+     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
+         std.debug.print("tensorfold: the server could not start\n", .{});
+@@ -175,6 +176,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
+     if (srv.cortheon) |c| log.line("cortheon on: chat requests get Cortheon's reasoning program, web research before building, and cortheon_search/cortheon_fetch run here ({s}); a request can send \"cortheon\": false", .{c.engine});
+     if (args.voices) |dir| log.line("voices: {d} from {s}; default voice: {s}", .{ voices.len, dir, if (default_voice) |v| v.name else "built-in" });
++    if (args.long_form) log.line("long-form speech: segments of up to {d} characters, each hearing {d} before it; at most 12 segments and 6000 frames a reply", .{ args.long_form_chars, args.long_form_history });
+     live.columns_env = env(s, "COLUMNS");
+     var ticker: live.Ticker = .{ .engine = s.engine };
+     const drawing = live.wanted(io, if (env(s, "TENSORFOLD_NO_LIVE")) |v| std.mem.eql(u8, v, "1") else false);
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 1b909417..93155123 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -24,6 +24,7 @@ const slide_graph = @import("slide_graph.zig");
+ const slide_lesson = @import("slide_lesson.zig");
+ const cortheon = @import("cortheon/cortheon.zig");
+ const drama_voice = @import("drama_voice.zig");
++const drama_long = @import("drama_long.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+@@ -66,6 +67,8 @@ pub const Config = struct {
+     voices: []const drama_voice.Voice = &.{},
+     /// --default-voice: the one of `voices` that ``default`` (or no voice) names; null: the built-in voice.
+     default_voice: ?*const drama_voice.Voice = null,
++    /// --long-form: a speech input longer than one segment is spoken segment by segment; null: one synthesis.
++    long_form: ?drama_long.Options = null,
+     timeouts: http_conn.Timeouts = .{},
+ };
+ 
+diff --git a/zig/src/server/speech.zig b/zig/src/server/speech.zig
+index 7fe6d0d5..90245845 100644
+--- a/zig/src/server/speech.zig
++++ b/zig/src/server/speech.zig
+@@ -12,6 +12,7 @@ const reply_text = @import("reply_text.zig");
+ const drama_prompt = @import("drama_prompt.zig");
+ const drama_voice = @import("drama_voice.zig");
+ const model_text = @import("model_text.zig");
++const speech_long = @import("speech_long.zig");
+ const ids = @import("ids.zig");
+ const log = @import("log.zig");
+ const clock = @import("clock.zig");
+@@ -43,7 +44,8 @@ pub const Format = enum {
+     }
+ };
+ 
+-const Plan = struct { prompt: []const u32, codes: []const drama_prompt.Codes, seed: u64, format: Format, stream: bool };
++/// One synthesis's prompt, or a long-form reply's segments (`long`).
++const Plan = struct { prompt: []const u32, codes: []const drama_prompt.Codes, seed: u64, format: Format, stream: bool, long: ?speech_long.Long = null };
+ 
+ pub fn post(srv: *Server, c: *Conn, a: Allocator) !void {
+     const sp = srv.info.speech orelse {
+@@ -57,6 +59,7 @@ pub fn post(srv: *Server, c: *Conn, a: Allocator) !void {
+     const plan = prepare(srv, &cx, sp, raw) catch |e| return refuse(c, &cx, id, e);
+     // only chunked framing tells a client that a stream which ends early is incomplete
+     if (plan.stream and !std.mem.eql(u8, c.version, "HTTP/1.1")) return fail(c, &cx, id, .request, "stream=true requires HTTP/1.1");
++    if (plan.long) |long| return speech_long.synthesize(srv, c, &cx, id, sp, long, plan.format, plan.stream, received);
+     synthesize(srv, c, &cx, id, sp, plan, received);
+ }
+ 
+@@ -110,6 +113,8 @@ fn prepare(srv: *Server, cx: *Cx, sp: api.SpeechInfo, raw: Value) errors.Refused
+     const voice = raw.strField("voice") orelse raw.strField("speaker") orelse "default";
+     const references = try drama_voice.lower(cx, input, raw.get("references") orelse .null, try voiceReference(srv, cx, voice));
+     if (references.len == 0) if (try drama_prompt.problem(cx.a, input)) |message| return cx.refuse(message);
++    if (srv.config.long_form) |options| if (try speech_long.plan(srv, cx, sp, input, references, options)) |long|
++        return .{ .prompt = &.{}, .codes = &.{}, .seed = 0, .format = format, .stream = stream, .long = long };
+     const rows = encode(srv, cx.a, input, references) catch |e| return switch (e) {
+         error.OutOfMemory => error.OutOfMemory,
+         error.Template => cx.other("the tokenizer cannot encode this prompt"),
+@@ -129,7 +134,7 @@ fn voiceReference(srv: *Server, cx: *Cx, voice: []const u8) errors.Refused![]con
+ }
+ 
+ /// A plain prompt's ids with no codes, or ``build_prompt_rows`` with the references.
+-fn encode(srv: *Server, a: Allocator, input: []const u8, references: []const drama_prompt.Reference) model_text.Error!drama_prompt.Rows {
++pub fn encode(srv: *Server, a: Allocator, input: []const u8, references: []const drama_prompt.Reference) model_text.Error!drama_prompt.Rows {
+     if (references.len == 0) return .{ .tokens = try drama_prompt.encode(a, srv.text, input), .codes = &.{} };
+     return drama_prompt.encodeReferenced(a, srv.text, input, references);
+ }
+@@ -159,11 +164,9 @@ fn synthesize(srv: *Server, c: *Conn, cx: *Cx, id: []const u8, sp: api.SpeechInf
+     const engine_id = srv.next_id.fetchAdd(1, .monotonic);
+     if (srv.keepalive) |k| k.begin();
+     defer if (srv.keepalive) |k| k.end();
+-    srv.engine.submitSpeech(engine_id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| return switch (e) {
+-        error.Busy => fail(c, cx, id, .capacity, "the engine is busy; retry shortly"),
+-        error.Closed => fail(c, cx, id, .other, "the scheduler is closed"),
+-        error.InvalidRequest => fail(c, cx, id, .request, "the engine refused this speech request's prompt, frame limit or sampling"),
+-        error.Unsupported => fail(c, cx, id, .request, "this model does not support speech synthesis"),
++    srv.engine.submitSpeech(engine_id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| {
++        const refused = submitFailure(e);
++        return fail(c, cx, id, refused.kind, refused.message);
+     };
+     // The engine holds `request`, its prompt, `pcm` and `result` until finished: no path below returns before it arrives.
+     if (plan.stream) return streamReply(srv, c, cx, id, sp, plan, received, &box, engine_id, pcm, &result);
+@@ -172,15 +175,25 @@ fn synthesize(srv: *Server, c: *Conn, cx: *Cx, id: []const u8, sp: api.SpeechInf
+     if (why(&box, samples, pcm.len)) |message| return fail(c, cx, id, .server, message);
+     const data = quantizeInPlace(pcm[0..samples]) catch return fail(c, cx, id, .server, "the synthesized audio has non-finite samples");
+     if (data.len > std.math.maxInt(u32) - 36) return fail(c, cx, id, .server, "the synthesized audio is too long for one reply");
+-    sendAudio(c, plan.format, sp.sample_rate, data, box.reason) catch {
++    sendAudio(c, plan.format, sp.sample_rate, data, box.reason, null) catch {
+         c.close = true; // a head already started or a client gone: nothing more can be sent on this connection
+         return;
+     };
+     log.line("speech {s} prompt={d} samples={d} format={s} finish={s} seconds={d:.2}", .{ id, plan.prompt.len, samples, @tagName(plan.format), @tagName(box.reason), clock.seconds(clock.nowNs(srv.io) - received) });
+ }
+ 
++/// Why the engine refused a submission, as the reply's kind and message.
++pub fn submitFailure(e: api.SpeechSubmitError) struct { kind: errors.Kind, message: []const u8 } {
++    return switch (e) {
++        error.Busy => .{ .kind = .capacity, .message = "the engine is busy; retry shortly" },
++        error.Closed => .{ .kind = .other, .message = "the scheduler is closed" },
++        error.InvalidRequest => .{ .kind = .request, .message = "the engine refused this speech request's prompt, frame limit or sampling" },
++        error.Unsupported => .{ .kind = .request, .message = "this model does not support speech synthesis" },
++    };
++}
++
+ /// The client left before the reply ended; the synthesis was cancelled and waited out.
+-fn left(srv: *Server, c: *Conn, id: []const u8, prompt_len: usize, received: i96) void {
++pub fn left(srv: *Server, c: *Conn, id: []const u8, prompt_len: usize, received: i96) void {
+     c.close = true;
+     srv.metrics.disconnected(srv.io);
+     var buf: [1024]u8 = undefined;
+@@ -189,7 +202,7 @@ fn left(srv: *Server, c: *Conn, id: []const u8, prompt_len: usize, received: i96
+ 
+ /// Why a finished synthesis has no complete audio, or null. `length` is audio clipped at the frame limit: it is
+ /// returned, marked by X-Finish-Reason (a whole reply's header, a stream's trailer).
+-fn why(box: *const Mailbox, samples: usize, capacity: usize) ?[]const u8 {
++pub fn why(box: *const Mailbox, samples: usize, capacity: usize) ?[]const u8 {
+     return switch (box.reason) {
+         .stop, .length => if (samples == 0 or samples > capacity) "the engine finished without complete audio" else null,
+         .cancelled => "speech synthesis was cancelled",
+@@ -199,7 +212,7 @@ fn why(box: *const Mailbox, samples: usize, capacity: usize) ?[]const u8 {
+ 
+ /// An error reply when synthesis ends before any audio; else the chunks, and the terminator only after a complete one.
+ fn streamReply(srv: *Server, c: *Conn, cx: *Cx, id: []const u8, sp: api.SpeechInfo, plan: Plan, received: i96, box: *Mailbox, engine_id: api.Id, pcm: []f32, result: *const api.SpeechResult) void {
+-    const sent = streamAudio(srv, c, sp, box, engine_id, pcm) orelse return left(srv, c, id, plan.prompt.len, received);
++    const sent = streamAudio(srv, c, sp, box, engine_id, pcm, "X-Finish-Reason") orelse return left(srv, c, id, plan.prompt.len, received);
+     const mismatch: ?[]const u8 = if (result.samples != sent.samples) "the finished synthesis does not match the audio it published" else null;
+     const problem = why(box, result.samples, pcm.len) orelse mismatch;
+     if (sent.samples == 0) return fail(c, cx, id, .server, problem orelse "the engine finished without publishing audio");
+@@ -218,10 +231,10 @@ fn streamReply(srv: *Server, c: *Conn, cx: *Cx, id: []const u8, sp: api.SpeechIn
+ }
+ 
+ /// What a stream sent, when this thread first saw published audio, and when frame 0's own bytes reached the socket.
+-const Sent = struct { samples: usize = 0, first_ready: i96 = 0, first_written: i96 = 0 };
++pub const Sent = struct { samples: usize = 0, first_ready: i96 = 0, first_written: i96 = 0 };
+ 
+-/// Sends everything published since the last send as one chunk, converted in place; null: the client left.
+-fn streamAudio(srv: *Server, c: *Conn, sp: api.SpeechInfo, box: *Mailbox, engine_id: api.Id, pcm: []f32) ?Sent {
++/// Sends what is published as chunks, converted in place; `start`: the Trailer to open the stream with, if not open.
++pub fn streamAudio(srv: *Server, c: *Conn, sp: api.SpeechInfo, box: *Mailbox, engine_id: api.Id, pcm: []f32, start: ?[]const u8) ?Sent {
+     var sent: Sent = .{};
+     var size: [20]u8 = undefined;
+     while (true) {
+@@ -230,7 +243,7 @@ fn streamAudio(srv: *Server, c: *Conn, sp: api.SpeechInfo, box: *Mailbox, engine
+         const first = sent.samples == 0;
+         if (first) {
+             sent.first_ready = clock.nowNs(srv.io);
+-            startStream(c, sp.sample_rate) catch return abandon(srv, box, engine_id);
++            if (start) |trailer| startStream(c, sp.sample_rate, trailer) catch return abandon(srv, box, engine_id);
+         }
+         // the audio event made pcm[..now] final: this thread converts it in place
+         const bytes = quantizeInPlace(pcm[sent.samples..now]) catch return abandon(srv, box, engine_id);
+@@ -246,7 +259,7 @@ fn streamAudio(srv: *Server, c: *Conn, sp: api.SpeechInfo, box: *Mailbox, engine
+ }
+ 
+ /// Cancels a synthesis whose client is gone, then waits for its finished event; null, for the callers' `return`.
+-fn abandon(srv: *Server, box: *Mailbox, engine_id: api.Id) ?Sent {
++pub fn abandon(srv: *Server, box: *Mailbox, engine_id: api.Id) ?Sent {
+     srv.engine.cancel(engine_id);
+     box.mutex.lockUncancelable(box.io);
+     defer box.mutex.unlock(box.io);
+@@ -255,7 +268,7 @@ fn abandon(srv: *Server, box: *Mailbox, engine_id: api.Id) ?Sent {
+ }
+ 
+ /// Waits for `finished` or (with `sent`) samples past it, cancelling if the client leaves; samples so far, or null.
+-fn settle(srv: *Server, c: *Conn, box: *Mailbox, engine_id: api.Id, sent: ?usize) ?usize {
++pub fn settle(srv: *Server, c: *Conn, box: *Mailbox, engine_id: api.Id, sent: ?usize) ?usize {
+     while (true) {
+         box.mutex.lockUncancelable(box.io);
+         const idle = if (sent) |n| box.audio == n else true;
+@@ -272,7 +285,7 @@ fn settle(srv: *Server, c: *Conn, box: *Mailbox, engine_id: api.Id, sent: ?usize
+ }
+ 
+ /// 200 with raw PCM16LE in HTTP/1.1 chunks, under the reference's sample-format headers.
+-fn startStream(c: *Conn, sample_rate: u32) error{Closed}!void {
++fn startStream(c: *Conn, sample_rate: u32, trailer: []const u8) error{Closed}!void {
+     c.startResponse(200, null) catch return error.Closed;
+     c.addHeader("Content-Type", Format.pcm.contentType()) catch return error.Closed;
+     c.addHeader("Transfer-Encoding", "chunked") catch return error.Closed;
+@@ -280,7 +293,7 @@ fn startStream(c: *Conn, sample_rate: u32) error{Closed}!void {
+     c.addHeader("X-Sample-Rate", std.fmt.bufPrint(&rate, "{d}", .{sample_rate}) catch unreachable) catch return error.Closed;
+     c.addHeader("X-Channels", "1") catch return error.Closed;
+     c.addHeader("X-Bit-Depth", "16") catch return error.Closed;
+-    c.addHeader("Trailer", "X-Finish-Reason") catch return error.Closed;
++    c.addHeader("Trailer", trailer) catch return error.Closed;
+     if (c.close) c.addHeader("Connection", "close") catch return error.Closed;
+     // each chunk leaves at once rather than waiting on the client's acknowledgement of the last (no effect off TCP)
+     std.posix.setsockopt(c.fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+@@ -303,7 +316,7 @@ fn refuse(c: *Conn, cx: *Cx, id: []const u8, e: errors.Refused) void {
+     send(c, cx, id);
+ }
+ 
+-fn fail(c: *Conn, cx: *Cx, id: []const u8, kind: errors.Kind, message: []const u8) void {
++pub fn fail(c: *Conn, cx: *Cx, id: []const u8, kind: errors.Kind, message: []const u8) void {
+     cx.kind = kind;
+     cx.message = message;
+     send(c, cx, id);
+@@ -318,7 +331,7 @@ fn send(c: *Conn, cx: *Cx, id: []const u8) void {
+ }
+ 
+ /// The head, then the WAV header and the samples where they lie: the audio is never copied to prepend a header.
+-fn sendAudio(c: *Conn, format: Format, sample_rate: u32, data: []const u8, reason: api.Reason) error{ Closed, OutOfMemory }!void {
++pub fn sendAudio(c: *Conn, format: Format, sample_rate: u32, data: []const u8, reason: api.Reason, segments: ?[]const u8) error{ Closed, OutOfMemory }!void {
+     const header: ?[wav_header_len]u8 = if (format == .wav) wavHeader(sample_rate, @intCast(data.len)) else null;
+     const header_len: usize = if (header != null) wav_header_len else 0;
+     try c.startResponse(200, null);
+@@ -326,6 +339,7 @@ fn sendAudio(c: *Conn, format: Format, sample_rate: u32, data: []const u8, reaso
+     var len: [24]u8 = undefined;
+     try c.addHeader("Content-Length", std.fmt.bufPrint(&len, "{d}", .{header_len + data.len}) catch unreachable);
+     try c.addHeader("X-Finish-Reason", @tagName(reason));
++    if (segments) |value| try c.addHeader("X-Long-Form-Segments", value);
+     if (c.close) try c.addHeader("Connection", "close");
+     defer c.out.clearRetainingCapacity();
+     if (!std.mem.eql(u8, c.version, "HTTP/0.9")) try c.out.appendSlice(c.gpa, "\r\n");
+diff --git a/zig/src/server/speech_long.zig b/zig/src/server/speech_long.zig
+new file mode 100644
+index 00000000..943fd63a
+--- /dev/null
++++ b/zig/src/server/speech_long.zig
+@@ -0,0 +1,192 @@
++//! /v1/audio/speech with --long-form: a long input spoken segment by segment, each hearing the audio of those before.
++const std = @import("std");
++const api = @import("engine_api");
++const errors = @import("errors.zig");
++const speech = @import("speech.zig");
++const drama_prompt = @import("drama_prompt.zig");
++const drama_long = @import("drama_long.zig");
++const log = @import("log.zig");
++const clock = @import("clock.zig");
++const Mailbox = @import("mailbox.zig").Mailbox;
++const Server = @import("server.zig").Server;
++const Conn = @import("http_conn.zig").Conn;
++const Cx = errors.Cx;
++const Reference = drama_prompt.Reference;
++const Codes = drama_prompt.Codes;
++
++/// A long-form reply's segments, the references each hears first, and how many earlier segments it hears after them.
++pub const Long = struct { segments: []const []const u8, references: []const Reference, history: u8 };
++
++/// The stream's trailers: the finish reason when clipped, and where the segments start.
++const trailer = "X-Finish-Reason, X-Long-Form-Segments";
++
++/// The input's segments when it has two or more, each refused now as a whole input would be; null: one synthesis.
++pub fn plan(srv: *Server, cx: *Cx, sp: api.SpeechInfo, input: []const u8, references: []const Reference, options: drama_long.Options) errors.Refused!?Long {
++    if ((std.unicode.utf8CountCodepoints(input) catch unreachable) <= options.chars) return null;
++    const segments = try drama_long.split(cx.a, input, options.chars);
++    if (segments.len <= 1) return null;
++    if (segments.len > drama_long.max_segments)
++        return cx.fail(.request, drama_prompt.error_prefix ++ " a long-form input in {d} segments of at most {d} characters exceeds the maximum of {d} segments", .{ segments.len, options.chars, drama_long.max_segments });
++    for (segments) |segment| {
++        if (try drama_prompt.problem(cx.a, segment)) |message| return cx.refuse(message);
++        const rows = speech.encode(srv, cx.a, segment, references) catch |e| return switch (e) {
++            error.OutOfMemory => error.OutOfMemory,
++            error.Template => cx.other("the tokenizer cannot encode this prompt"),
++        };
++        if (rows.tokens.len > sp.max_prompt_tokens)
++            return cx.fail(.request, drama_prompt.error_prefix ++ " a prompt of {d} rows exceeds the maximum allowed length of {d} rows", .{ rows.tokens.len, sp.max_prompt_tokens });
++    }
++    return .{ .segments = segments, .references = references, .history = options.history };
++}
++
++/// Speaks every segment into one reply: a WAV or PCM body, or a PCM stream from the first segment's first audio.
++pub fn synthesize(srv: *Server, c: *Conn, cx: *Cx, id: []const u8, sp: api.SpeechInfo, long: Long, format: speech.Format, stream: bool, received: i96) void {
++    if (sp.frame_length == 0 or sp.max_frames == 0 or sp.sample_rate == 0 or sp.sample_rate > std.math.maxInt(u32) / 2)
++        return speech.fail(c, cx, id, .server, "the engine advertises no usable speech output");
++    const pcm = srv.gpa.alloc(f32, drama_long.max_frames * @as(usize, sp.frame_length)) catch return speech.fail(c, cx, id, .server, "out of memory");
++    defer srv.gpa.free(pcm);
++    const generated = srv.gpa.alloc(Codes, drama_long.max_frames) catch return speech.fail(c, cx, id, .server, "out of memory");
++    defer srv.gpa.free(generated);
++    if (srv.keepalive) |k| k.begin();
++    defer if (srv.keepalive) |k| k.end();
++    var r: Reply = .{ .srv = srv, .c = c, .cx = cx, .id = id, .sp = sp, .long = long, .stream = stream, .received = received, .pcm = pcm, .generated = generated };
++    for (0..long.segments.len) |i| {
++        if (r.frames == drama_long.max_frames) {
++            r.reason = .length;
++            break;
++        }
++        if (!r.speak(i)) return;
++        // a clipped segment's audio would be the next one's carry-over: the reply ends with it
++        if (r.reason == .length) break;
++    }
++    r.finish(format);
++}
++
++const Reply = struct {
++    srv: *Server,
++    c: *Conn,
++    cx: *Cx,
++    id: []const u8,
++    sp: api.SpeechInfo,
++    long: Long,
++    stream: bool,
++    received: i96,
++    pcm: []f32,
++    generated: []Codes,
++    heard: std.ArrayList(Reference) = .empty,
++    starts: std.ArrayList(usize) = .empty,
++    frames: usize = 0,
++    rows: usize = 0,
++    reason: api.Reason = .stop,
++    open: bool = false,
++    first_ready: i96 = 0,
++
++    /// Segment `i`'s prompt: its references, then the latest segments heard while it fits (bare, `plan` checked it).
++    fn prompt(r: *Reply, i: usize) !drama_prompt.Rows {
++        var keep: usize = @min(r.long.history, r.heard.items.len);
++        while (true) : (keep -= 1) {
++            const rows = try speech.encode(r.srv, r.cx.a, r.long.segments[i], try drama_long.carried(r.cx.a, r.long.references, r.heard.items, keep));
++            if (rows.tokens.len <= r.sp.max_prompt_tokens or keep == 0) return rows;
++        }
++    }
++
++    /// Synthesizes segment `i` after the frames so far; false when the reply has ended (refused, cut short, or left).
++    fn speak(r: *Reply, i: usize) bool {
++        const fl: usize = r.sp.frame_length;
++        const room = @min(r.sp.max_frames, drama_long.max_frames - r.frames);
++        const rows = r.prompt(i) catch |e| return r.end(.other, if (e == error.OutOfMemory) "out of memory" else "the tokenizer cannot encode this prompt");
++        var result: api.SpeechResult = .{};
++        const request: api.SpeechRequest = .{
++            .prompt = rows.tokens,
++            .codes = rows.codes,
++            .generated = r.generated[r.frames..][0..room],
++            .pcm = r.pcm[r.frames * fl ..][0 .. room * fl],
++            .result = &result,
++            .seed = api.seedFor(rows.tokens, r.srv.config.seed_salt),
++            .max_frames = @intCast(room),
++            .temperature = drama_prompt.temperature,
++            .top_p = drama_prompt.top_p,
++            .top_k = drama_prompt.top_k,
++            .stream = r.stream,
++        };
++        var box: Mailbox = .{ .io = r.srv.io, .gpa = r.srv.gpa };
++        defer box.deinit();
++        const engine_id = r.srv.next_id.fetchAdd(1, .monotonic);
++        r.submit(&request, &box, engine_id, i > 0) catch |e| {
++            const refused = speech.submitFailure(e);
++            return r.end(refused.kind, refused.message);
++        };
++        // The engine holds `request` and the buffers it names until finished: no path below returns before it arrives.
++        r.rows += rows.tokens.len;
++        if (r.stream) {
++            const sent = speech.streamAudio(r.srv, r.c, r.sp, &box, engine_id, request.pcm, if (r.open) null else trailer) orelse return r.gone();
++            if (!r.open and sent.samples > 0) {
++                r.open = true;
++                r.first_ready = sent.first_ready;
++            }
++            const mismatch: ?[]const u8 = if (result.samples != sent.samples) "the finished synthesis does not match the audio it published" else null;
++            if (speech.why(&box, result.samples, request.pcm.len) orelse mismatch) |message| return r.end(.server, message);
++        } else {
++            if (speech.settle(r.srv, r.c, &box, engine_id, null) == null) return r.gone();
++            if (speech.why(&box, result.samples, request.pcm.len)) |message| return r.end(.server, message);
++        }
++        const frames = result.samples / fl;
++        r.starts.append(r.cx.a, r.frames * fl) catch return r.end(.server, "out of memory");
++        r.heard.append(r.cx.a, .{ .text = r.long.segments[i], .frames = r.generated[r.frames..][0..frames] }) catch return r.end(.server, "out of memory");
++        r.frames += frames;
++        if (box.reason == .length) r.reason = .length;
++        return true;
++    }
++
++    /// Submits, waiting out another request's synthesis after the first segment so a reply is not cut between segments.
++    fn submit(r: *Reply, request: *const api.SpeechRequest, box: *Mailbox, engine_id: api.Id, wait: bool) api.SpeechSubmitError!void {
++        while (true) {
++            r.srv.engine.submitSpeech(engine_id, request, .{ .ctx = box, .event = Mailbox.onEvent }) catch |e| {
++                if (e != error.Busy or !wait or r.c.peerGone()) return e;
++                std.Io.sleep(r.srv.io, .fromMilliseconds(20), .awake) catch {};
++                continue;
++            };
++            return;
++        }
++    }
++
++    /// An error reply before any audio; after a stream's first chunk, no terminator, so the body is incomplete.
++    fn end(r: *Reply, kind: errors.Kind, message: []const u8) bool {
++        if (!r.open) {
++            speech.fail(r.c, r.cx, r.id, kind, message);
++            return false;
++        }
++        r.c.close = true;
++        log.line("speech {s} long-form stream ended incomplete after segments={d} samples={d}: {s}", .{ r.id, r.starts.items.len, r.frames * r.sp.frame_length, message });
++        return false;
++    }
++
++    fn gone(r: *Reply) bool {
++        speech.left(r.srv, r.c, r.id, r.rows, r.received);
++        return false;
++    }
++
++    /// The whole body with the segments header, or the stream's terminating chunk with its trailers.
++    fn finish(r: *Reply, format: speech.Format) void {
++        const samples = r.frames * r.sp.frame_length;
++        const segments = drama_long.segmentsHeader(r.cx.a, r.starts.items) catch return speech.fail(r.c, r.cx, r.id, .server, "out of memory");
++        if (r.stream) {
++            const reason = if (r.reason == .length) "X-Finish-Reason: length\r\n" else "";
++            const last = std.fmt.allocPrint(r.cx.a, "0\r\n{s}X-Long-Form-Segments: {s}\r\n\r\n", .{ reason, segments }) catch "0\r\n\r\n";
++            r.c.writeAll(last) catch {
++                r.c.close = true;
++                return;
++            };
++        } else {
++            const data = speech.quantizeInPlace(r.pcm[0..samples]) catch return speech.fail(r.c, r.cx, r.id, .server, "the synthesized audio has non-finite samples");
++            if (data.len > std.math.maxInt(u32) - 36) return speech.fail(r.c, r.cx, r.id, .server, "the synthesized audio is too long for one reply");
++            speech.sendAudio(r.c, format, r.sp.sample_rate, data, r.reason, segments) catch {
++                r.c.close = true;
++                return;
++            };
++        }
++        log.line("speech {s} long_form segments={d}/{d} prompt={d} samples={d} format={s} stream={} finish={s} seconds={d:.2}", .{
++            r.id, r.starts.items.len, r.long.segments.len, r.rows, samples, @tagName(format), r.stream, @tagName(r.reason), clock.seconds(clock.nowNs(r.srv.io) - r.received),
++        });
++    }
++};
+diff --git a/zig/src/server/speech_long_test.zig b/zig/src/server/speech_long_test.zig
+new file mode 100644
+index 00000000..d30adc1d
+--- /dev/null
++++ b/zig/src/server/speech_long_test.zig
+@@ -0,0 +1,275 @@
++//! Long-form speech on the wire, against an engine that scripts each segment's frames and finish reason.
++const std = @import("std");
++const api = @import("engine_api");
++const server = @import("root.zig");
++const drama_prompt = @import("drama_prompt.zig");
++const drama_long = @import("drama_long.zig");
++const harness = @import("speech_stream_test.zig");
++const Served = harness.Served;
++
++const gpa = std.testing.allocator;
++const frame = 4;
++
++const Turn = struct { frames: usize, reason: api.Reason = .stop };
++
++/// One synthesis a turn, run inside submit: each segment's PCM is its turn number / 16, its codes turn * 100 + frame.
++const Turns = struct {
++    turns: []const Turn,
++    max_prompt: u32 = 4096,
++    seen: usize = 0,
++    arena: std.heap.ArenaAllocator = .init(gpa),
++    prompts: std.ArrayList([]const u32) = .empty,
++    codes: std.ArrayList([]const drama_prompt.Codes) = .empty,
++    seeds: std.ArrayList(u64) = .empty,
++    limits: std.ArrayList(u32) = .empty,
++    generated: std.ArrayList(usize) = .empty,
++
++    fn engine(t: *Turns) api.Engine {
++        return .{ .ctx = t, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory, .submit_speech = speech } };
++    }
++    fn info(ctx: *anyopaque) api.Info {
++        const t: *Turns = @ptrCast(@alignCast(ctx));
++        return .{ .text_generation = false, .speech = .{ .sample_rate = 44100, .frame_length = frame, .max_frames = 1024, .max_prompt_tokens = t.max_prompt } };
++    }
++    fn speech(ctx: *anyopaque, id: api.Id, request: *const api.SpeechRequest, sink: api.Sink) api.SpeechSubmitError!void {
++        const t: *Turns = @ptrCast(@alignCast(ctx));
++        if (t.seen == t.turns.len) return error.InvalidRequest;
++        const turn = t.turns[t.seen];
++        t.seen += 1;
++        const a = t.arena.allocator();
++        t.prompts.append(a, a.dupe(u32, request.prompt) catch unreachable) catch unreachable;
++        t.codes.append(a, a.dupe(drama_prompt.Codes, request.codes) catch unreachable) catch unreachable;
++        t.seeds.append(a, request.seed) catch unreachable;
++        t.limits.append(a, request.max_frames) catch unreachable;
++        t.generated.append(a, request.generated.len) catch unreachable;
++        const frames = @min(turn.frames, request.max_frames);
++        @memset(request.pcm[0 .. frames * frame], @as(f32, @floatFromInt(t.seen)) / 16);
++        if (request.generated.len > 0) for (request.generated[0..frames], 0..) |*codes, f| {
++            codes.* = @splat(@intCast(t.seen * 100 + f));
++        };
++        if (request.stream and frames > 0) sink.event(sink.ctx, id, &.{ .audio = frames * frame });
++        const reason: api.Reason = if (turn.reason == .stop and frames == request.max_frames) .length else turn.reason;
++        if (reason == .stop or reason == .length) request.result.samples = frames * frame;
++        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = reason, .message = if (reason == .failed) "scripted failure" else "" } });
++    }
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++    fn submit(_: *anyopaque, _: api.Id, _: *const api.Request, _: api.Sink) api.SubmitError!void {
++        return error.Unsupported;
++    }
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++    fn deinit(t: *Turns) void {
++        t.arena.deinit();
++    }
++};
++
++fn config(long_form: ?drama_long.Options) server.Config {
++    return .{ .served_name = "m", .model_ids = &.{"m"}, .long_form = long_form };
++}
++
++/// `n` sentences of 18 characters: with 20-character segments, one a segment.
++fn sentences(a: std.mem.Allocator, n: usize) ![]const u8 {
++    var out: std.ArrayList(u8) = .empty;
++    for (0..n) |i| try out.print(a, "{s}Sentence {d:0>2} is ok.", .{ if (i == 0) "" else " ", i });
++    return out.items;
++}
++
++fn body(a: std.mem.Allocator, input: []const u8, stream: bool) ![]const u8 {
++    return std.fmt.allocPrint(a, "{{\"model\":\"m\",\"input\":\"{s}\",\"response_format\":\"pcm\",\"stream\":{}}}", .{ input, stream });
++}
++
++/// Served once, the route joined; the reply head and the bytes after it.
++fn serve(t: *Turns, cfg: server.Config, request: []const u8) !struct { s: *Served, head: []const u8 } {
++    const s = try gpa.create(Served);
++    try s.startWith(t.engine(), cfg, "HTTP/1.1", request, 2000);
++    const head = try s.readHead();
++    s.route.join();
++    return .{ .s = s, .head = head };
++}
++
++fn done(s: *Served) void {
++    s.deinit();
++    gpa.destroy(s);
++}
++
++/// The PCM16 bytes of `frames` frames of turn `n`'s value.
++fn turnPcm(out: *std.ArrayList(u8), a: std.mem.Allocator, n: usize, frames: usize) !void {
++    const q: i16 = @intFromFloat(@as(f32, @floatFromInt(n)) / 16 * 32767.0);
++    for (0..frames * frame) |_| try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(i16, q)));
++}
++
++/// Segment `i`'s expected prompt: the earlier segments' text and scripted codes as references, latest last.
++fn expected(a: std.mem.Allocator, text: *harness.Bytes, segments: []const []const u8, frames: []const usize, i: usize, keep: usize) !drama_prompt.Rows {
++    if (keep == 0) return .{ .tokens = try drama_prompt.encode(a, text.text(), segments[i]), .codes = &.{} };
++    var heard: std.ArrayList(drama_prompt.Reference) = .empty;
++    for (i - keep..i) |j| {
++        const codes = try a.alloc(drama_prompt.Codes, frames[j]);
++        for (codes, 0..) |*c, f| c.* = @splat(@intCast((j + 1) * 100 + f));
++        try heard.append(a, .{ .text = segments[j], .frames = codes });
++    }
++    return drama_prompt.encodeReferenced(a, text.text(), segments[i], heard.items);
++}
++
++test "long-form off: a long input is one synthesis, and an input of one segment is that same synthesis with it on" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var text: harness.Bytes = .{};
++    for ([_][]const u8{ try sentences(a, 3), "Short enough." }) |input| {
++        var replies: [2][]const u8 = undefined;
++        var prompts: [2][]const u32 = undefined;
++        for ([_]?drama_long.Options{ null, .{ .chars = 300 } }, 0..) |lf, k| {
++            var t: Turns = .{ .turns = &.{.{ .frames = 5 }} };
++            defer t.deinit();
++            const r = try serve(&t, config(lf), try body(a, input, false));
++            defer done(r.s);
++            try std.testing.expectEqual(@as(usize, 1), t.seen);
++            try std.testing.expect(std.mem.indexOf(u8, r.head, "X-Long-Form-Segments") == null);
++            try std.testing.expectEqual(@as(usize, 0), t.generated.items[0]);
++            try std.testing.expectEqual(api.seedFor(t.prompts.items[0], 0), t.seeds.items[0]);
++            prompts[k] = try a.dupe(u32, t.prompts.items[0]);
++            replies[k] = try std.mem.concat(a, u8, &.{ r.head[std.mem.indexOf(u8, r.head, "Content-Type").?..], try r.s.readRest() });
++        }
++        try std.testing.expectEqualSlices(u32, try drama_prompt.encode(a, text.text(), input), prompts[0]);
++        try std.testing.expectEqualSlices(u32, prompts[0], prompts[1]);
++        try std.testing.expectEqualStrings(replies[0], replies[1]);
++    }
++}
++
++test "segments are spoken in order, each hearing the one before, their PCM joined with no gap" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var text: harness.Bytes = .{};
++    const input = try sentences(a, 3);
++    const segments = try drama_long.split(a, input, 20);
++    const frames = [_]usize{ 5, 3, 7 };
++    var t: Turns = .{ .turns = &.{ .{ .frames = 5 }, .{ .frames = 3 }, .{ .frames = 7 } } };
++    defer t.deinit();
++    const r = try serve(&t, config(.{ .chars = 20 }), try body(a, input, false));
++    defer done(r.s);
++    try std.testing.expect(std.mem.indexOf(u8, r.head, "HTTP/1.1 200") != null);
++    try std.testing.expect(std.mem.indexOf(u8, r.head, "X-Finish-Reason: stop\r\nX-Long-Form-Segments: 3;20,32\r\n") != null);
++    var want: std.ArrayList(u8) = .empty;
++    for (frames, 1..) |n, turn| try turnPcm(&want, a, turn, n);
++    try std.testing.expectEqualSlices(u8, want.items, try r.s.readRest());
++    try std.testing.expectEqual(@as(usize, 3), t.seen);
++    for (0..3) |i| {
++        const rows = try expected(a, &text, segments, &frames, i, @min(i, 1));
++        try std.testing.expectEqualSlices(u32, rows.tokens, t.prompts.items[i]);
++        try std.testing.expectEqualSlices(drama_prompt.Codes, rows.codes, t.codes.items[i]);
++        try std.testing.expectEqual(api.seedFor(rows.tokens, 0), t.seeds.items[i]);
++        try std.testing.expect(t.generated.items[i] >= t.limits.items[i]);
++    }
++}
++
++test "history 2 hears two earlier segments, dropping the oldest when the prompt would not fit" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var text: harness.Bytes = .{};
++    const input = try sentences(a, 3);
++    const segments = try drama_long.split(a, input, 20);
++    const frames = [_]usize{ 5, 3, 7 };
++    const two = try expected(a, &text, segments, &frames, 2, 2);
++    const one = try expected(a, &text, segments, &frames, 2, 1);
++    for ([_]u32{ 4096, @intCast(two.tokens.len - 1) }, [_]drama_prompt.Rows{ two, one }) |max_prompt, want| {
++        var t: Turns = .{ .turns = &.{ .{ .frames = 5 }, .{ .frames = 3 }, .{ .frames = 7 } }, .max_prompt = max_prompt };
++        defer t.deinit();
++        const r = try serve(&t, config(.{ .chars = 20, .history = 2 }), try body(a, input, false));
++        defer done(r.s);
++        try std.testing.expectEqual(@as(usize, 3), t.seen);
++        try std.testing.expectEqualSlices(u32, want.tokens, t.prompts.items[2]);
++    }
++}
++
++test "a clipped segment ends the reply with length; later segments are not spoken" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var t: Turns = .{ .turns = &.{ .{ .frames = 5 }, .{ .frames = 3, .reason = .length }, .{ .frames = 7 } } };
++    defer t.deinit();
++    const r = try serve(&t, config(.{ .chars = 20 }), try body(a, try sentences(a, 3), false));
++    defer done(r.s);
++    try std.testing.expectEqual(@as(usize, 2), t.seen);
++    try std.testing.expect(std.mem.indexOf(u8, r.head, "X-Finish-Reason: length\r\nX-Long-Form-Segments: 2;20\r\n") != null);
++    try std.testing.expectEqual(@as(usize, 2 * frame * 8), (try r.s.readRest()).len);
++}
++
++test "the frame budget: each segment gets what is left, and a reply that spends it ends with length" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const thousand: Turn = .{ .frames = 1000 };
++    const cases = [_]struct { turns: []const Turn, seen: usize, last_limit: u32 }{
++        .{ .turns = &.{ thousand, thousand, thousand, thousand, thousand, thousand, thousand }, .seen = 6, .last_limit = 1000 },
++        .{ .turns = &.{ thousand, thousand, thousand, thousand, thousand, .{ .frames = 1500 }, thousand }, .seen = 6, .last_limit = 1000 },
++    };
++    for (cases) |case| {
++        var t: Turns = .{ .turns = case.turns };
++        defer t.deinit();
++        const r = try serve(&t, config(.{ .chars = 20 }), try body(a, try sentences(a, 7), false));
++        defer done(r.s);
++        try std.testing.expectEqual(case.seen, t.seen);
++        try std.testing.expectEqual(@as(u32, 1024), t.limits.items[0]);
++        try std.testing.expectEqual(case.last_limit, t.limits.items[t.seen - 1]);
++        try std.testing.expect(std.mem.indexOf(u8, r.head, "X-Finish-Reason: length\r\n") != null);
++        try std.testing.expectEqual(@as(usize, 2 * frame * drama_long.max_frames), (try r.s.readRest()).len);
++    }
++}
++
++test "more than 12 segments are refused before any synthesis" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var t: Turns = .{ .turns = &.{} };
++    defer t.deinit();
++    const r = try serve(&t, config(.{ .chars = 20 }), try body(a, try sentences(a, 13), false));
++    defer done(r.s);
++    try std.testing.expect(std.mem.indexOf(u8, r.head, " 400 ") != null);
++    try std.testing.expect(std.mem.indexOf(u8, try r.s.readRest(), "Drama 3 request: a long-form input in 13 segments of at most 20 characters exceeds the maximum of 12 segments") != null);
++    try std.testing.expectEqual(@as(usize, 0), t.seen);
++}
++
++test "a long-form stream sends each segment as it is made, then the trailers" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_]api.Reason{ .stop, .length }) |last| {
++        var t: Turns = .{ .turns = &.{ .{ .frames = 5 }, .{ .frames = 3, .reason = last } } };
++        defer t.deinit();
++        const r = try serve(&t, config(.{ .chars = 20 }), try body(a, try sentences(a, 2), true));
++        defer done(r.s);
++        try std.testing.expect(std.mem.indexOf(u8, r.head, "Trailer: X-Finish-Reason, X-Long-Form-Segments\r\n") != null);
++        const rest = try r.s.readRest();
++        var want: std.ArrayList(u8) = .empty;
++        try want.print(a, "{x}\r\n", .{2 * frame * 5});
++        try turnPcm(&want, a, 1, 5);
++        try want.print(a, "\r\n{x}\r\n", .{2 * frame * 3});
++        try turnPcm(&want, a, 2, 3);
++        try want.print(a, "\r\n0\r\n{s}X-Long-Form-Segments: 2;20\r\n\r\n", .{if (last == .length) "X-Finish-Reason: length\r\n" else ""});
++        try std.testing.expectEqualSlices(u8, want.items, rest);
++    }
++}
++
++test "a failure after the first segment ends a stream incomplete and a whole reply with an error" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_]bool{ true, false }) |stream| {
++        var t: Turns = .{ .turns = &.{ .{ .frames = 5 }, .{ .frames = 0, .reason = .failed } } };
++        defer t.deinit();
++        const r = try serve(&t, config(.{ .chars = 20 }), try body(a, try sentences(a, 2), stream));
++        defer done(r.s);
++        const rest = try r.s.readRest();
++        if (stream) {
++            try std.testing.expect(std.mem.indexOf(u8, r.head, "HTTP/1.1 200") != null and std.mem.indexOf(u8, rest, "\r\n0\r\n") == null);
++        } else {
++            try std.testing.expect(std.mem.indexOf(u8, r.head, "HTTP/1.1 500") != null and std.mem.indexOf(u8, rest, "scripted failure") != null);
++        }
++    }
++}
+diff --git a/zig/src/server/speech_stream_test.zig b/zig/src/server/speech_stream_test.zig
+index 9a3ca4d8..f6e58e7b 100644
+--- a/zig/src/server/speech_stream_test.zig
++++ b/zig/src/server/speech_stream_test.zig
+@@ -64,9 +64,9 @@ const Script = struct {
+     }
+ };
+ 
+-/// Every byte is its own token: the route's prompt encoding needs no vocabulary.
+-const Bytes = struct {
+-    fn text(t: *Bytes) model_text.Text {
++/// Every byte is its own token, and ``<|semantic:0|>`` is 256: the route's prompt encoding needs no vocabulary.
++pub const Bytes = struct {
++    pub fn text(t: *Bytes) model_text.Text {
+         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
+     }
+     fn encode(_: *anyopaque, a: std.mem.Allocator, input: []const u8, _: bool) model_text.Error![]u32 {
+@@ -79,8 +79,8 @@ const Bytes = struct {
+         for (ids, out) |id, *byte| byte.* = @intCast(id);
+         return out;
+     }
+-    fn tokenId(_: *anyopaque, _: []const u8) ?u32 {
+-        return null;
++    fn tokenId(_: *anyopaque, piece: []const u8) ?u32 {
++        return if (std.mem.eql(u8, piece, "<|semantic:0|>")) 256 else null;
+     }
+     fn tokenString(_: *anyopaque, a: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
+         return std.fmt.allocPrint(a, "{d}", .{id});
+@@ -100,7 +100,7 @@ const Bytes = struct {
+ };
+ 
+ /// One request served on its own thread; the test reads the reply from the client end as it arrives.
+-const Served = struct {
++pub const Served = struct {
+     srv: *server.Server,
+     text: Bytes = .{},
+     client: std.c.fd_t,
+@@ -113,10 +113,14 @@ const Served = struct {
+     client_open: bool = true,
+ 
+     fn start(s: *Served, script: *Script, version: []const u8, body: []const u8, write_ms: i32) !void {
++        try s.startWith(script.engine(), .{ .served_name = "m", .model_ids = &.{"m"} }, version, body, write_ms);
++    }
++
++    pub fn startWith(s: *Served, engine: api.Engine, config: server.Config, version: []const u8, body: []const u8, write_ms: i32) !void {
+         var pair: [2]std.c.fd_t = undefined;
+         if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+         s.* = .{ .srv = undefined, .client = pair[0], .route_fd = pair[1], .route = undefined, .write_ms = write_ms };
+-        s.srv = try server.Server.init(gpa, std.testing.io, script.engine(), s.text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
++        s.srv = try server.Server.init(gpa, std.testing.io, engine, s.text.text(), config, null);
+         var head: [160]u8 = undefined;
+         try writeAll(s.client, try std.fmt.bufPrint(&head, "POST /v1/audio/speech {s}\r\nHost: t\r\nContent-Length: {d}\r\n\r\n", .{ version, body.len }));
+         try writeAll(s.client, body);
+@@ -141,7 +145,7 @@ const Served = struct {
+         script.thread = null;
+     }
+ 
+-    fn deinit(s: *Served) void {
++    pub fn deinit(s: *Served) void {
+         if (s.client_open) _ = std.c.close(s.client);
+         _ = std.c.close(s.route_fd);
+         s.got.deinit(gpa);
+@@ -163,7 +167,7 @@ const Served = struct {
+         return true;
+     }
+ 
+-    fn readHead(s: *Served) ![]const u8 {
++    pub fn readHead(s: *Served) ![]const u8 {
+         while (std.mem.indexOf(u8, s.got.items, "\r\n\r\n") == null) if (!try s.more(2000)) return error.NoHead;
+         const end = std.mem.indexOf(u8, s.got.items, "\r\n\r\n").? + 4;
+         s.read_at = end;
+@@ -187,7 +191,7 @@ const Served = struct {
+     }
+ 
+     /// Every chunk's bytes until the reply ends; `terminated`: the zero chunk came.
+-    fn payload(s: *Served, terminated: *bool) ![]u8 {
++    pub fn payload(s: *Served, terminated: *bool) ![]u8 {
+         var out: std.ArrayList(u8) = .empty;
+         errdefer out.deinit(gpa);
+         while (s.readChunk()) |chunk| {
+@@ -202,7 +206,7 @@ const Served = struct {
+     }
+ 
+     /// The rest of a reply the route has finished writing.
+-    fn readRest(s: *Served) ![]const u8 {
++    pub fn readRest(s: *Served) ![]const u8 {
+         while (try s.more(200)) {}
+         return s.got.items[s.read_at..];
+     }
+-- 
+2.43.0
+

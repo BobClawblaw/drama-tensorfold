@@ -43,6 +43,8 @@ def main() -> int:
     parser.add_argument('--evidence-dir', type=Path, required=True)
     parser.add_argument('--port', type=int, default=18793)
     parser.add_argument('--ready-timeout', type=float, default=900)
+    parser.add_argument('serve_args', nargs='*', metavar='SERVE_ARG',
+                        help='Extra tensorfold-native serve flags, after --, e.g. -- --max-frames 4096 --long-form')
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error('Port must be between 1 and 65535')
@@ -62,10 +64,12 @@ def main() -> int:
         server_command = [str(executable), 'serve', str(checkpoint), '--host', '127.0.0.1',
                           '--port', str(args.port), '--name', 'fishaudio/drama-3',
                           '--context', '8192', '--parallel', '1', '--no-drafts',
-                          '--prompt-cache-gib', '0', '--keep-warm', '0']
+                          '--prompt-cache-gib', '0', '--keep-warm', '0', *args.serve_args]
         backend_environment = ['TENSORFOLD_MEMORY_RESERVE_GIB=34',
                                'TENSORFOLD_CUDA_MEMORY_LIMIT_GB=54']
         allocator_caps = {'tracked_cuda_and_pinned_host_buffers': 54}
+    elif args.serve_args:
+        parser.error('Extra serve flags apply to the native backend only')
     else:
         executable = root / 'venv/bin/sgl-omni'
         working_directory = root / 'sglang-omni'

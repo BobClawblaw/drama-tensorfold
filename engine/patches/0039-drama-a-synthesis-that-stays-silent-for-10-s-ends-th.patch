@@ -1,0 +1,679 @@
+From f5c11dea7786b4fa78d376e174118c2ba6c4fb5c Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 20:52:07 +0800
+Subject: [PATCH 39/39] drama: a synthesis that stays silent for 10 s ends
+ there with finish reason silence
+
+The native model can stall in digital silence mid-reply. One stall lasted 7.4 s and recovered; two never recovered (37 s and 64 s) and padded the reply until end of speech or the frame cap. A 10 s silent run now ends the synthesis, keeps the audio and reports X-Finish-Reason: silence, for single replies, streams and every long-form segment.
+---
+ CHANGELOG.md                          |   3 +-
+ docs/drama-voices.md                  |  19 ++-
+ zig/src/core/engine_api.zig           |   3 +-
+ zig/src/native/drama_generate.zig     | 169 ++++++++++++++++++++++++++
+ zig/src/native/drama_host.zig         | 129 +++++++++++---------
+ zig/src/server/chat.zig               |   1 +
+ zig/src/server/speech.zig             |  21 ++--
+ zig/src/server/speech_long.zig        |  14 ++-
+ zig/src/server/speech_long_test.zig   |  26 ++--
+ zig/src/server/speech_stream_test.zig |  34 +++---
+ 10 files changed, 318 insertions(+), 101 deletions(-)
+ create mode 100644 zig/src/native/drama_generate.zig
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1ea8aca2..71e7e281 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,8 +4,9 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
+ 
+ ## Unreleased
+ 
++- speech: a Drama 3 synthesis that stays silent (below -60 dBFS) for 10 s ends there with `X-Finish-Reason: silence` and keeps its audio. Before, a collapsed reply generated up to a minute of near-digital silence before its end of speech or the frame limit. A stall that recovers sooner (one measured stall lasted 7.4 s) is kept untouched. Silence reached in the last frames still counts, ahead of the end of speech and the frame limit. With `--long-form`, such a segment ends the reply. To hear the audio while generating, a whole reply now decodes every 16 frames, with the incremental decode streams already use. On the 48-request default-voice capture, all 46 normal replies were byte-identical to the previous build, and the reply that stayed silent for 37 s was cut 10 s into its stall, a byte-identical prefix ([docs](docs/drama-voices.md#silence-guard))
+ - speech: `--max-frames N` (CUDA, 1 to 8191; default 1024) lets one Drama 3 synthesis generate up to N frames, so a reply of 190 s at N = 4096 is spoken in one pass with no joins. The context holds the prompt and the frames: prompts may take `min(4096, context - N)` rows, and `--context` must exceed N. The codec's decode buffers take about 1.19 MiB a frame (4.75 GiB at 4096). Text models refuse the flag. Without it, every limit and buffer is as before ([docs](docs/drama-voices.md#frame-limit))
+-- speech: `--long-form` speaks a long Drama 3 input in the fewest segments of up to `--long-form-chars` (default 500), balanced in length and cut where the text turns (a question, or a sentence opening with So, Okay, Now, Anyway, Here's, …), with a 0.60 s pause at such a cut. Each segment hears the earlier segments' text and generated codes as references (`--long-form-history`, default 1), so prosody carries across the joins. At each join only the pause the punctuation asks for and the model left out is added, as room tone (0.42 s after `.` and `!`, up to 0.70 s for a paragraph), and a segment off the earlier segments' speech level gets one gain of at most 3 dB. A reply has at most 12 segments and 6000 frames. `X-Long-Form-Segments` gives where each segment starts, and streams send the segments in order. With the flag off, or an input that fits in one segment, replies are unchanged ([docs](docs/drama-voices.md#long-form-replies))
++- speech: `--long-form` speaks a long Drama 3 input in the fewest segments of up to `--long-form-chars` (default 500), balanced in length and cut where the text turns (a question, or a sentence opening with So, Okay, Now, Anyway, Here's, …), with a 0.60 s pause at such a cut. Each segment hears the earlier segments' text and generated codes as references (`--long-form-history`, default 1), which keeps the speaker the same across a join; a new segment still restarts its prosody. At each join only the pause the punctuation asks for and the model left out is added, as room tone (0.42 s after `.` and `!`, up to 0.70 s for a paragraph), and a segment off the earlier segments' speech level gets one gain of at most 3 dB. A reply has at most 12 segments and 6000 frames. `X-Long-Form-Segments` gives where each segment starts, and streams send the segments in order. With the flag off, or an input that fits in one segment, replies are unchanged ([docs](docs/drama-voices.md#long-form-replies))
+ - speech: Drama 3 speaks in a reference voice. A request can send `references: [{text, vq_codes}]`. `--voices DIR` loads voice files a request names with `voice`, and `--default-voice NAME` uses one when a request names no voice. `tools/zig/drama_voice.py` encodes a clip offline with the pinned reference's codec encoder. The prompt rows match the reference's `build_prompt_rows` (fixture-gated with the real tokenizer), and requests without a voice reference build the same prompt as before ([docs](docs/drama-voices.md))
+ - speech: `stream: true` with `response_format: pcm` streams HTTP/1.1 chunks while Drama 3 generates; incremental codec decode bit-identical to the whole decode (oracle-gated)
+ - speech: Drama 3 generates 1.66x faster on a GB10 (warm real-time factor 1.087 to 0.655 over the 23 warm items of a 48-request capture), with the audio of every normally finished reply byte for byte the same. The one-row backbone GEMVs stream their weights through a swizzled `cp.async` ring, add-norm, SwiGLU, MoE combine and attention glue are fused or pipelined in the same float order, the tower runs its one-row decode attention as a cluster kernel and samples with a radix select, and the backbone chain launches with programmatic dependent launch when both embedded kernel images carry the `drama_pdl` marker. The tower's one-row projections run on `drama_tower_gemv`, which reproduces cuBLASLt 130101's gemv summation; `Model.init` checks each projection against its actual cuBLASLt plan on probe rows and keeps cuBLASLt for any projection that differs by one bit, or on any other GPU or library.
+diff --git a/docs/drama-voices.md b/docs/drama-voices.md
+index 16f01382..9c7a9b42 100644
+--- a/docs/drama-voices.md
++++ b/docs/drama-voices.md
+@@ -69,11 +69,24 @@ tensorfold serve DRAMA3_DIR --voices voices/ --default-voice NAME --max-frames 4
+ ```
+ 
+ - **Context.** The context holds the prompt and every frame, so `--context` (default and at most 8192, the tower attention's key limit) must exceed N. Prompts may take `min(4096, context - N)` rows. At N = 4096 that is 4096 rows; a voice reference takes one row per frame of its clip (339 for a 16 s clip) plus its transcript's tokens.
+-- **Memory.** The codec decodes the whole reply in one pass, so its buffers grow by about 1.19 MiB a frame: 1.19 GiB at 1024 frames, 4.75 GiB at 4096. The server's PCM buffer grows by 8 KiB a frame. When they do not fit the memory budget, startup fails with `OutOfDeviceMemory`.
++- **Memory.** The codec holds the whole reply's activations, so its buffers grow by about 1.19 MiB a frame: 1.19 GiB at 1024 frames, 4.75 GiB at 4096. The server's PCM buffer grows by 8 KiB a frame. When they do not fit the memory budget, startup fails with `OutOfDeviceMemory`.
+ - **Default.** Without the flag, the limits and buffers stay as they were.
+ 
+ With `--long-form`, each segment may use up to N frames, and a reply may use 6000 frames in all. Three English replies of 686 to 1483 characters, spoken in a reference voice, took 1.44 to 1.56 frames a character, pauses included. So `--long-form-chars` at about N / 2 leaves a segment room to spare. For example, `--max-frames 4096 --long-form --long-form-chars 2048` speaks inputs of up to 2048 characters in one synthesis. `--long-form-chars` keeps its default whatever N is.
+ 
++## Silence guard
++
++A synthesis can collapse: the model stops speaking and generates near-digital silence until its end of speech or the frame limit. One measured reply did this for 64 s; another stayed silent for 37 s until the frame limit. The model can also stall and then recover: one reply was silent for 7.4 s and then spoke the rest of its text correctly.
++
++So the engine decodes audio while it generates, every 4 frames for a stream and every 16 frames (0.74 s) otherwise. It ends a synthesis only once 10 s of frames in a row are below -60 dBFS (an RMS of 0.001), so a stall that has not recovered by then is treated as a collapse. Shorter stalls are kept as they are: the server does not trim them.
++
++- The audio made so far, including the silent run, is kept. The reply carries `X-Finish-Reason: silence`: a header on a whole reply, a trailer on a stream.
++- Silence that completes 10 s only in the last frames still counts. It outranks both the end of speech and the frame limit, because the reply collapsed however generation stopped.
++- With `--long-form`, a segment ended this way ends the reply, as a clipped one does.
++- **Whole replies decode in chunks of 16 frames,** with the incremental decode that streams use. This was measured on the 48-request default-voice capture against the previous build:
++  - All 46 normal replies were byte-identical (two passes of 23), including the one with the recovering 7.4 s stall. 9 of 9 streams matched.
++  - The reply with the 37 s silence was cut in both passes at 20.8 s, 10 s into its stall. What remained was a byte-identical prefix of the previous build's audio.
++
+ ## Long-form replies
+ 
+ ```sh
+@@ -101,8 +114,8 @@ With `--long-form`, a speech input longer than `--long-form-chars` (default 500
+ - **Limits.**
+   - More than 12 segments are refused up front.
+   - A reply may use 6000 frames in all; each segment gets at most what is left.
+-  - A segment that is clipped (by the engine's frame limit or the budget) ends the reply, and its audio is kept.
+-- **Response headers.** `X-Finish-Reason` is `stop` only when every segment stopped by itself. `X-Long-Form-Segments: N;S2,S3,…` gives the number of segments spoken and the sample offset at which each segment after the first starts, after the added pauses.
++  - A segment that is clipped (by the engine's frame limit or the budget) or ended by the silence guard ends the reply, and its audio is kept.
++- **Response headers.** `X-Finish-Reason` is `stop` only when every segment stopped by itself; otherwise it is the last segment's `length` or `silence`. `X-Long-Form-Segments: N;S2,S3,…` gives the number of segments spoken and the sample offset at which each segment after the first starts, after the added pauses.
+ - **Streaming.** With `stream: true`, segment 1 streams as it is made. Each later segment is sent whole, with its pause, once it is complete, because its level and pause need all of it. Both headers come as trailers, declared by `Trailer: X-Finish-Reason, X-Long-Form-Segments`.
+ 
+ An input that fits in one segment, and every request when `--long-form` is off, is served exactly as before.
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 383b62a4..198387fe 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -118,7 +118,8 @@ pub const SpeechInfo = struct {
+     max_prompt_tokens: u32,
+ };
+ 
+-pub const Reason = enum { stop, length, cancelled, failed };
++/// `silence`: a speech synthesis ended by its silence guard, its audio kept as a `length` one keeps its clipped audio.
++pub const Reason = enum { stop, length, cancelled, failed, silence };
+ 
+ /// What a finished reply's rounds did, for its runtime fields and /metrics.
+ pub const Stats = struct {
+diff --git a/zig/src/native/drama_generate.zig b/zig/src/native/drama_generate.zig
+new file mode 100644
+index 00000000..42b6cf5f
+--- /dev/null
++++ b/zig/src/native/drama_generate.zig
+@@ -0,0 +1,169 @@
++//! Drama 3's frame loop: frames until end of speech, the frame cap or a collapse into silence, decoded as they come.
++const std = @import("std");
++const api = @import("engine_api");
++
++pub const Codes = [10]u32;
++
++/// Seconds of silent frames that end a synthesis: one stalled 7.4 s and recovered; collapses ran 37 s and 64 s.
++pub const seconds = 10;
++/// A frame below -60 dBFS (an RMS of 0.001) is silent: a collapsed render sat at -93 dBFS, speech far above.
++const floor_power = 1e-6;
++
++/// The samples of the current run of silent frames.
++pub const Guard = struct {
++    limit: usize,
++    run: usize = 0,
++
++    pub fn init(sample_rate: u32) Guard {
++        return .{ .limit = seconds * @as(usize, sample_rate) };
++    }
++
++    /// Hears whole frames of `frame_length` samples; true as soon as a silent run has lasted `seconds`.
++    pub fn hear(g: *Guard, pcm: []const f32, frame_length: usize) bool {
++        var frames = std.mem.window(f32, pcm, frame_length, frame_length);
++        while (frames.next()) |samples| {
++            var power: f32 = 0;
++            for (samples) |x| power += x * x;
++            g.run = if (power < floor_power * @as(f32, @floatFromInt(samples.len))) g.run + samples.len else 0;
++            if (g.run >= g.limit) return true; // later speech in the same chunk does not undo the collapse
++        }
++        return false;
++    }
++};
++
++/// When a synthesis decodes while it generates: once it has `first` frames, then every `chunk` more.
++pub const Cadence = struct { first: usize, chunk: usize };
++
++/// How a synthesis ended, and the frames it made.
++pub const Ending = struct { frames: usize, reason: api.Reason };
++
++/// Fills `codes` (as long as the cap) from `source.next()` (null: EOS), decoding with `source.decode` at `cadence`.
++pub fn run(source: anytype, codes: []Codes, cadence: Cadence, sample_rate: u32, frame_length: usize) !Ending {
++    var guard: Guard = .init(sample_rate);
++    var count: usize = 0;
++    var decoded: usize = 0;
++    var reason: api.Reason = .stop;
++    while (try source.next()) |made| {
++        codes[count] = made;
++        count += 1;
++        if (count == codes.len) {
++            reason = .length;
++            break;
++        }
++        if (count - decoded == if (decoded == 0) cadence.first else cadence.chunk) {
++            decoded = count;
++            if (guard.hear(try source.decode(codes[0..count]), frame_length)) return .{ .frames = count, .reason = .silence };
++        }
++    }
++    // silence heard in the last frames outranks end of speech and the cap: the reply collapsed however it stopped
++    if (count > decoded and guard.hear(try source.decode(codes[0..count]), frame_length)) reason = .silence;
++    return .{ .frames = count, .reason = reason };
++}
++
++const rate = 44100;
++const frame = 2048;
++const speech: f32 = 0.25;
++const collapse: f32 = 2.2e-5; // -93 dBFS, the level a collapsed render held
++const stream: Cadence = .{ .first = 1, .chunk = 4 };
++const whole: Cadence = .{ .first = 16, .chunk = 16 };
++
++/// A scripted synthesis: one level a frame, then end of speech; `asked` counts the frames the loop asked for.
++const Script = struct {
++    levels: []const f32,
++    pcm: []f32,
++    asked: usize = 0,
++    decoded: usize = 0,
++
++    fn next(s: *Script) !?Codes {
++        if (s.asked == s.levels.len) return null;
++        s.asked += 1;
++        return @splat(0);
++    }
++
++    fn decode(s: *Script, codes: []const Codes) ![]const f32 {
++        const from = s.decoded;
++        for (s.levels[from..codes.len], from..) |level, f| @memset(s.pcm[f * frame ..][0..frame], level);
++        s.decoded = codes.len;
++        return s.pcm[from * frame .. codes.len * frame];
++    }
++};
++
++/// How the loop ends a synthesis of `levels` under a frame cap of `cap`, and the frames it asked the model for.
++fn ends(levels: []const f32, cap: usize, cadence: Cadence) !struct { Ending, usize } {
++    const gpa = std.testing.allocator;
++    const pcm = try gpa.alloc(f32, levels.len * frame);
++    defer gpa.free(pcm);
++    const codes = try gpa.alloc(Codes, cap);
++    defer gpa.free(codes);
++    var s: Script = .{ .levels = levels, .pcm = pcm };
++    return .{ try run(&s, codes, cadence, rate, frame), s.asked };
++}
++
++/// `speaking` frames of speech, then `silent` of collapse.
++fn collapsed(comptime speaking: usize, comptime silent: usize) [speaking + silent]f32 {
++    var levels: [speaking + silent]f32 = undefined;
++    @memset(levels[0..speaking], speech);
++    @memset(levels[speaking..], collapse);
++    return levels;
++}
++
++test "a reply that collapses into silence ends 10 s into it, within one decode chunk, and asks for no more frames" {
++    const levels = collapsed(140, 1400); // 6.5 s of speech, then 65 s of collapse: what one render did
++    const trip = 140 + 216; // 216 frames of 2048 samples are the first run past 10 s at 44.1 kHz
++    for ([_]Cadence{ stream, whole }) |cadence| {
++        const ending, const asked = try ends(&levels, 4096, cadence);
++        try std.testing.expectEqual(api.Reason.silence, ending.reason);
++        try std.testing.expect(ending.frames >= trip and ending.frames < trip + cadence.chunk and asked == ending.frames);
++    }
++}
++
++test "a 7.4 s stall that recovers into speech, as one measured reply did, does not trip it" {
++    var levels: [118 + 159 + 400]f32 = undefined; // 5.48 s of speech, a 7.40 s stall, then the rest of the text
++    @memset(&levels, speech);
++    @memset(levels[118..][0..159], collapse);
++    for ([_]Cadence{ stream, whole }) |cadence| {
++        try std.testing.expectEqual(Ending{ .frames = levels.len, .reason = .stop }, (try ends(&levels, 4096, cadence))[0]);
++    }
++}
++
++test "pauses at the collapse's level never trip it short of 10 s; 10 s does" {
++    var levels: [10 * (40 + 39)]f32 = undefined; // 1.86 s of speech, then a 1.81 s pause, ten times
++    for (0..10) |i| {
++        @memset(levels[i * 79 ..][0..40], speech);
++        @memset(levels[i * 79 + 40 ..][0..39], collapse);
++    }
++    try std.testing.expectEqual(Ending{ .frames = levels.len, .reason = .stop }, (try ends(&levels, 4096, whole))[0]);
++    var edge: [40 + 215 + 40]f32 = undefined; // 215 silent frames: 9.98 s
++    @memset(&edge, speech);
++    @memset(edge[40..][0..215], 0);
++    const one: Cadence = .{ .first = 1, .chunk = 1 };
++    try std.testing.expectEqual(Ending{ .frames = edge.len, .reason = .stop }, (try ends(&edge, 4096, one))[0]);
++    edge[255] = 0;
++    try std.testing.expectEqual(Ending{ .frames = 256, .reason = .silence }, (try ends(&edge, 4096, one))[0]);
++}
++
++test "a run that reaches 10 s inside a decode chunk trips it, though speech resumes before the chunk ends" {
++    var levels: [20 + 216 + 30]f32 = undefined; // the 216th silent frame, 235, is mid-chunk for streams and whole replies
++    @memset(&levels, speech);
++    @memset(levels[20..][0..216], collapse);
++    try std.testing.expectEqual(Ending{ .frames = 237, .reason = .silence }, (try ends(&levels, 4096, stream))[0]);
++    try std.testing.expectEqual(Ending{ .frames = 240, .reason = .silence }, (try ends(&levels, 4096, whole))[0]);
++}
++
++test "silence reached in the last frames outranks end of speech and the frame cap" {
++    // whole replies decode at 352, streams at 353: 10 s of silence completes only in the final decode
++    const whole_tail = collapsed(140, 216);
++    const stream_tail = collapsed(138, 216);
++    try std.testing.expectEqual(Ending{ .frames = 356, .reason = .silence }, (try ends(&whole_tail, 4096, whole))[0]);
++    try std.testing.expectEqual(Ending{ .frames = 354, .reason = .silence }, (try ends(&stream_tail, 4096, stream))[0]);
++    try std.testing.expectEqual(Ending{ .frames = 356, .reason = .silence }, (try ends(&whole_tail, 356, whole))[0]);
++    const spoken = collapsed(205, 0);
++    try std.testing.expectEqual(Ending{ .frames = 205, .reason = .stop }, (try ends(&spoken, 4096, whole))[0]);
++    try std.testing.expectEqual(Ending{ .frames = 200, .reason = .length }, (try ends(&spoken, 200, whole))[0]);
++}
++
++test "quiet speech above -60 dBFS is not silence" {
++    var levels: [400]f32 = undefined; // 18.6 s, well past the 216 frames that would end silence
++    @memset(&levels, 0.0011);
++    try std.testing.expectEqual(Ending{ .frames = 400, .reason = .stop }, (try ends(&levels, 4096, whole))[0]);
++}
+diff --git a/zig/src/native/drama_host.zig b/zig/src/native/drama_host.zig
+index 383b09c8..fcc258ee 100644
+--- a/zig/src/native/drama_host.zig
++++ b/zig/src/native/drama_host.zig
+@@ -5,6 +5,7 @@ const cuda = @import("cuda");
+ const api = @import("engine_api");
+ const drama = @import("drama");
+ const budget = @import("cuda_memory.zig");
++const generation = @import("drama_generate.zig");
+ const Allocator = std.mem.Allocator;
+ 
+ const Frame = drama.tower.Frame;
+@@ -26,6 +27,8 @@ const sample_rate = 44100;
+ const frame_length = 2048;
+ /// Frames a streamed request decodes together after its first, which is decoded alone for the earliest audio.
+ const stream_chunk_frames = 4;
++/// Frames a whole reply decodes together while it generates, so its silence guard hears the audio as it is made.
++const whole_chunk_frames = 16;
+ 
+ pub const Options = struct {
+     context: usize = 8192,
+@@ -242,7 +245,7 @@ const Host = struct {
+             return h.finish(job, .failed, stats, words(e));
+         };
+         r.result.samples = done.samples; // published only after the full decode and the final cancellation check
+-        h.finish(job, if (done.truncated) .length else .stop, stats, "");
++        h.finish(job, done.reason, stats, "");
+     }
+ 
+     /// Frees the slot (a new request may be admitted while this one's event is out), then sends `finished`.
+@@ -258,8 +261,8 @@ const Host = struct {
+         job.sink.event(job.sink.ctx, job.id, &event);
+     }
+ 
+-    /// Prompt pass, frame generation and codec decode into the request's PCM (streamed by `publish`). A synthesis that
+-    /// reaches max_frames without its end of speech stops there and keeps those frames' audio, marked truncated.
++    /// Prompt pass, then the frame loop (`generation.run`) decoding into the request's PCM as it goes. A synthesis
++    /// stopped by max_frames (`length`) or by its silence guard (`silence`) keeps the audio it made.
+     fn synthesize(h: *Host, job: Job, stats: *api.Stats, began: i96) !Done {
+         const r = job.request;
+         try h.check();
+@@ -296,68 +299,76 @@ const Host = struct {
+ 
+         // Generation: the last row's hidden state and semantic logits give a frame; a frame that is not EOS is the
+         // next backbone row. Steps are bounded by max_frames, the EOS step included.
+-        const sampling: drama.tower.Sampling = .{ .temperature = r.temperature, .top_p = r.top_p, .top_k = r.top_k };
+-        var hidden = try lastRow(last.hidden, last.rows, b.hidden * 2);
+-        var logits = try lastRow(last.semantic_logits, 1, logit_cols * 4);
++        var steps: Steps = .{
++            .h = h,
++            .job = job,
++            .stats = stats,
++            .sampling = .{ .temperature = r.temperature, .top_p = r.top_p, .top_k = r.top_k },
++            .hidden = try lastRow(last.hidden, last.rows, b.hidden * 2),
++            .logits = try lastRow(last.semantic_logits, 1, logit_cols * 4),
++        };
+         // a caller's generated buffer takes the codes in place of the host's own: nothing is copied either way
+         const codes: []Codes = if (r.generated.len > 0) r.generated else h.codes;
+-        var count: usize = 0;
+-        var truncated = false;
+-        var published: usize = 0; // frames a streamed request's caller owns
+-        if (r.stream) h.codec.begin();
+-        while (true) {
++        const cadence: generation.Cadence = if (r.stream) .{ .first = 1, .chunk = stream_chunk_frames } else .{ .first = whole_chunk_frames, .chunk = whole_chunk_frames };
++        h.codec.begin();
++        const ending = try generation.run(&steps, codes[0..r.max_frames], cadence, sample_rate, frame_length);
++        if (ending.frames == 0) return error.EmptySpeech;
++        return .{ .samples = ending.frames * frame_length, .reason = ending.reason };
++    }
++
++    /// What a finished synthesis produced: its samples, and why it ended (stop, length or silence).
++    const Done = struct { samples: usize, reason: api.Reason };
++
++    /// The frame loop's source: the backbone and tower's next frame, and the codec's decode of the frames so far.
++    const Steps = struct {
++        h: *Host,
++        job: Job,
++        stats: *api.Stats,
++        sampling: drama.tower.Sampling,
++        hidden: cuda.DeviceBuffer,
++        logits: cuda.DeviceBuffer,
++        count: usize = 0,
++
++        /// The next frame's codes, or null at end of speech; each frame after the first feeds the one before it in.
++        pub fn next(s: *Steps) !?Codes {
++            const h = s.h;
++            const b = &h.backbone;
++            const t = &h.tower;
+             try h.check();
+-            const frame = try t.generate(s, logits, hidden, sampling);
+-            stats.rounds += 1;
+-            if (frame[0] == h.eos) break;
+-            if (frame[0] < h.semantic_start or frame[0] > h.semantic_end) return error.BadSpeechFrame;
+-            codes[count] = frame[1..11].*;
+-            count += 1;
+-            h.noteFrames(count);
+-            if (count == r.max_frames) {
+-                truncated = true;
+-                break;
++            if (s.count > 0) {
++                const extra = try t.setInput(h.stream, h.frames[0..1]);
++                const rows = try b.run(h.stream, .decode, h.frames[0][0..1], extra);
++                if (rows.rows != 1) return error.DramaRowsMismatch;
++                s.hidden = try lastRow(rows.hidden, 1, b.hidden * 2);
++                s.logits = try lastRow(rows.semantic_logits, 1, logit_cols * 4);
+             }
+-            if (r.stream and (published == 0 or count - published == stream_chunk_frames)) published = try h.publish(job, codes[0..count]);
++            const frame = try t.generate(h.stream, s.logits, s.hidden, s.sampling);
++            s.stats.rounds += 1;
++            if (frame[0] == h.eos) return null;
++            if (frame[0] < h.semantic_start or frame[0] > h.semantic_end) return error.BadSpeechFrame;
+             h.frames[0] = frame;
+-            const extra = try t.setInput(s, h.frames[0..1]);
+-            const rows = try b.run(s, .decode, h.frames[0][0..1], extra);
+-            if (rows.rows != 1) return error.DramaRowsMismatch;
+-            hidden = try lastRow(rows.hidden, 1, b.hidden * 2);
+-            logits = try lastRow(rows.semantic_logits, 1, logit_cols * 4);
++            s.count += 1;
++            h.noteFrames(s.count);
++            return frame[1..11].*;
+         }
+-        if (count == 0) return error.EmptySpeech;
+ 
+-        try h.check();
+-        if (r.stream) {
+-            if (count > published) _ = try h.publish(job, codes[0..count]);
+-            return .{ .samples = count * frame_length, .truncated = truncated };
++        /// Decodes the frames not yet decoded and checks them (a stream's caller then owns them); their PCM.
++        pub fn decode(s: *Steps, codes: []const Codes) ![]const f32 {
++            const h = s.h;
++            try h.check();
++            const r = s.job.request;
++            const from = h.codec.decoded * frame_length;
++            const samples = try h.codec.advance(h.stream, codes, r.pcm);
++            if (samples != codes.len * frame_length) return error.CodecSampleCount;
++            for (r.pcm[from..samples]) |x| if (!std.math.isFinite(x)) return error.NonFiniteAudio;
++            try h.check();
++            if (r.stream) {
++                const event: api.Event = .{ .audio = samples };
++                s.job.sink.event(s.job.sink.ctx, s.job.id, &event);
++            }
++            return r.pcm[from..samples];
+         }
+-        const want = count * frame_length;
+-        const samples = try h.codec.decode(s, codes[0..count], r.pcm);
+-        if (samples != want) return error.CodecSampleCount;
+-        for (r.pcm[0..samples]) |x| if (!std.math.isFinite(x)) return error.NonFiniteAudio;
+-        try h.check();
+-        return .{ .samples = samples, .truncated = truncated };
+-    }
+-
+-    /// What a finished synthesis produced: its samples, and whether it stopped at max_frames before its end of speech.
+-    const Done = struct { samples: usize, truncated: bool };
+-
+-    /// Decodes the frames not yet decoded, checks them, then hands pcm[0..frames * 2048] over with an `audio` event.
+-    fn publish(h: *Host, job: Job, codes: []const Codes) !usize {
+-        try h.check();
+-        const r = job.request;
+-        const from = h.codec.decoded * frame_length;
+-        const samples = try h.codec.advance(h.stream, codes, r.pcm);
+-        const frames = codes.len;
+-        if (samples != frames * frame_length) return error.CodecSampleCount;
+-        for (r.pcm[from..samples]) |x| if (!std.math.isFinite(x)) return error.NonFiniteAudio;
+-        try h.check();
+-        const event: api.Event = .{ .audio = samples };
+-        job.sink.event(job.sink.ctx, job.id, &event);
+-        return frames;
+-    }
++    };
+ 
+     fn notePrefill(h: *Host, tokens: usize, began: i96, done: i96) void {
+         h.lock();
+@@ -526,6 +537,10 @@ fn close(ctx: *anyopaque) void {
+     h.gpa.destroy(h);
+ }
+ 
++test {
++    _ = generation;
++}
++
+ test "without --max-frames the limits are as before; a larger limit takes its rows from the prompt's share" {
+     try std.testing.expectEqual(api.SpeechInfo{ .sample_rate = 44100, .frame_length = 2048, .max_frames = 1024, .max_prompt_tokens = 4096 }, speechInfo(8192, default_max_frames).?);
+     try std.testing.expectEqual(@as(u32, 1025), speechInfo(2049, 1024).?.max_prompt_tokens);
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 3df35434..f7d83b33 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -428,6 +428,7 @@ const Generation = struct {
+             .stop => "stop",
+             .length => "length",
+             .cancelled => "cancelled",
++            .silence => "silence",
+             .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
+         };
+         const finished_ns = nowNs(g.srv.io);
+diff --git a/zig/src/server/speech.zig b/zig/src/server/speech.zig
+index 983dbcc8..53d373eb 100644
+--- a/zig/src/server/speech.zig
++++ b/zig/src/server/speech.zig
+@@ -200,11 +200,11 @@ pub fn left(srv: *Server, c: *Conn, id: []const u8, prompt_len: usize, received:
+     log.line("{s}", .{log.ended(&buf, id, null, prompt_len, 0, clock.seconds(clock.nowNs(srv.io) - received))});
+ }
+ 
+-/// Why a finished synthesis has no complete audio, or null. `length` is audio clipped at the frame limit: it is
+-/// returned, marked by X-Finish-Reason (a whole reply's header, a stream's trailer).
++/// Why a finished synthesis has no complete audio, or null. Audio cut short by the frame limit (`length`) or silence
++/// guard (`silence`) is returned, marked by X-Finish-Reason (a whole reply's header, a stream's trailer).
+ pub fn why(box: *const Mailbox, samples: usize, capacity: usize) ?[]const u8 {
+     return switch (box.reason) {
+-        .stop, .length => if (samples == 0 or samples > capacity) "the engine finished without complete audio" else null,
++        .stop, .length, .silence => if (samples == 0 or samples > capacity) "the engine finished without complete audio" else null,
+         .cancelled => "speech synthesis was cancelled",
+         .failed => if (box.message.len > 0) box.message else "speech synthesis failed",
+     };
+@@ -221,7 +221,7 @@ fn streamReply(srv: *Server, c: *Conn, cx: *Cx, id: []const u8, sp: api.SpeechIn
+         log.line("speech {s} stream ended incomplete after samples={d}: {s}", .{ id, sent.samples, message });
+         return;
+     }
+-    c.writeAll(if (box.reason == .length) length_chunk else last_chunk) catch {
++    c.writeAll(lastChunk(box.reason)) catch {
+         c.close = true;
+         return;
+     };
+@@ -303,10 +303,15 @@ pub fn startStream(c: *Conn, sample_rate: u32, trailer: []const u8) error{Closed
+     return c.finish("");
+ }
+ 
+-/// The terminating chunk after a complete synthesis's last samples; audio clipped at the frame limit ends with the
+-/// X-Finish-Reason trailer instead.
+-const last_chunk = "0\r\n\r\n";
+-const length_chunk = "0\r\nX-Finish-Reason: length\r\n\r\n";
++/// The terminating chunk after a complete synthesis's last samples; audio cut short (clipped at the frame limit, or
++/// ended by the silence guard) ends with the X-Finish-Reason trailer instead.
++fn lastChunk(reason: api.Reason) []const u8 {
++    return switch (reason) {
++        .length => "0\r\nX-Finish-Reason: length\r\n\r\n",
++        .silence => "0\r\nX-Finish-Reason: silence\r\n\r\n",
++        else => "0\r\n\r\n",
++    };
++}
+ 
+ fn refuse(c: *Conn, cx: *Cx, id: []const u8, e: errors.Refused) void {
+     if (e == error.OutOfMemory) {
+diff --git a/zig/src/server/speech_long.zig b/zig/src/server/speech_long.zig
+index cda0b247..453904a6 100644
+--- a/zig/src/server/speech_long.zig
++++ b/zig/src/server/speech_long.zig
+@@ -18,7 +18,7 @@ const Codes = drama_prompt.Codes;
+ /// A long-form reply's segments, the references each hears first, and how many earlier segments it hears after them.
+ pub const Long = struct { segments: []const []const u8, references: []const Reference, history: u8 };
+ 
+-/// The stream's trailers: the finish reason when clipped, and where the segments start.
++/// The stream's trailers: the finish reason when cut short, and where the segments start.
+ const trailer = "X-Finish-Reason, X-Long-Form-Segments";
+ 
+ /// The input's segments when it has two or more, each refused now as a whole input would be; null: one synthesis.
+@@ -62,8 +62,8 @@ pub fn synthesize(srv: *Server, c: *Conn, cx: *Cx, id: []const u8, sp: api.Speec
+             break;
+         }
+         if (!r.speak(i)) return;
+-        // a clipped segment's audio would be the next one's carry-over: the reply ends with it
+-        if (r.reason == .length) break;
++        // a clipped or silenced segment's audio would be the next one's carry-over: the reply ends with it
++        if (r.reason != .stop) break;
+     }
+     r.finish(format);
+ }
+@@ -147,7 +147,7 @@ const Reply = struct {
+         if (r.stream and !live) r.send(r.out[joined..r.samples]) catch |e| return if (e == error.Closed) r.gone() else r.end(.server, "the synthesized audio has non-finite samples");
+         r.heard.append(r.cx.a, .{ .text = r.long.segments[i], .frames = r.generated[r.frames..][0..frames] }) catch return r.end(.server, "out of memory");
+         r.frames += frames;
+-        if (box.reason == .length) r.reason = .length;
++        if (box.reason != .stop) r.reason = box.reason;
+         return true;
+     }
+ 
+@@ -240,7 +240,11 @@ const Reply = struct {
+     fn finish(r: *Reply, format: speech.Format) void {
+         const segments = drama_long.segmentsHeader(r.cx.a, r.starts.items) catch return speech.fail(r.c, r.cx, r.id, .server, "out of memory");
+         if (r.stream) {
+-            const reason = if (r.reason == .length) "X-Finish-Reason: length\r\n" else "";
++            const reason = switch (r.reason) {
++                .length => "X-Finish-Reason: length\r\n",
++                .silence => "X-Finish-Reason: silence\r\n",
++                else => "",
++            };
+             const last = std.fmt.allocPrint(r.cx.a, "0\r\n{s}X-Long-Form-Segments: {s}\r\n\r\n", .{ reason, segments }) catch "0\r\n\r\n";
+             r.c.writeAll(last) catch {
+                 r.c.close = true;
+diff --git a/zig/src/server/speech_long_test.zig b/zig/src/server/speech_long_test.zig
+index 94c825ec..08aa2aaa 100644
+--- a/zig/src/server/speech_long_test.zig
++++ b/zig/src/server/speech_long_test.zig
+@@ -55,7 +55,7 @@ const Turns = struct {
+         };
+         if (request.stream and frames > 0) sink.event(sink.ctx, id, &.{ .audio = frames * frame });
+         const reason: api.Reason = if (turn.reason == .stop and frames == request.max_frames) .length else turn.reason;
+-        if (reason == .stop or reason == .length) request.result.samples = frames * frame;
++        if (reason == .stop or reason == .length or reason == .silence) request.result.samples = frames * frame;
+         sink.event(sink.ctx, id, &.{ .finished = .{ .reason = reason, .message = if (reason == .failed) "scripted failure" else "" } });
+     }
+     fn cancel(_: *anyopaque, _: api.Id) void {}
+@@ -279,17 +279,20 @@ test "history 2 hears two earlier segments, dropping the oldest when the prompt
+     }
+ }
+ 
+-test "a clipped segment ends the reply with length; later segments are not spoken" {
++test "a clipped or silenced segment ends the reply with its reason; later segments are not spoken" {
+     var arena: std.heap.ArenaAllocator = .init(gpa);
+     defer arena.deinit();
+     const a = arena.allocator();
+-    var t: Turns = .{ .turns = &.{ .{ .frames = 5 }, .{ .frames = 3, .reason = .length }, .{ .frames = 7 } } };
+-    defer t.deinit();
+-    const r = try serve(&t, config(.{ .chars = 20 }), try body(a, try sentences(a, 3), false));
+-    defer done(r.s);
+-    try std.testing.expectEqual(@as(usize, 2), t.seen);
+-    try std.testing.expect(std.mem.indexOf(u8, r.head, "X-Finish-Reason: length\r\nX-Long-Form-Segments: 2;470\r\n") != null);
+-    try std.testing.expectEqual(@as(usize, 2 * (frame * 8 + 420)), (try r.s.readRest()).len);
++    for ([_]api.Reason{ .length, .silence }) |cut| {
++        var t: Turns = .{ .turns = &.{ .{ .frames = 5 }, .{ .frames = 3, .reason = cut }, .{ .frames = 7 } } };
++        defer t.deinit();
++        const r = try serve(&t, config(.{ .chars = 20 }), try body(a, try sentences(a, 3), false));
++        defer done(r.s);
++        try std.testing.expectEqual(@as(usize, 2), t.seen);
++        const head = try std.fmt.allocPrint(a, "X-Finish-Reason: {s}\r\nX-Long-Form-Segments: 2;470\r\n", .{@tagName(cut)});
++        try std.testing.expect(std.mem.indexOf(u8, r.head, head) != null);
++        try std.testing.expectEqual(@as(usize, 2 * (frame * 8 + 420)), (try r.s.readRest()).len);
++    }
+ }
+ 
+ test "the frame budget: each segment gets what is left, and a reply that spends it ends with length" {
+@@ -331,7 +334,7 @@ test "a long-form stream sends the first segment as it is made, then each later
+     var arena: std.heap.ArenaAllocator = .init(gpa);
+     defer arena.deinit();
+     const a = arena.allocator();
+-    for ([_]api.Reason{ .stop, .length }) |last| {
++    for ([_]api.Reason{ .stop, .length, .silence }) |last| {
+         const turns = [_]Turn{ .{ .frames = 5 }, .{ .frames = 3, .reason = last } };
+         var t: Turns = .{ .turns = &turns };
+         defer t.deinit();
+@@ -345,7 +348,8 @@ test "a long-form stream sends the first segment as it is made, then each later
+         try want.print(a, "\r\n{x}\r\n", .{2 * (420 + frame * 3)});
+         try zeros(&want, a, 420);
+         try turnPcm(&want, a, turns[1], 1);
+-        try want.print(a, "\r\n0\r\n{s}X-Long-Form-Segments: 2;470\r\n\r\n", .{if (last == .length) "X-Finish-Reason: length\r\n" else ""});
++        const reason = if (last == .stop) "" else try std.fmt.allocPrint(a, "X-Finish-Reason: {s}\r\n", .{@tagName(last)});
++        try want.print(a, "\r\n0\r\n{s}X-Long-Form-Segments: 2;470\r\n\r\n", .{reason});
+         try std.testing.expectEqualSlices(u8, want.items, try r.s.readRest());
+     }
+ }
+diff --git a/zig/src/server/speech_stream_test.zig b/zig/src/server/speech_stream_test.zig
+index 2e8708ac..657e508c 100644
+--- a/zig/src/server/speech_stream_test.zig
++++ b/zig/src/server/speech_stream_test.zig
+@@ -46,7 +46,7 @@ const Script = struct {
+             if (request.stream) sink.event(sink.ctx, id, &.{ .audio = n });
+             done = n;
+         }
+-        if (e.reason == .stop or e.reason == .length) request.result.samples = done;
++        if (e.reason == .stop or e.reason == .length or e.reason == .silence) request.result.samples = done;
+         sink.event(sink.ctx, id, &.{ .finished = .{ .reason = e.reason, .message = e.message } });
+     }
+     fn cancel(ctx: *anyopaque, _: api.Id) void {
+@@ -292,28 +292,32 @@ test "a failure after audio ends the stream without its terminating chunk" {
+     try std.testing.expect(!terminated and s.eof);
+ }
+ 
+-test "audio clipped at the frame limit ends the stream with the length trailer" {
+-    var script: Script = .{ .steps = &.{ frame, 2 * frame }, .reason = .length, .inline_ = true };
+-    var s: Served = undefined;
+-    try s.start(&script, "HTTP/1.1", stream_body, 2000);
+-    defer s.deinit();
+-    try expectHeader(try s.readHead(), "Trailer: X-Finish-Reason\r\n");
+-    s.join(&script);
+-    const rest = try s.readRest();
+-    const end = "\r\n0\r\nX-Finish-Reason: length\r\n\r\n";
+-    try std.testing.expect(std.mem.startsWith(u8, rest, "2000\r\n") and std.mem.endsWith(u8, rest, end));
+-    try std.testing.expectEqualStrings(&pcm(2), rest["2000\r\n".len .. rest.len - end.len]);
++test "audio cut short by the frame limit or the silence guard ends the stream with its reason's trailer" {
++    for ([_]api.Reason{ .length, .silence }) |reason| {
++        var script: Script = .{ .steps = &.{ frame, 2 * frame }, .reason = reason, .inline_ = true };
++        var s: Served = undefined;
++        try s.start(&script, "HTTP/1.1", stream_body, 2000);
++        defer s.deinit();
++        try expectHeader(try s.readHead(), "Trailer: X-Finish-Reason\r\n");
++        s.join(&script);
++        const rest = try s.readRest();
++        var buf: [64]u8 = undefined;
++        const end = try std.fmt.bufPrint(&buf, "\r\n0\r\nX-Finish-Reason: {s}\r\n\r\n", .{@tagName(reason)});
++        try std.testing.expect(std.mem.startsWith(u8, rest, "2000\r\n") and std.mem.endsWith(u8, rest, end));
++        try std.testing.expectEqualStrings(&pcm(2), rest["2000\r\n".len .. rest.len - end.len]);
++    }
+ }
+ 
+-test "a whole reply returns audio clipped at the frame limit and names its finish reason" {
+-    for ([_]api.Reason{ .stop, .length }) |reason| {
++test "a whole reply returns audio cut short and names its finish reason" {
++    for ([_]api.Reason{ .stop, .length, .silence }) |reason| {
+         var script: Script = .{ .steps = &.{frame}, .reason = reason };
+         var s: Served = undefined;
+         try s.start(&script, "HTTP/1.1", "{\"model\":\"m\",\"input\":\"hi\",\"response_format\":\"pcm\"}", 2000);
+         defer s.deinit();
+         const head = try s.readHead();
+         try expectHeader(head, "HTTP/1.1 200");
+-        try expectHeader(head, if (reason == .length) "X-Finish-Reason: length\r\n" else "X-Finish-Reason: stop\r\n");
++        var buf: [64]u8 = undefined;
++        try expectHeader(head, try std.fmt.bufPrint(&buf, "X-Finish-Reason: {s}\r\n", .{@tagName(reason)}));
+         s.join(&script);
+         try std.testing.expectEqualStrings(&pcm(1), try s.readRest());
+     }
+-- 
+2.43.0
+
