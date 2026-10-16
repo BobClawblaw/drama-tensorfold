@@ -28,3 +28,12 @@ b68639202cc50953852bd593b5e40a32c1a2cdfca7190121128ad36d4d7d5afb  0025-drama-the
 86f80bc7f72e66c10e44fbc4790ca924811c6c84698860a854fc04f5cba99cd9  0028-drama-the-codec-builds-its-weights-on-its-own-thread.patch
 9959ab7aa562f3a938d9921ca821e38913a375d89119ccaae6ab1d4d96b272c4  0029-drama-the-tower-s-one-row-projections-on-drama_tower.patch
 294b5176ac3efa1325f460315a68e630b76fe9fb15445716454ef79ed270c2e1  0030-drama-the-backbone-chain-launches-with-programmatic-.patch
+92024cc8e43b44834dc2d1cf66d0d800ce93e8b6592f74db0a343c1d553a6ba3  0031-drama-speech-requests-carry-voice-references-in-buil.patch
+1277a4eee7a9fbf97da70633f7ca5f4d32e9ad5efae0af52bfa5fe2af5ed0658  0032-drama-voices-serves-voice-files-and-default-voice-pi.patch
+7e5369e229ed29631a06f49150e8c16c1a8fc00f97b16a0fe64a0c1fb10a5658  0033-drama-tf-drama-reference-prefill-runs-the-backbone-o.patch
+37746f1aaf015cfc2606f2d64da8976ddd65e95b9e3147d2a5324e8bbd6364d3  0034-drama-a-speech-request-can-keep-the-codes-it-generat.patch
+4cb1a4502942cddb52711ff28575ccccf28fb039eaed661a854e8cd9a931ced2  0035-drama-long-form-speaks-long-inputs-in-segments-that-.patch
+5af560e26556465dc04c549da8fbcabdd76e3c27404ff6621099885be091c31b  0036-drama-long-form-joins-rest-as-the-punctuation-asks-a.patch
+30be9ec92a2d7358a5b1f1de74c7dfc265d21319a29678519c0edab472a07684  0037-drama-long-form-cuts-the-fewest-balanced-segments-wh.patch
+19c5fb60232a991fed4ad7e650e7e530064d4183823fe250c5d12fd685b4fbcd  0038-drama-max-frames-lets-one-synthesis-speak-a-whole-lo.patch
+7adeacde2cb31004b60cb49af51b81ed69e79db32187aea49e74bd6276e5853d  0039-drama-a-synthesis-that-stays-silent-for-10-s-ends-th.patch

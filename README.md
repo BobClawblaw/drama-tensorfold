@@ -93,15 +93,39 @@ the license's Section III(c), which needs a separate license from Fish Audio.
 <summary>HTTP contract</summary>
 
 `POST /v1/audio/speech` takes `model` (`fishaudio/drama-3`), `input` (at most 4096 characters), `voice`
-(`default` only), `response_format` (`wav` or `pcm`) and `stream` (`true` needs `pcm`). Anything else is
-refused.
+(`default`, or a name loaded with `--voices`), `references` (transcript plus `vq_codes`), `response_format`
+(`wav` or `pcm`) and `stream` (`true` needs `pcm`). Anything else is refused.
 
-- **Whole reply:** `Content-Length` framing and an `X-Finish-Reason: stop` or `length` header.
-- **Streamed reply:** chunked mono 16-bit 44.1 kHz PCM, sent as whole frames. A clipped stream ends with an
-  `X-Finish-Reason: length` trailer.
-- **`length`:** the reply hit the 1024-frame (47.55 s) cap without an end of speech; the audio is clipped.
+- **Whole reply:** `Content-Length` framing and an `X-Finish-Reason` header: `stop`, `length` or `silence`.
+- **Streamed reply:** chunked mono 16-bit 44.1 kHz PCM, sent as whole frames. A reply that did not end in `stop`
+  ends with an `X-Finish-Reason` trailer.
+- **`length`:** the reply hit the frame cap (`--max-frames`, 1024 by default, 47.55 s) without an end of speech;
+  the audio is clipped.
+- **`silence`:** the model stayed silent for 10 s; the reply ends there and keeps the audio before it.
 - **Errors:** `400` for a refused request, `503` while the single engine slot is busy, `500` for a server fault.
 </details>
+
+### Long replies
+
+Pass serve flags to the launcher after `--`:
+
+```sh
+python3 recipe/pilot.py … -- --max-frames 4096 --long-form --long-form-chars 2400
+```
+
+- **`--max-frames 4096`:** one synthesis speaks up to about 190 s, so a typical spoken reply is one generation
+  with no joins. Measured: 52 s, 49 s and 92.5 s replies each in one request, all ending in `stop`, Whisper WER
+  2.0-2.5%, rendered at RTF about 0.68.
+- **`--long-form`:** an input longer than `--long-form-chars` is spoken in balanced segments cut at sentence ends,
+  each conditioned on the previous segment's text and codes, joined with room-tone pauses sized by punctuation.
+  A new segment still restarts its prosody (measured +2 to +5 semitones at a join), so prefer one generation.
+- **`--voices DIR --default-voice NAME`:** serve voice files (a reference clip's transcript and codes) and make
+  one of them the voice `default` names. Make a clip's codes with `tools/zig/drama_voice.py` in the engine tree.
+- **Delivery:** if you re-encode replies to Opus, use `-application audio` at 64 kbps or more. `voip` at 48 kbps
+  cut 4-8 kHz by up to 4.8 dB in our tests.
+
+Without these flags every reply is unchanged: the 44 normal default-voice corpus replies are byte-identical,
+streams pass 9 of 9 checks, and only long-05 changes, cut at 20.8 s, 10 s into its silent stall.
 
 ## Status
 
@@ -113,8 +137,8 @@ refused.
 > - one-frame codec decode 33.1 dB (bar 40 dB);
 > - a 7-row tower top-1 that differs where the reference's logits tie.
 >
-> **Long text:** both engines can pad a reply with silence up to the 47.55 s cap. One test text (long-05) never
-> reaches an end of speech on native. Native returns the clipped audio, marked `X-Finish-Reason: length`.
+> **Long text:** the model can stall in silence mid-reply: one test text recovered after 7.4 s, long-05 never
+> recovered within the 47.55 s cap. Native now ends a reply after 10 s of silence with `X-Finish-Reason: silence`.
 
 One rater preferred native in 4 of 5 listening pairs; one pair was not blind. This does not change
 qualification. Every gate and result is in [`results/`](results/README.md).
