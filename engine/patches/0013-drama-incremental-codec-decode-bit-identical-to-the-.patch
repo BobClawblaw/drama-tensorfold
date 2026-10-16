@@ -1,0 +1,595 @@
+From 50a041ff5057eb081193ed9f77ee0d8e64c269e0 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 11:12:49 +0800
+Subject: [PATCH 13/30] drama: incremental codec decode, bit-identical to the
+ whole decode
+
+The codec can decode frames from a given frame onward at their absolute rows, reading the rows before them that
+its causal convolutions and attention windows reach, and writing nothing before them. Every chunk boundary gives
+the same samples as one decode of all frames, so audio can be decoded while it is generated.
+---
+ zig/kernels/cuda/drama_codec.cu          |  34 ++--
+ zig/src/families/drama/codec.zig         | 197 +++++++++++++++++------
+ zig/src/families/drama/codec_kernels.zig |  33 ++--
+ zig/tests/cuda/drama_codec_trace.zig     |   6 +-
+ 4 files changed, 188 insertions(+), 82 deletions(-)
+
+diff --git a/zig/kernels/cuda/drama_codec.cu b/zig/kernels/cuda/drama_codec.cu
+index 9c1ec33d..8cac1736 100644
+--- a/zig/kernels/cuda/drama_codec.cu
++++ b/zig/kernels/cuda/drama_codec.cu
+@@ -143,12 +143,12 @@ extern "C" __global__ void __launch_bounds__(256) drama_codec_rope(
+ // Match the pinned Torch efficient-attention path: absolute 64-key tiles,
+ // exp2 softmax, FP16 probabilities for P*V, and FP32 denominator/output accumulation.
+ // qkv [frames][3 * heads * 64], out [frames][heads * 64].
+-// Grid: (frames, heads); block: 128 threads.
++// Grid: (queries, heads) for queries t0.. at their absolute rows; block: 128 threads.
+ extern "C" __global__ void __launch_bounds__(128) drama_codec_window_attention(
+-    const __half* __restrict__ qkv, __half* __restrict__ out, int heads, int window, float scale) {
++    const __half* __restrict__ qkv, __half* __restrict__ out, int t0, int heads, int window, float scale) {
+   constexpr int tile = 64;
+   __shared__ float q[kHeadDim], p[tile], part[32];
+-  const int t = blockIdx.x, h = blockIdx.y, j = threadIdx.x;
++  const int t = t0 + blockIdx.x, h = blockIdx.y, j = threadIdx.x;
+   const size_t ld = (size_t)3 * heads * kHeadDim;
+   if (j < kHeadDim) q[j] = h2f(qkv[(size_t)t * ld + h * kHeadDim + j]);
+   __syncthreads();
+@@ -221,13 +221,13 @@ extern "C" __global__ void __launch_bounds__(256) drama_codec_layer_norm(
+ }
+ 
+ // ConvNeXtBlock.dwconv: causal depthwise conv, kernel 7, left padding 6 (rvq.py CausalConvNet),
+-// cuDNN then bias add_. x, y [rows][width]; w [width][7]. Grid: ceil(rows * width / 256).
++// cuDNN then bias add_. Rows t0..t0+rows-1 of x, y [..][width]; w [width][7]. Grid: ceil(rows * width / 256).
+ extern "C" __global__ void __launch_bounds__(256) drama_codec_dwconv7(
+     const __half* __restrict__ x, const __half* __restrict__ w, const __half* __restrict__ b,
+-    __half* __restrict__ y, long long rows, int width) {
++    __half* __restrict__ y, long long t0, long long rows, int width) {
+   const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= rows * width) return;
+-  const long long t = i / width;
++  const long long t = t0 + i / width;
+   const int c = (int)(i % width);
+   float acc = 0.f;
+ #pragma unroll
+@@ -235,7 +235,7 @@ extern "C" __global__ void __launch_bounds__(256) drama_codec_dwconv7(
+     const long long r = t - 6 + k;
+     if (r >= 0) acc = fmaf(h2f(x[r * width + c]), h2f(w[c * 7 + k]), acc);
+   }
+-  y[i] = f2h(rh(acc) + h2f(b[c]));
++  y[t * width + c] = f2h(rh(acc) + h2f(b[c]));
+ }
+ 
+ // dac Snake1d as channels_last_decoder.py's Triton kernel computes it: alpha and 1 / (alpha + 1e-9)
+@@ -253,12 +253,13 @@ extern "C" __global__ void __launch_bounds__(256) drama_codec_snake(
+ }
+ 
+ // The last decoder conv (96 -> 1, kernel 7, causal) and nn.Tanh, written as FP32 PCM:
+-// y = float(h(tanh(h(h(acc) + b)))). x [rows][width]; w [7][width]. Grid: ceil(rows / 256).
++// y = float(h(tanh(h(h(acc) + b)))). Rows t0..t0+rows-1; x [..][width]; w [7][width]. Grid: ceil(rows / 256).
+ extern "C" __global__ void __launch_bounds__(256) drama_codec_conv_out_tanh(
+     const __half* __restrict__ x, const __half* __restrict__ w, const __half* __restrict__ b,
+-    float* __restrict__ y, long long rows, int width) {
+-  const long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+-  if (t >= rows) return;
++    float* __restrict__ y, long long t0, long long rows, int width) {
++  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++  if (i >= rows) return;
++  const long long t = t0 + i;
+   float acc = 0.f;
+   for (int k = 0; k < 7; ++k) {
+     const long long r = t - 6 + k;
+@@ -278,6 +279,7 @@ extern "C" __global__ void __launch_bounds__(256) drama_codec_conv_out_tanh(
+ // n = j * cout + co, its output rows [q][j] being the output samples q * s + j.
+ // Epilogue, in the reference's order: bias (fused: h(acc + b); separate: h(h(acc) + b)), GELU
+ // (erf form), per-column scale (LayerScale / ConvNeXt gamma), residual add, each rounded to FP16.
++// Only rows m_begin <= m < m are read and written; tiles start at multiples of BM from row 0.
+ struct GemmParams {
+   const __half* x;
+   const __half* w;
+@@ -285,7 +287,7 @@ struct GemmParams {
+   const __half* scale;     // [period] or null
+   const __half* residual;  // [m][ldr] or null (may alias y)
+   __half* y;
+-  long long m;
++  long long m, m_begin;
+   int n, cin, taps, dilation, ldx, ldy, ldr, period, bias_mode, act;
+ };
+ 
+@@ -308,7 +310,7 @@ __device__ __forceinline__ float gemm_epilogue(const GemmParams& p, long long m,
+ }
+ }  // namespace
+ 
+-// Block 256 threads (8 warps as 2 x 4, each 64 x 32 of the 128 x 128 tile); grid (ceil(m / 128),
++// Block 256 threads (8 warps as 2 x 4, each 64 x 32 of the 128 x 128 tile); grid (tiles over [m_begin, m),
+ // ceil(n / 128)). Requires cin, ldx and ldy multiples of 8 and x, w 16-byte aligned.
+ extern "C" __global__ void __launch_bounds__(256) drama_codec_conv_gemm(const GemmParams p) {
+   using namespace nvcuda;
+@@ -317,7 +319,7 @@ extern "C" __global__ void __launch_bounds__(256) drama_codec_conv_gemm(const Ge
+   __shared__ __align__(128) float cs[8][16 * 16];
+   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+   const int wm = warp >> 2, wn = warp & 3;
+-  const long long m0 = (long long)blockIdx.x * BM;
++  const long long m0 = (p.m_begin / BM + blockIdx.x) * BM;
+   const int n0 = blockIdx.y * BN;
+   const int ktot = p.taps * p.cin;
+ 
+@@ -336,7 +338,7 @@ extern "C" __global__ void __launch_bounds__(256) drama_codec_conv_gemm(const Ge
+       const int kk = k0 + c;
+       uint4 a = make_uint4(0u, 0u, 0u, 0u), b = make_uint4(0u, 0u, 0u, 0u);
+       const long long m = m0 + r;
+-      if (m < p.m && kk < ktot) {
++      if (m >= p.m_begin && m < p.m && kk < ktot) {
+         const int tap = kk / p.cin, ci = kk - tap * p.cin;
+         const long long rin = m - (long long)(p.taps - 1 - tap) * p.dilation;
+         if (rin >= 0) a = *reinterpret_cast<const uint4*>(p.x + rin * p.ldx + ci);
+@@ -385,7 +387,7 @@ extern "C" __global__ void __launch_bounds__(256) drama_codec_conv_gemm(const Ge
+       for (int e = lane; e < 256; e += 32) {
+         const long long m = m0 + wm * 64 + i * 16 + (e >> 4);
+         const int n = n0 + wn * 32 + j * 16 + (e & 15);
+-        if (m < p.m && n < p.n) p.y[m * p.ldy + n] = f2h(gemm_epilogue(p, m, n, c[e]));
++        if (m >= p.m_begin && m < p.m && n < p.n) p.y[m * p.ldy + n] = f2h(gemm_epilogue(p, m, n, c[e]));
+       }
+       __syncwarp();
+     }
+diff --git a/zig/src/families/drama/codec.zig b/zig/src/families/drama/codec.zig
+index 9cff45f6..583f529f 100644
+--- a/zig/src/families/drama/codec.zig
++++ b/zig/src/families/drama/codec.zig
+@@ -12,7 +12,7 @@
+ //! Weights come straight from the pinned codec.pth (codec_pth.zig reads it without Python);
+ //! weight norm is folded in FP32 as torch._weight_norm folds it, then every tensor the reference
+ //! casts to FP16 is cast here with round-to-nearest-even. Snake alphas stay FP32, as the reference's
+-//! Triton kernel reads them (codec_load.zig).
++//! Triton kernel reads them (codec_load.zig). `decode` is one whole pass; `begin`/`advance` decode it frames at a time.
+ 
+ const std = @import("std");
+ const cuda = @import("cuda");
+@@ -26,6 +26,7 @@ pub const Options = struct { max_frames: usize = 1024 };
+ 
+ const latent = load.latent;
+ const codebooks = load.codebooks;
++const layers = load.layers;
+ const heads = load.heads;
+ const head_dim = load.head_dim;
+ const window = load.window;
+@@ -55,11 +56,45 @@ const act_halves_per_frame = blk: {
+     break :blk most;
+ };
+ 
++/// One causal consumer's kept rows: the last `rows` rows of `width` FP16 channels, right-aligned at `offset` in carry.
++const Carry = struct { offset: usize, rows: usize, width: usize };
++
++/// Every consumer that reads rows before a chunk's first: depthwise convs, conv0, transposed convs, conv7s, output.
++const Carries = struct {
++    dwconv: [upsample_stages]Carry,
++    conv0: Carry,
++    blocks: [rates.len]struct { transconv: Carry, units: [dilations.len]Carry },
++    out: Carry,
++    bytes: usize,
++};
++
++const carries: Carries = blk: {
++    var c: Carries = undefined;
++    var at: usize = 0;
++    for (&c.dwconv) |*d| d.* = keep(&at, 6, latent);
++    c.conv0 = keep(&at, 6, latent);
++    var ch: usize = decoder_dim;
++    for (&c.blocks) |*b| {
++        b.transconv = keep(&at, 1, ch);
++        ch /= 2;
++        for (&b.units, dilations) |*u, d| u.* = keep(&at, 6 * d, ch);
++    }
++    c.out = keep(&at, 6, out_channels);
++    c.bytes = at;
++    break :blk c;
++};
++
++fn keep(at: *usize, rows: usize, width: usize) Carry {
++    defer at.* += rows * width * 2;
++    return .{ .offset = at.*, .rows = rows, .width = width };
++}
++
+ comptime {
+     std.debug.assert(samples_per_frame == 2048);
+     std.debug.assert(out_channels == 96);
+-    // the transformer's scratch (5T and 9T rows of 1024) fits the same buffers
++    // the transformer's scratch (2T rows of 1024 in one buffer, 9T in another) fits the same buffers
+     std.debug.assert(act_halves_per_frame >= 9 * latent);
++    std.debug.assert(carries.bytes == 268416);
+ }
+ 
+ pub const Model = struct {
+@@ -76,6 +111,12 @@ pub const Model = struct {
+     audio_dev: cuda.DeviceBuffer,
+     codes_host: cuda.HostBuffer,
+     audio_host: cuda.HostBuffer,
++    /// Each transformer layer's qkv rows [max_frames][3 * latent]: attention reads earlier chunks' keys here.
++    kv: cuda.DeviceBuffer,
++    /// The rows each causal consumer reads before a chunk (`carries`).
++    carry: cuda.DeviceBuffer,
++    /// Frames of the utterance `advance` has decoded.
++    decoded: usize = 0,
+ 
+     pub fn init(gpa: Allocator, io: std.Io, ctx: *cuda.Context, checkpoint_dir: []const u8, kernel_dir: []const u8, options: Options) !Model {
+         if (options.max_frames == 0) return error.Invalid;
+@@ -110,7 +151,11 @@ pub const Model = struct {
+         errdefer audio_dev.free();
+         var codes_host = try cuda.HostBuffer.alloc(d, options.max_frames * codebooks * @sizeOf(u32));
+         errdefer codes_host.free();
+-        const audio_host = try cuda.HostBuffer.alloc(d, options.max_frames * samples_per_frame * @sizeOf(f32));
++        var audio_host = try cuda.HostBuffer.alloc(d, options.max_frames * samples_per_frame * @sizeOf(f32));
++        errdefer audio_host.free();
++        var kv = try cuda.DeviceBuffer.alloc(d, layers * options.max_frames * 3 * latent * 2);
++        errdefer kv.free();
++        const carry = try cuda.DeviceBuffer.alloc(d, carries.bytes);
+         return .{
+             .max_frames = options.max_frames,
+             .ctx = ctx,
+@@ -122,11 +167,15 @@ pub const Model = struct {
+             .audio_dev = audio_dev,
+             .codes_host = codes_host,
+             .audio_host = audio_host,
++            .kv = kv,
++            .carry = carry,
+         };
+     }
+ 
+     pub fn deinit(self: *Model) void {
+         self.ctx.makeCurrent() catch {};
++        self.carry.free();
++        self.kv.free();
+         self.audio_host.free();
+         self.codes_host.free();
+         self.audio_dev.free();
+@@ -137,24 +186,47 @@ pub const Model = struct {
+         self.* = undefined;
+     }
+ 
++    /// Starts an utterance for `advance`; `decode` and a failed `advance` also end one (the next starts at frame 0).
++    pub fn begin(self: *Model) void {
++        self.decoded = 0;
++    }
++
++    /// The frames after those decoded into the same rows of `output`, bit-identical to `decode(codes)` there.
++    pub fn advance(self: *Model, stream: cuda.Stream, codes: []const [10]u32, output: []f32) !usize {
++        const first = self.decoded;
++        if (codes.len <= first) return error.NoFrames;
++        self.decoded = 0;
++        const samples = try self.run(stream, codes, first, true, output);
++        self.decoded = codes.len;
++        return samples;
++    }
++
+     /// Codes are frame-major, ten codebooks a frame, EOS rows excluded; out-of-range codes clamp to
+     /// each codebook's last row as rvq.py's decode clamps them. Writes `codes.len * 2048` mono FP32
+     /// samples to `output` and returns that count once every device operation has finished.
+     pub fn decode(self: *Model, stream: cuda.Stream, codes: []const [10]u32, output: []f32) !usize {
++        self.decoded = 0;
++        return self.run(stream, codes, 0, false, output);
++    }
++
++    /// Frames [first, codes.len) into output[first * 2048 ..]; `keep_rows`: save the rows the next chunk reads.
++    fn run(self: *Model, stream: cuda.Stream, codes: []const [10]u32, first: usize, keep_rows: bool, output: []f32) !usize {
+         const frames = codes.len;
+         if (frames == 0) return error.NoFrames;
+         if (frames > self.max_frames) return error.TooManyFrames;
+         const samples = frames * samples_per_frame;
+         if (output.len < samples) return error.OutputTooSmall;
+         try self.ctx.makeCurrent();
+-        const code_bytes = std.mem.sliceAsBytes(codes);
+-        @memcpy(self.codes_host.bytes[0..code_bytes.len], code_bytes);
+-        try self.codes_dev.uploadAsync(0, self.codes_host.bytes[0..code_bytes.len], stream.handle);
+-        try self.forward(stream, frames);
+-        const audio = self.audio_host.slice(f32)[0..samples];
+-        try self.audio_dev.downloadAsync(0, std.mem.sliceAsBytes(audio), stream.handle);
++        const code_at = first * codebooks * @sizeOf(u32);
++        const code_bytes = std.mem.sliceAsBytes(codes[first..]);
++        const staged = self.codes_host.bytes[code_at..][0..code_bytes.len];
++        @memcpy(staged, code_bytes);
++        try self.codes_dev.uploadAsync(code_at, staged, stream.handle);
++        try self.forward(stream, first, frames, keep_rows);
++        const audio = self.audio_host.slice(f32)[first * samples_per_frame .. samples];
++        try self.audio_dev.downloadAsync(first * samples_per_frame * @sizeOf(f32), std.mem.sliceAsBytes(audio), stream.handle);
+         try stream.synchronize();
+-        @memcpy(output[0..samples], audio);
++        @memcpy(output[first * samples_per_frame .. samples], audio);
+         return samples;
+     }
+ 
+@@ -162,78 +234,100 @@ pub const Model = struct {
+         return self.weights.ptr + offset;
+     }
+ 
+-    fn forward(self: *Model, s: cuda.Stream, frames: usize) !void {
++    /// Before a consumer reads rows [at, end) of `tensor`: restore the kept rows before `at`, then keep the last ones.
++    fn history(self: *Model, s: cuda.Stream, c: Carry, tensor: u64, at: usize, end: usize, keep_rows: bool) !void {
++        const row = c.width * 2;
++        const back = @min(c.rows, at);
++        if (back > 0) {
++            const into: cuda.DeviceBuffer = .{ .d = self.carry.d, .ptr = tensor + (at - back) * row, .len = back * row, .borrowed = true };
++            try into.copyFrom(0, self.carry.ptr + c.offset + (c.rows - back) * row, back * row, s.handle);
++        }
++        if (!keep_rows) return;
++        const n = @min(c.rows, end);
++        try self.carry.copyFrom(c.offset + (c.rows - n) * row, tensor + (end - n) * row, n * row, s.handle);
++    }
++
++    /// Frames [first, end): every stage computes only its new rows, at the absolute rows a whole decode uses.
++    fn forward(self: *Model, s: cuda.Stream, first: usize, end: usize, keep_rows: bool) !void {
+         const k = &self.kernels;
+         const w = &self.w;
+         const h = 2; // bytes an FP16 element
+         const p = [3]u64{ self.acts[0].ptr, self.acts[1].ptr, self.acts[2].ptr };
++        const frames = end - first;
+ 
+         // rvq.py decode: z = semantic + residual codebooks through out_proj
+-        try k.rvqLatent(s, self.codes_dev.ptr, self.wp(w.semantic_book), self.wp(w.residual_books), self.wp(w.out_w), self.wp(w.out_b), p[0], frames);
++        try k.rvqLatent(s, self.codes_dev.ptr + first * codebooks * @sizeOf(u32), self.wp(w.semantic_book), self.wp(w.residual_books), self.wp(w.out_w), self.wp(w.out_b), p[0] + first * latent * h, frames);
+ 
+-        // post_module (WindowLimitedTransformer): x in p[0], scratch in p[1] and p[2]
++        // post_module (WindowLimitedTransformer): x in p[0], scratch in p[1] and p[2], each layer's qkv in kv
+         const x = p[0];
+         const xn = p[1];
+-        const qkv = p[1] + frames * latent * h;
+-        const att = p[1] + 4 * frames * latent * h;
++        const att = p[1] + end * latent * h;
+         const gu = p[2];
+-        const act = p[2] + frames * 2 * ffn * h;
++        const act = p[2] + end * 2 * ffn * h;
+         const scale: f32 = 1.0 / @sqrt(@as(f32, head_dim));
+-        for (&w.layers) |*l| {
+-            try k.rmsNorm(s, x, self.wp(l.attention_norm), xn, frames, latent, rms_eps);
+-            try k.gemm(s, .{ .x = xn, .w = self.wp(l.wqkv), .y = qkv, .m = frames, .n = 3 * latent, .cin = latent, .ldx = latent, .ldy = 3 * latent });
+-            try k.ropeQk(s, qkv, self.wp(w.rope), frames, latent);
+-            try k.windowAttention(s, qkv, att, frames, heads, window, scale);
++        for (&w.layers, 0..) |*l, i| {
++            const qkv = self.kv.ptr + i * self.max_frames * 3 * latent * h;
++            try k.rmsNorm(s, x + first * latent * h, self.wp(l.attention_norm), xn + first * latent * h, frames, latent, rms_eps);
++            try k.gemm(s, .{ .x = xn, .w = self.wp(l.wqkv), .y = qkv, .first = first, .m = end, .n = 3 * latent, .cin = latent, .ldx = latent, .ldy = 3 * latent });
++            try k.ropeQk(s, qkv + first * 3 * latent * h, self.wp(w.rope) + first * head_dim * h, frames, latent);
++            try k.windowAttention(s, qkv, att, first, end, heads, window, scale);
+             // h = x + attention_layer_scale(wo(y)), in place over x
+-            try k.gemm(s, .{ .x = att, .w = self.wp(l.wo), .y = x, .m = frames, .n = latent, .cin = latent, .ldx = latent, .ldy = latent, .scale = self.wp(l.attention_scale), .residual = x, .ldr = latent });
+-            try k.rmsNorm(s, x, self.wp(l.ffn_norm), xn, frames, latent, rms_eps);
+-            try k.gemm(s, .{ .x = xn, .w = self.wp(l.w13), .y = gu, .m = frames, .n = 2 * ffn, .cin = latent, .ldx = latent, .ldy = 2 * ffn });
+-            try k.siluMul(s, gu, act, frames, ffn);
+-            try k.gemm(s, .{ .x = act, .w = self.wp(l.w2), .y = x, .m = frames, .n = latent, .cin = ffn, .ldx = ffn, .ldy = latent, .scale = self.wp(l.ffn_scale), .residual = x, .ldr = latent });
++            try k.gemm(s, .{ .x = att, .w = self.wp(l.wo), .y = x, .first = first, .m = end, .n = latent, .cin = latent, .ldx = latent, .ldy = latent, .scale = self.wp(l.attention_scale), .residual = x, .ldr = latent });
++            try k.rmsNorm(s, x + first * latent * h, self.wp(l.ffn_norm), xn + first * latent * h, frames, latent, rms_eps);
++            try k.gemm(s, .{ .x = xn, .w = self.wp(l.w13), .y = gu, .first = first, .m = end, .n = 2 * ffn, .cin = latent, .ldx = latent, .ldy = 2 * ffn });
++            try k.siluMul(s, gu + first * 2 * ffn * h, act + first * ffn * h, frames, ffn);
++            try k.gemm(s, .{ .x = act, .w = self.wp(l.w2), .y = x, .first = first, .m = end, .n = latent, .cin = ffn, .ldx = ffn, .ldy = latent, .scale = self.wp(l.ffn_scale), .residual = x, .ldr = latent });
+         }
+-        try k.rmsNorm(s, x, self.wp(w.norm), p[1], frames, latent, rms_eps);
++        try k.rmsNorm(s, x + first * latent * h, self.wp(w.norm), p[1] + first * latent * h, frames, latent, rms_eps);
+ 
+-        // upsample: (ConvTranspose1d k2 s2, ConvNeXtBlock) twice; T rows -> 4T rows
++        // upsample: (ConvTranspose1d k2 s2, ConvNeXtBlock) twice; rows [first, end) -> [4 first, 4 end)
+         var input = p[1];
+         var spent = p[0];
+-        var rows = frames;
+-        for (&w.upsample) |*u| {
++        var from = first;
++        var to = end;
++        for (&w.upsample, carries.dwconv) |*u, carry| {
+             const y = spent;
+-            try k.gemm(s, .{ .x = input, .w = self.wp(u.conv), .y = y, .m = rows, .n = 2 * latent, .cin = latent, .ldx = latent, .ldy = 2 * latent, .bias = self.wp(u.conv_b), .bias_mode = .separate, .period = latent });
+-            rows *= 2;
++            try k.gemm(s, .{ .x = input, .w = self.wp(u.conv), .y = y, .first = from, .m = to, .n = 2 * latent, .cin = latent, .ldx = latent, .ldy = 2 * latent, .bias = self.wp(u.conv_b), .bias_mode = .separate, .period = latent });
++            from *= 2;
++            to *= 2;
+             const dw = p[2];
+-            const normed = p[2] + rows * latent * h;
+-            try k.dwconv(s, y, self.wp(u.dw), self.wp(u.dw_b), dw, rows, latent);
+-            try k.layerNorm(s, dw, self.wp(u.norm_w), self.wp(u.norm_b), normed, rows, latent, layer_norm_eps);
++            const normed = p[2] + to * latent * h;
++            try self.history(s, carry, y, from, to, keep_rows);
++            try k.dwconv(s, y, self.wp(u.dw), self.wp(u.dw_b), dw, from, to, latent);
++            try k.layerNorm(s, dw + from * latent * h, self.wp(u.norm_w), self.wp(u.norm_b), normed + from * latent * h, to - from, latent, layer_norm_eps);
+             const hidden = input; // the stage input is spent
+-            try k.gemm(s, .{ .x = normed, .w = self.wp(u.pw1), .y = hidden, .m = rows, .n = convnext_hidden, .cin = latent, .ldx = latent, .ldy = convnext_hidden, .bias = self.wp(u.pw1_b), .bias_mode = .fused, .act = .gelu });
+-            // y = input + gamma * pwconv2(...), in place over y
+-            try k.gemm(s, .{ .x = hidden, .w = self.wp(u.pw2), .y = y, .m = rows, .n = latent, .cin = convnext_hidden, .ldx = convnext_hidden, .ldy = latent, .bias = self.wp(u.pw2_b), .bias_mode = .fused, .scale = self.wp(u.gamma), .residual = y, .ldr = latent });
++            try k.gemm(s, .{ .x = normed, .w = self.wp(u.pw1), .y = hidden, .first = from, .m = to, .n = convnext_hidden, .cin = latent, .ldx = latent, .ldy = convnext_hidden, .bias = self.wp(u.pw1_b), .bias_mode = .fused, .act = .gelu });
++            // y = input + gamma * pwconv2(...), in place over y's new rows
++            try k.gemm(s, .{ .x = hidden, .w = self.wp(u.pw2), .y = y, .first = from, .m = to, .n = latent, .cin = convnext_hidden, .ldx = convnext_hidden, .ldy = latent, .bias = self.wp(u.pw2_b), .bias_mode = .fused, .scale = self.wp(u.gamma), .residual = y, .ldr = latent });
+             input = y;
+             spent = hidden;
+         }
+ 
+-        // decoder.model: conv 1024 -> 1536 (kernel 7, causal)
++        // decoder.model: conv 1024 -> 1536 (kernel 7, causal); its kept rows replace the depthwise conv's in `input`
+         var cur = spent;
+-        try k.gemm(s, .{ .x = input, .w = self.wp(w.conv0), .y = cur, .m = rows, .n = decoder_dim, .cin = latent, .ldx = latent, .ldy = decoder_dim, .taps = 7, .bias = self.wp(w.conv0_b), .bias_mode = .separate });
++        try self.history(s, carries.conv0, input, from, to, keep_rows);
++        try k.gemm(s, .{ .x = input, .w = self.wp(w.conv0), .y = cur, .first = from, .m = to, .n = decoder_dim, .cin = latent, .ldx = latent, .ldy = decoder_dim, .taps = 7, .bias = self.wp(w.conv0_b), .bias_mode = .separate });
+         var spare = [2]u64{ input, p[2] };
+         var ch: usize = decoder_dim;
+-        for (&w.blocks, rates) |*b, rate| {
++        for (&w.blocks, rates, carries.blocks) |*b, rate, kept| {
+             const out_ch = ch / 2;
+             // DecoderBlock: Snake, then ConvTranspose1d(kernel 2 * rate, stride rate) trimmed causally
+-            try k.snake(s, cur, self.wp(b.snake.alpha), self.wp(b.snake.inv), spare[0], rows, ch);
+-            try k.gemm(s, .{ .x = spare[0], .w = self.wp(b.conv), .y = spare[1], .m = rows, .n = rate * out_ch, .cin = ch, .ldx = ch, .ldy = rate * out_ch, .taps = 2, .bias = self.wp(b.conv_b), .bias_mode = .separate, .period = out_ch });
+-            rows *= rate;
++            try k.snake(s, cur + from * ch * h, self.wp(b.snake.alpha), self.wp(b.snake.inv), spare[0] + from * ch * h, to - from, ch);
++            try self.history(s, kept.transconv, spare[0], from, to, keep_rows);
++            try k.gemm(s, .{ .x = spare[0], .w = self.wp(b.conv), .y = spare[1], .first = from, .m = to, .n = rate * out_ch, .cin = ch, .ldx = ch, .ldy = rate * out_ch, .taps = 2, .bias = self.wp(b.conv_b), .bias_mode = .separate, .period = out_ch });
++            from *= rate;
++            to *= rate;
+             ch = out_ch;
+             // ResidualUnits: x + conv1(snake(conv7(snake(x)))), rotating three buffers
+             var xb = spare[1];
+             var sb = cur;
+             var tb = spare[0];
+-            for (&b.units, dilations) |*u, dilation| {
+-                try k.snake(s, xb, self.wp(u.snake1.alpha), self.wp(u.snake1.inv), sb, rows, ch);
+-                try k.gemm(s, .{ .x = sb, .w = self.wp(u.conv7), .y = tb, .m = rows, .n = ch, .cin = ch, .ldx = ch, .ldy = ch, .taps = 7, .dilation = dilation, .bias = self.wp(u.conv7_b), .bias_mode = .separate });
+-                try k.snake(s, tb, self.wp(u.snake2.alpha), self.wp(u.snake2.inv), tb, rows, ch);
+-                try k.gemm(s, .{ .x = tb, .w = self.wp(u.conv1), .y = sb, .m = rows, .n = ch, .cin = ch, .ldx = ch, .ldy = ch, .bias = self.wp(u.conv1_b), .bias_mode = .separate, .residual = xb, .ldr = ch });
++            for (&b.units, dilations, kept.units) |*u, dilation, carry| {
++                try k.snake(s, xb + from * ch * h, self.wp(u.snake1.alpha), self.wp(u.snake1.inv), sb + from * ch * h, to - from, ch);
++                try self.history(s, carry, sb, from, to, keep_rows);
++                try k.gemm(s, .{ .x = sb, .w = self.wp(u.conv7), .y = tb, .first = from, .m = to, .n = ch, .cin = ch, .ldx = ch, .ldy = ch, .taps = 7, .dilation = dilation, .bias = self.wp(u.conv7_b), .bias_mode = .separate });
++                try k.snake(s, tb + from * ch * h, self.wp(u.snake2.alpha), self.wp(u.snake2.inv), tb + from * ch * h, to - from, ch);
++                try k.gemm(s, .{ .x = tb, .w = self.wp(u.conv1), .y = sb, .first = from, .m = to, .n = ch, .cin = ch, .ldx = ch, .ldy = ch, .bias = self.wp(u.conv1_b), .bias_mode = .separate, .residual = xb, .ldr = ch });
+                 const unit_out = sb;
+                 sb = tb;
+                 tb = xb;
+@@ -243,7 +337,8 @@ pub const Model = struct {
+             spare = .{ sb, tb };
+         }
+         // Snake, conv 96 -> 1 (kernel 7, causal), tanh
+-        try k.snake(s, cur, self.wp(w.out_snake.alpha), self.wp(w.out_snake.inv), cur, rows, ch);
+-        try k.convOutTanh(s, cur, self.wp(w.out_conv), self.wp(w.out_conv_b), self.audio_dev.ptr, rows, ch);
++        try k.snake(s, cur + from * ch * h, self.wp(w.out_snake.alpha), self.wp(w.out_snake.inv), cur + from * ch * h, to - from, ch);
++        try self.history(s, carries.out, cur, from, to, keep_rows);
++        try k.convOutTanh(s, cur, self.wp(w.out_conv), self.wp(w.out_conv_b), self.audio_dev.ptr, from, to, ch);
+     }
+ };
+diff --git a/zig/src/families/drama/codec_kernels.zig b/zig/src/families/drama/codec_kernels.zig
+index 7009aacc..95e58d28 100644
+--- a/zig/src/families/drama/codec_kernels.zig
++++ b/zig/src/families/drama/codec_kernels.zig
+@@ -24,6 +24,7 @@ const GemmParams = extern struct {
+     residual: u64,
+     y: u64,
+     m: i64,
++    m_begin: i64,
+     n: i32,
+     cin: i32,
+     taps: i32,
+@@ -36,7 +37,7 @@ const GemmParams = extern struct {
+     act: i32,
+ };
+ 
+-/// One implicit-GEMM call (drama_codec_conv_gemm): `m` output rows of `n` columns from `taps`
++/// One implicit-GEMM call (drama_codec_conv_gemm): output rows [first, m) of `n` columns from `taps`
+ /// shifted reads of `cin` channels of `x`. Leading dimensions are in elements.
+ pub const Gemm = struct {
+     x: u64,
+@@ -47,6 +48,8 @@ pub const Gemm = struct {
+     cin: usize,
+     ldx: usize,
+     ldy: usize,
++    /// Rows before it are neither read nor written (an incremental decode's earlier chunks).
++    first: usize = 0,
+     taps: usize = 1,
+     dilation: usize = 1,
+     bias: u64 = 0,
+@@ -151,15 +154,17 @@ pub const Kernels = struct {
+         try run(k.rope, s, .{ .x = try blocks(frames, 1) }, 256, &a);
+     }
+ 
+-    pub fn windowAttention(k: *const Kernels, s: cuda.Stream, qkv: u64, out: u64, frames: usize, heads: usize, window: usize, scale: f32) !void {
++    /// Queries [first, end) at their absolute rows; qkv holds every row their windows reach.
++    pub fn windowAttention(k: *const Kernels, s: cuda.Stream, qkv: u64, out: u64, first: usize, end: usize, heads: usize, window: usize, scale: f32) !void {
+         if (window == 0 or window > 128) return error.Invalid;
+         var a: cuda.Args = .{};
+         a.add(qkv);
+         a.add(out);
++        a.add(try small(first));
+         a.add(try small(heads));
+         a.add(try small(window));
+         a.add(scale);
+-        try run(k.attention, s, .{ .x = try blocks(frames, 1), .y = @intCast(heads) }, 128, &a);
++        try run(k.attention, s, .{ .x = try blocks(end - first, 1), .y = @intCast(heads) }, 128, &a);
+     }
+ 
+     pub fn siluMul(k: *const Kernels, s: cuda.Stream, gu: u64, out: u64, rows: usize, width: usize) !void {
+@@ -182,15 +187,17 @@ pub const Kernels = struct {
+         try run(k.layer_norm, s, .{ .x = try blocks(rows, 1) }, 256, &a);
+     }
+ 
+-    pub fn dwconv(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, b: u64, y: u64, rows: usize, width: usize) !void {
++    /// Rows [first, end) at their absolute rows; x holds the six rows before `first`.
++    pub fn dwconv(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, b: u64, y: u64, first: usize, end: usize, width: usize) !void {
+         var a: cuda.Args = .{};
+         a.add(x);
+         a.add(w);
+         a.add(b);
+         a.add(y);
+-        a.add(@as(i64, @intCast(rows)));
++        a.add(@as(i64, @intCast(first)));
++        a.add(@as(i64, @intCast(end - first)));
+         a.add(try small(width));
+-        try run(k.dwconv7, s, .{ .x = try blocks(rows * width, 256) }, 256, &a);
++        try run(k.dwconv7, s, .{ .x = try blocks((end - first) * width, 256) }, 256, &a);
+     }
+ 
+     /// Snake over [rows][width]; x and y may be the same buffer.
+@@ -205,21 +212,22 @@ pub const Kernels = struct {
+         try run(k.snake_fn, s, .{ .x = try blocks(rows * width, 256) }, 256, &a);
+     }
+ 
+-    /// The final conv and tanh into FP32 PCM [rows].
+-    pub fn convOutTanh(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, b: u64, y: u64, rows: usize, width: usize) !void {
++    /// The final conv and tanh into FP32 PCM rows [first, end) at their absolute rows.
++    pub fn convOutTanh(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, b: u64, y: u64, first: usize, end: usize, width: usize) !void {
+         var a: cuda.Args = .{};
+         a.add(x);
+         a.add(w);
+         a.add(b);
+         a.add(y);
+-        a.add(@as(i64, @intCast(rows)));
++        a.add(@as(i64, @intCast(first)));
++        a.add(@as(i64, @intCast(end - first)));
+         a.add(try small(width));
+-        try run(k.out_tanh, s, .{ .x = try blocks(rows, 256) }, 256, &a);
++        try run(k.out_tanh, s, .{ .x = try blocks(end - first, 256) }, 256, &a);
+     }
+ 
+     pub fn gemm(k: *const Kernels, s: cuda.Stream, g: Gemm) !void {
+         const ktot = g.taps * g.cin;
+-        if (g.m == 0 or g.n == 0 or g.taps == 0 or g.cin == 0) return error.Invalid;
++        if (g.first >= g.m or g.n == 0 or g.taps == 0 or g.cin == 0) return error.Invalid;
+         if (g.cin % 8 != 0 or g.ldx % 8 != 0 or g.ldx < g.cin or g.ldy < g.n) return error.Invalid;
+         if (g.x % 16 != 0 or g.w % 16 != 0) return error.Misaligned;
+         if ((g.bias_mode != .none) != (g.bias != 0)) return error.Invalid;
+@@ -232,6 +240,7 @@ pub const Kernels = struct {
+             .residual = g.residual,
+             .y = g.y,
+             .m = @intCast(g.m),
++            .m_begin = @intCast(g.first),
+             .n = try small(g.n),
+             .cin = try small(g.cin),
+             .taps = try small(g.taps),
+@@ -246,6 +255,6 @@ pub const Kernels = struct {
+         _ = try small(ktot);
+         var a: cuda.Args = .{};
+         a.add(p);
+-        try run(k.gemm_fn, s, .{ .x = try blocks(g.m, 128), .y = try blocks(g.n, 128) }, 256, &a);
++        try run(k.gemm_fn, s, .{ .x = try blocks(g.m - g.first / 128 * 128, 128), .y = try blocks(g.n, 128) }, 256, &a);
+     }
+ };
+diff --git a/zig/tests/cuda/drama_codec_trace.zig b/zig/tests/cuda/drama_codec_trace.zig
+index 66892a83..6046d7b5 100644
+--- a/zig/tests/cuda/drama_codec_trace.zig
++++ b/zig/tests/cuda/drama_codec_trace.zig
+@@ -185,7 +185,7 @@ const Tracer = struct {
+             try t.capture(try std.fmt.bufPrint(&nb, "layer{d}.attention_norm", .{i}), xn, .f16, frames, latent, "attention_norm(x)");
+             try k.gemm(s, .{ .x = xn, .w = t.wp(l.wqkv), .y = qkv, .m = frames, .n = 3 * latent, .cin = latent, .ldx = latent, .ldy = 3 * latent });
+             try k.ropeQk(s, qkv, t.wp(w.rope), frames, latent);
+-            try k.windowAttention(s, qkv, att, frames, heads, window, scale);
++            try k.windowAttention(s, qkv, att, 0, frames, heads, window, scale);
+             try t.capture(try std.fmt.bufPrint(&nb, "layer{d}.attention_core", .{i}), att, .f16, frames, latent, "windowed attention output, wo input");
+             try k.gemm(s, .{ .x = att, .w = t.wp(l.wo), .y = x, .m = frames, .n = latent, .cin = latent, .ldx = latent, .ldy = latent, .scale = t.wp(l.attention_scale), .residual = x, .ldr = latent });
+             try t.capture(try std.fmt.bufPrint(&nb, "layer{d}.attention_residual", .{i}), x, .f16, frames, latent, "h = x + attention_layer_scale(wo(core)), ffn_norm input");
+@@ -210,7 +210,7 @@ const Tracer = struct {
+             try t.capture(try std.fmt.bufPrint(&nb, "upsample{d}.transconv", .{i}), y, .f16, rows, latent, "ConvTranspose1d k2 s2 + bias");
+             const dw = p[2];
+             const normed = p[2] + rows * latent * h;
+-            try k.dwconv(s, y, t.wp(u.dw), t.wp(u.dw_b), dw, rows, latent);
++            try k.dwconv(s, y, t.wp(u.dw), t.wp(u.dw_b), dw, 0, rows, latent);
+             try t.capture(try std.fmt.bufPrint(&nb, "upsample{d}.dwconv", .{i}), dw, .f16, rows, latent, "ConvNeXt causal depthwise conv7 + bias");
+             try k.layerNorm(s, dw, t.wp(u.norm_w), t.wp(u.norm_b), normed, rows, latent, layer_norm_eps);
+             try t.capture(try std.fmt.bufPrint(&nb, "upsample{d}.layer_norm", .{i}), normed, .f16, rows, latent, "ConvNeXt LayerNorm");
+@@ -254,7 +254,7 @@ const Tracer = struct {
+         }
+         try k.snake(s, cur, t.wp(w.out_snake.alpha), t.wp(w.out_snake.inv), cur, rows, ch);
+         try t.capture("decoder.out_snake", cur, .f16, rows, ch, "decoder.model.5 Snake1d");
+-        try k.convOutTanh(s, cur, t.wp(w.out_conv), t.wp(w.out_conv_b), m.audio_dev.ptr, rows, ch);
++        try k.convOutTanh(s, cur, t.wp(w.out_conv), t.wp(w.out_conv_b), m.audio_dev.ptr, 0, rows, ch);
+         if (rows != t.frames * samples_per_frame) return error.UnexpectedSampleCount;
+         t.replay_equal = try t.captureCompare("pcm", m.audio_dev.ptr, .f32, rows, 1, "decoder.model.6 causal conv7 96 -> 1, tanh (model.7)", t.production);
+     }

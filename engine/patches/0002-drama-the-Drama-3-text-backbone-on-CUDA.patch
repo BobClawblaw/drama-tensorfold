@@ -1,0 +1,3326 @@
+From adbc978f3cc70ac0133bd7a625e9c16ae641c3ff Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 12:16:11 +0800
+Subject: [PATCH 02/30] drama: the Drama 3 text backbone on CUDA
+
+Drama 3's backbone is a Qwen3.5-35B-A3B-style hybrid: 30 Gated DeltaNet and 10 gated full-attention layers,
+each with a 256-expert top-8 block-FP8 MoE and a gated shared expert. Model.run appends rows and returns every
+row's final-norm hidden state and the last row's semantic logits.
+
+The kernels follow the arithmetic of the sglang-omni reference: the canonical 64-token chunked GDN prefill
+(drama_gdn_chunk.cuh, after flash-linear-attention's kernels as SGLang carries them), the packed recurrent decode,
+gated attention with Q/K norm and partial NeoX RoPE, dynamic 1 x 128 FP8 activation quantization, and the BF16
+tensor-core GEMMs in drama_backbone_gemm.cu. Weights load as stored; nothing is requantized.
+
+THIRD_PARTY_NOTICES.md credits flash-linear-attention (MIT), whose chunked kernels the GDN prefill is adapted from
+and whose packed decode the recurrence follows.
+---
+ THIRD_PARTY_NOTICES.md                      |   6 +
+ zig/kernels/cuda/drama_backbone.cu          | 571 ++++++++++++++++++
+ zig/kernels/cuda/drama_backbone_gemm.cu     | 260 +++++++++
+ zig/kernels/cuda/drama_gdn_chunk.cuh        | 605 ++++++++++++++++++++
+ zig/src/families/drama/backbone.zig         | 496 ++++++++++++++++
+ zig/src/families/drama/backbone_config.zig  | 155 +++++
+ zig/src/families/drama/backbone_gdn.zig     | 368 ++++++++++++
+ zig/src/families/drama/backbone_kernels.zig | 331 +++++++++++
+ zig/src/families/drama/backbone_weights.zig | 425 ++++++++++++++
+ zig/src/families/drama/root.zig             |   6 +
+ 10 files changed, 3223 insertions(+)
+ create mode 100644 zig/kernels/cuda/drama_backbone.cu
+ create mode 100644 zig/kernels/cuda/drama_backbone_gemm.cu
+ create mode 100644 zig/kernels/cuda/drama_gdn_chunk.cuh
+ create mode 100644 zig/src/families/drama/backbone.zig
+ create mode 100644 zig/src/families/drama/backbone_config.zig
+ create mode 100644 zig/src/families/drama/backbone_gdn.zig
+ create mode 100644 zig/src/families/drama/backbone_kernels.zig
+ create mode 100644 zig/src/families/drama/backbone_weights.zig
+ create mode 100644 zig/src/families/drama/root.zig
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index b482c601..d80898bb 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -83,6 +83,12 @@ Flash Next implements transformers' model math under the attribution above. In t
+ DeltaNet kernel follows flash-linear-attention's numerics, MIT; its NCCL wrapper follows vLLM's stream convention,
+ Apache-2.0, without copying either implementation.
+ 
++The native Drama 3 backbone's Gated DeltaNet prefill (`zig/kernels/cuda/drama_gdn_chunk.cuh`, driven by
++`zig/src/families/drama/backbone_gdn.zig`) is adapted from SGLang's `chunk_gated_delta_rule` (Apache-2.0), whose
++kernels are adapted from [flash-linear-attention](https://github.com/fla-org/flash-linear-attention), MIT License,
++Copyright (c) 2023-2025 Songlin Yang, Yu Zhang (text below). Its decode recurrence (`drama_backbone.cu`) follows
++the same project's packed decode.
++
+ The Python engine's GLM CUDA engine implements transformers' `models/glm5_next/modular_glm5_next.py` math,
+ Apache-2.0, without including that source. Its draft inputs and thinking-off rendering follow the public GLM recipe
+ from Mia-AiLab without including recipe code.
+diff --git a/zig/kernels/cuda/drama_backbone.cu b/zig/kernels/cuda/drama_backbone.cu
+new file mode 100644
+index 00000000..b70173a5
+--- /dev/null
++++ b/zig/kernels/cuda/drama_backbone.cu
+@@ -0,0 +1,571 @@
++// Drama (Qwen3.5-MoE hybrid) backbone glue: embedding mix, zero-centered residual norms, the Gated DeltaNet
++// convolution, decode recurrence and chunked prefill (drama_gdn_chunk.cuh), gated full attention with partial NeoX
++// RoPE, the softmax top-8 router, dynamic 1 x 128 FP8 activation quantization, SwiGLU and the routed + gated shared
++// expert combine.
++//
++// Every formula names the reference op it mirrors (SGLang v0.5.21 / flashinfer 0.6.18 / FLA as pinned by
++// sglang-omni ab095ef); math runs in fp32 and rounds to bf16 where the reference stores or casts to a bf16 value.
++
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <math.h>
++#include <stdint.h>
++
++namespace drama {
++
++__device__ __forceinline__ float bf(__nv_bfloat16 v) { return __bfloat162float(v); }
++__device__ __forceinline__ __nv_bfloat16 tobf(float v) { return __float2bfloat16_rn(v); }
++__device__ __forceinline__ float round_bf(float v) { return bf(tobf(v)); }
++
++__device__ __forceinline__ float warp_sum(float x) {
++#pragma unroll
++    for (int m = 16; m; m >>= 1) x += __shfl_xor_sync(0xffffffffu, x, m);
++    return x;
++}
++
++__device__ __forceinline__ float warp_max(float x) {
++#pragma unroll
++    for (int m = 16; m; m >>= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, m));
++    return x;
++}
++
++// Block-wide sum for blocks of `nwarps` full warps; every thread gets the total.
++__device__ __forceinline__ float block_sum(float x, float* scratch, int nwarps) {
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    x = warp_sum(x);
++    if (lane == 0) scratch[warp] = x;
++    __syncthreads();
++    float s = lane < nwarps ? scratch[lane] : 0.f;
++    s = warp_sum(s);
++    __syncthreads();
++    return s;
++}
++
++__device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
++__device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
++
++}  // namespace drama
++
++using namespace drama;
++
++// Semantic rows (ids in [lo, hi]): out = bf16(bf16(out + extra) * 0.70710677), audio_decoder.embed_backbone with
++// one backbone codebook: (text_embeddings + codebook_embedding_sum.to(bf16)) * (1 / sqrt(2)), each torch op rounding.
++// Other rows keep the token embedding. Grid: rows; block 256.
++extern "C" __global__ void __launch_bounds__(256) drama_semantic_mix(const int* ids, __nv_bfloat16* out,
++                                                                    const __nv_bfloat16* extra, int width,
++                                                                    int lo, int hi) {
++    const int r = blockIdx.x;
++    const int id = ids[r];
++    if (id < lo || id > hi) return;
++    const float scale = 0.70710678118654752f;
++    __nv_bfloat16* o = out + static_cast<size_t>(r) * width;
++    const __nv_bfloat16* e = extra + static_cast<size_t>(r) * width;
++    for (int i = threadIdx.x; i < width; i += blockDim.x) {
++        const float s = round_bf(bf(o[i]) + bf(e[i]));
++        o[i] = tobf(s * scale);
++    }
++}
++
++// GemmaRMSNorm with the installed FlashInfer CuTe-DSL order for 2048-wide BF16 rows:
++// eight contiguous values per lane, FP32 FMA squares, then XOR offsets 1, 2, 4, 8, 16.
++// first: v = x, res = x; else v = float(x) + float(res), with one BF16 residual store.
++// The reduction finishes before any in-place residual write. Grid: rows; block: 256.
++extern "C" __global__ void __launch_bounds__(256) drama_add_norm(const __nv_bfloat16* x, __nv_bfloat16* res,
++                                                                const __nv_bfloat16* w, __nv_bfloat16* y,
++                                                                int width, float eps, int first) {
++    __shared__ float square_sum;
++    const size_t base = static_cast<size_t>(blockIdx.x) * width;
++    const int t = threadIdx.x;
++    if (t < 32) {
++        float sum = 0.f;
++        for (int block = 0; block < width; block += 256) {
++            for (int v = 0; v < 8; ++v) {
++                const int i = block + 8 * t + v;
++                float value = bf(x[base + i]);
++                if (!first) value += bf(res[base + i]);
++                sum = fmaf(value, value, sum);
++            }
++        }
++        for (int offset = 1; offset < 32; offset <<= 1)
++            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
++        if (t == 0) square_sum = sum;
++    }
++    __syncthreads();
++    const float rcp = rsqrtf(square_sum / static_cast<float>(width) + eps);
++    for (int i = t; i < width; i += blockDim.x) {
++        float value = bf(x[base + i]);
++        if (!first) value += bf(res[base + i]);
++        res[base + i] = tobf(value);
++        y[base + i] = tobf(value * rcp * (1.0f + bf(w[i])));
++    }
++}
++
++// Drama's 32 value heads, width 128. Canonical SGLang FLA full-extend arithmetic:
++// eight contiguous values per lane, two heads per warp. Keep this order for every
++// token count; the reference's one-head-per-warp short layout has different rounding.
++// Grid: (rows, 32 / (block / 16)); block 32 or 256. No auxiliary sums output.
++extern "C" __global__ void __launch_bounds__(256) drama_gated_rms_128(
++    const __nv_bfloat16* y, long long y_ld,
++    const __nv_bfloat16* z, long long z_ld,
++    const __nv_bfloat16* w, __nv_bfloat16* out, float eps) {
++    const int sub = threadIdx.x & 15;
++    const int hd = (blockIdx.y * blockDim.x + threadIdx.x) / 16;
++    const long long row = blockIdx.x;
++    float v[8], gate[8], weight[8];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const int col = sub * 8 + i;
++        v[i] = __bfloat162float(y[row * y_ld + hd * 128 + col]);
++        gate[i] = __bfloat162float(z[row * z_ld + hd * 128 + col]);
++        weight[i] = __bfloat162float(w[col]);
++    }
++    float sum = __fmul_rn(v[1], v[1]);
++    sum = __fmaf_rn(v[0], v[0], sum);
++#pragma unroll
++    for (int i = 2; i < 8; ++i) sum = __fmaf_rn(v[i], v[i], sum);
++#pragma unroll
++    for (int mask = 8; mask > 0; mask >>= 1)
++        sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, mask));
++    float variance;
++    asm("div.full.f32 %0, %1, %2;" : "=f"(variance) : "f"(sum), "f"(128.0f));
++    variance = __fadd_rn(variance, eps);
++    float inv;
++    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(variance));
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const float exponent = __fmul_rn(__fsub_rn(0.0f, gate[i]), __int_as_float(0x3fb8aa3b));
++        float e;
++        asm("ex2.approx.f32 %0, %1;" : "=f"(e) : "f"(exponent));
++        const float denom = __fadd_rn(e, 1.0f);
++        float sigmoid;
++        asm("div.full.f32 %0, %1, %2;" : "=f"(sigmoid) : "f"(1.0f), "f"(denom));
++        const float norm = __fmul_rn(__fmul_rn(v[i], inv), weight[i]);
++        const float result = __fmul_rn(norm, __fmul_rn(gate[i], sigmoid));
++        out[(row * 32 + hd) * 128 + sub * 8 + i] = __float2bfloat16_rn(result);
++    }
++}
++
++// Causal depthwise conv over the packed q|k|v channels (Qwen3.5 GatedDeltaNet conv1d, kernel 4, no bias) with
++// silu, as CUDA causal_conv1d_update: FP32 products and accumulation, y = bf16(silu(acc)).
++// state: bf16 [3][C], the three previous raw inputs (oldest first), read then advanced. Grid: ceil(C / 256); block 256.
++extern "C" __global__ void __launch_bounds__(256) drama_gdn_conv(const __nv_bfloat16* in, int ld_in,
++                                                                const __nv_bfloat16* w, __nv_bfloat16* state,
++                                                                __nv_bfloat16* out, int rows, int C) {
++    const int c = blockIdx.x * blockDim.x + threadIdx.x;
++    if (c >= C) return;
++    const float w0 = bf(w[4 * c]), w1 = bf(w[4 * c + 1]), w2 = bf(w[4 * c + 2]), w3 = bf(w[4 * c + 3]);
++    __nv_bfloat16 h0 = state[c], h1 = state[C + c], h2 = state[2 * C + c];
++    for (int t = 0; t < rows; ++t) {
++        const __nv_bfloat16 xt = in[static_cast<size_t>(t) * ld_in + c];
++        float acc = w0 * bf(h0);
++        acc += w1 * bf(h1);
++        acc += w2 * bf(h2);
++        acc += w3 * bf(xt);
++        out[static_cast<size_t>(t) * C + c] = tobf(silu(acc));
++        h0 = h1;
++        h1 = h2;
++        h2 = xt;
++    }
++    state[c] = h0;
++    state[C + c] = h1;
++    state[2 * C + c] = h2;
++}
++
++// Triton prefill has a different precision boundary: BF16 products, then FP32 accumulation.
++// Match its ex2.approx / div.full activation too; keep CUDA decode above unchanged.
++extern "C" __global__ void __launch_bounds__(256) drama_gdn_conv_prefill(
++    const __nv_bfloat16* in, int ld_in, const __nv_bfloat16* w, __nv_bfloat16* state,
++    __nv_bfloat16* out, int rows, int C) {
++    const int c = blockIdx.x * blockDim.x + threadIdx.x;
++    if (c >= C) return;
++    const float w0 = bf(w[4 * c]), w1 = bf(w[4 * c + 1]), w2 = bf(w[4 * c + 2]), w3 = bf(w[4 * c + 3]);
++    __nv_bfloat16 h0 = state[c], h1 = state[C + c], h2 = state[2 * C + c];
++    for (int t = 0; t < rows; ++t) {
++        const __nv_bfloat16 xt = in[static_cast<size_t>(t) * ld_in + c];
++        float acc = 0.0f + bf(tobf(w0 * bf(h0)));
++        acc += bf(tobf(w1 * bf(h1)));
++        acc += bf(tobf(w2 * bf(h2)));
++        acc += bf(tobf(w3 * bf(xt)));
++        const float exponent = __fmul_rn(__fsub_rn(0.0f, acc), __int_as_float(0x3fb8aa3b));
++        float exponential;
++        asm("ex2.approx.f32 %0, %1;" : "=f"(exponential) : "f"(exponent));
++        const float denominator = __fadd_rn(1.0f, exponential);
++        float y;
++        asm("div.full.f32 %0, %1, %2;" : "=f"(y) : "f"(acc), "f"(denominator));
++        out[static_cast<size_t>(t) * C + c] = tobf(y);
++        h0 = h1;
++        h1 = h2;
++        h2 = xt;
++    }
++    state[c] = h0;
++    state[C + c] = h1;
++    state[2 * C + c] = h2;
++}
++
++// Gated delta rule, token by token, the per-step math of FLA's packed decode (fused_recurrent.py):
++//   g = -exp(A_log) * softplus(a + dt_bias) (softplus = log(1 + exp(x)) for x <= 20, else x),
++//   beta = bf16(sigmoid(b)) (packed decode casts it to b's dtype, fused_gdn_gating stores it as bf16);
++//   q = q / sqrt(sum q^2 + 1e-6) * scale, k = k / sqrt(sum k^2 + 1e-6);
++//   S *= exp(g); v -= sum_k S k; v *= beta; S += k (x) v; o = sum_k S q.
++// qkv: bf16 rows [q (NK x 128) | k (NK x 128) | v (NV x 128)] ld_qkv apart (the conv output);
++// ba: bf16 rows [b (NV) | a (NV)] ld_ba apart; key head of value head h is h / (NV / NK) (repeat_interleave).
++// state: fp32 [NV][128 (v)][128 (k)], k contiguous; y: bf16 [rows][NV][128].
++// Grid: (128 / (8 * 4), NV); block 128: a warp owns 8 value columns, a lane 4 k entries of each.
++// Decode only: packed decode keeps the normalized q/k in fp32. Prefill is the chunked algorithm of
++// drama_gdn_chunk.cuh. Same state layout.
++extern "C" __global__ void __launch_bounds__(128) drama_gdn_recur(const __nv_bfloat16* qkv, int ld_qkv,
++                                                                 const __nv_bfloat16* ba, int ld_ba,
++                                                                 const float* a_log, const float* dt_bias,
++                                                                 float* state, __nv_bfloat16* y, int rows, int nk,
++                                                                 int nv, float scale) {
++    constexpr int DK = 128, DV = 128, R = 8;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int head = blockIdx.y;
++    const int col0 = (blockIdx.x * 4 + warp) * R;
++    const int kh = head / (nv / nk);
++    float* s0 = state + static_cast<size_t>(head) * DV * DK;
++    float s[R][4];
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++        const float4 v = *reinterpret_cast<const float4*>(s0 + static_cast<size_t>(col0 + r) * DK + lane * 4);
++        s[r][0] = v.x;
++        s[r][1] = v.y;
++        s[r][2] = v.z;
++        s[r][3] = v.w;
++    }
++    const float A = expf(a_log[head]);
++    const float bias = dt_bias[head];
++    for (int t = 0; t < rows; ++t) {
++        const __nv_bfloat16* row = qkv + static_cast<size_t>(t) * ld_qkv;
++        float q[4], k[4], v[R];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            q[i] = bf(row[kh * DK + lane * 4 + i]);
++            k[i] = bf(row[nk * DK + kh * DK + lane * 4 + i]);
++        }
++#pragma unroll
++        for (int r = 0; r < R; ++r) v[r] = bf(row[2 * nk * DK + head * DV + col0 + r]);
++        const float bb = bf(ba[static_cast<size_t>(t) * ld_ba + head]);
++        const float aa = bf(ba[static_cast<size_t>(t) * ld_ba + nv + head]);
++        const float x = aa + bias;
++        const float sp = x <= 20.0f ? logf(1.0f + expf(x)) : x;
++        const float decay = expf(-A * sp);
++        const float beta = round_bf(1.0f / (1.0f + expf(-bb)));
++        float qq = 0.f, kk = 0.f;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            qq += q[i] * q[i];
++            kk += k[i] * k[i];
++        }
++        qq = warp_sum(qq);
++        kk = warp_sum(kk);
++        const float qn = sqrtf(qq + 1e-6f), kn = sqrtf(kk + 1e-6f);
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            q[i] = (q[i] / qn) * scale;
++            k[i] = k[i] / kn;
++        }
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            float mem = 0.f;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                s[r][i] *= decay;
++                mem += s[r][i] * k[i];
++            }
++            mem = warp_sum(mem);
++            const float delta = (v[r] - mem) * beta;
++            float o = 0.f;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                s[r][i] += k[i] * delta;
++                o += s[r][i] * q[i];
++            }
++            o = warp_sum(o);
++            if (lane == r) y[(static_cast<size_t>(t) * nv + head) * DV + col0 + r] = tobf(o);
++        }
++    }
++#pragma unroll
++    for (int r = 0; r < R; ++r)
++        *reinterpret_cast<float4*>(s0 + static_cast<size_t>(col0 + r) * DK + lane * 4) =
++            make_float4(s[r][0], s[r][1], s[r][2], s[r][3]);
++}
++
++#include "drama_gdn_chunk.cuh"
++
++// Full-attention prologue (fused_qk_gemma_rmsnorm_rope_gate semantics): per head of 256, GemmaRMSNorm
++// bf16(v * rsqrt(mean(v^2) + eps) * (1 + w)) (the reference rounds the norm to bf16 before RoPE), then NeoX
++// RoPE in fp32 on the leading 64 dims (pairs d, d + 32) with fp32 cos/sin of pos * inv_freq[d % 32] (SGLang
++// keeps the cos/sin cache in fp32 on CUDA) and a second bf16 rounding at the store; the other dims round once.
++// qkv rows: [per q head: q (256) | gate (256)] x H, then k (HK x 256), then v (HK x 256), ld_qkv apart.
++// q goes to q_out [rows][H][256]; k and v to the caches [context][HK][256] at pos0 + row.
++// Grid: (rows, H + HK); block 32 (a lane owns 8 dims).
++extern "C" __global__ void __launch_bounds__(32) drama_attn_prep(const __nv_bfloat16* qkv, int ld_qkv,
++                                                                const __nv_bfloat16* qn_w, const __nv_bfloat16* kn_w,
++                                                                const float* inv_freq, __nv_bfloat16* q_out,
++                                                                __nv_bfloat16* kc, __nv_bfloat16* vc, int pos0, int H,
++                                                                int HK, float eps) {
++    constexpr int D = 256, ROT = 64, HALF = 32;
++    const int r = blockIdx.x, h = blockIdx.y, lane = threadIdx.x;
++    const int pos = pos0 + r;
++    const __nv_bfloat16* row = qkv + static_cast<size_t>(r) * ld_qkv;
++    const bool is_q = h < H;
++    const int kh = h - H;
++    const __nv_bfloat16* src = is_q ? row + h * 2 * D : row + H * 2 * D + kh * D;
++    const __nv_bfloat16* w = is_q ? qn_w : kn_w;
++    float v[8];
++    float ss = 0.f;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        v[i] = bf(src[lane * 8 + i]);
++        ss += v[i] * v[i];
++    }
++    ss = warp_sum(ss);
++    const float rcp = rsqrtf(ss / static_cast<float>(D) + eps);
++#pragma unroll
++    for (int i = 0; i < 8; ++i) v[i] = round_bf(v[i] * rcp * (1.0f + bf(w[lane * 8 + i])));
++    // lanes 0..3 hold dims 0..31, lanes 4..7 dims 32..63: partner lane ^ 4
++    float o[8];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const float other = __shfl_xor_sync(0xffffffffu, v[i], 4);
++        const int d = lane * 8 + i;
++        if (d < ROT) {
++            const float ang = static_cast<float>(pos) * inv_freq[d % HALF];
++            const float c = cosf(ang), s = sinf(ang);
++            o[i] = d < HALF ? v[i] * c - other * s : v[i] * c + other * s;
++        } else {
++            o[i] = v[i];
++        }
++    }
++    __nv_bfloat16* dst = is_q ? q_out + (static_cast<size_t>(r) * H + h) * D
++                              : kc + (static_cast<size_t>(pos) * HK + kh) * D;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) dst[lane * 8 + i] = tobf(o[i]);
++    if (!is_q) {
++        const __nv_bfloat16* vs = row + H * 2 * D + HK * D + kh * D;
++        __nv_bfloat16* vd = vc + (static_cast<size_t>(pos) * HK + kh) * D;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) vd[lane * 8 + i] = vs[lane * 8 + i];
++    }
++}
++
++// Causal GQA attention over the cache, fp32 scores and online softmax, then the output gate:
++// out = bf16(float(bf16(softmax(q k^T * scale) v)) * sigmoid(gate)) (fused_sigmoid_mul after the attention store).
++// As the Triton decode/extend kernels' tl.dot(p.to(v.dtype), v), the P.V numerator uses bf16(p); the
++// denominator sums the fp32 p.
++// Row r (absolute position pos0 + r) sees keys 0..pos0 + r; query head h reads kv head h / (H / HK).
++// gate: per row at qkv + h * 512 + 256 (ld_qkv apart). out: bf16 [rows][H * 256].
++// Grid: (rows, H); block 256: 8 warps take keys round-robin, a lane owns 8 dims.
++extern "C" __global__ void __launch_bounds__(256) drama_attention(const __nv_bfloat16* q, const __nv_bfloat16* kc,
++                                                                 const __nv_bfloat16* vc, const __nv_bfloat16* qkv,
++                                                                 int ld_qkv, __nv_bfloat16* out, int pos0, int H,
++                                                                 int HK, float scale) {
++    constexpr int D = 256, NW = 8;
++    __shared__ float sm_m[NW], sm_l[NW];
++    __shared__ float sm_o[NW][D];
++    const int r = blockIdx.x, h = blockIdx.y;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int kh = h / (H / HK);
++    const int last = pos0 + r;
++    float qv[8], o[8];
++    const __nv_bfloat16* qr = q + (static_cast<size_t>(r) * H + h) * D + lane * 8;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        qv[i] = bf(qr[i]);
++        o[i] = 0.f;
++    }
++    float m = -INFINITY, l = 0.f;
++    for (int j = warp; j <= last; j += NW) {
++        const uint4 kw = *reinterpret_cast<const uint4*>(kc + (static_cast<size_t>(j) * HK + kh) * D + lane * 8);
++        const __nv_bfloat16* kp = reinterpret_cast<const __nv_bfloat16*>(&kw);
++        float dot = 0.f;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) dot += qv[i] * bf(kp[i]);
++        const float sc = warp_sum(dot) * scale;
++        const float mn = fmaxf(m, sc);
++        const float corr = expf(m - mn);  // m = -inf on the first key: 0
++        const float p = expf(sc - mn);
++        l = l * corr + p;
++        const uint4 vw = *reinterpret_cast<const uint4*>(vc + (static_cast<size_t>(j) * HK + kh) * D + lane * 8);
++        const __nv_bfloat16* vp = reinterpret_cast<const __nv_bfloat16*>(&vw);
++#pragma unroll
++        for (int i = 0; i < 8; ++i) o[i] = o[i] * corr + round_bf(p) * bf(vp[i]);
++        m = mn;
++    }
++    if (lane == 0) {
++        sm_m[warp] = m;
++        sm_l[warp] = l;
++    }
++#pragma unroll
++    for (int i = 0; i < 8; ++i) sm_o[warp][lane * 8 + i] = o[i];
++    __syncthreads();
++    float M = -INFINITY;
++#pragma unroll
++    for (int w = 0; w < NW; ++w) M = fmaxf(M, sm_m[w]);
++    float L = 0.f;
++    float f[NW];
++#pragma unroll
++    for (int w = 0; w < NW; ++w) {
++        f[w] = sm_l[w] > 0.f ? expf(sm_m[w] - M) : 0.f;
++        L += sm_l[w] * f[w];
++    }
++    const int d = threadIdx.x;  // 256 threads, one dim each
++    float acc = 0.f;
++#pragma unroll
++    for (int w = 0; w < NW; ++w) acc += sm_o[w][d] * f[w];
++    const float attn = round_bf(acc / L);
++    const float gate = bf(qkv[static_cast<size_t>(r) * ld_qkv + h * 2 * D + D + d]);
++    out[(static_cast<size_t>(r) * H + h) * D + d] = tobf(attn * sigmoid(gate));
++}
++
++// Router: probabilities = softmax(float(logits)) over E = 256 (bf16 logits, as the gate Linear stores them), the 8
++// largest (lower expert id on ties), renormalized to sum 1 (TopK renormalize=norm_topk_prob). ids/w [rows][8] in
++// descending probability. Grid: rows; block 256 (one expert a thread).
++extern "C" __global__ void __launch_bounds__(256) drama_topk(const __nv_bfloat16* logits, int ld, int* ids, float* wts,
++                                                            int top) {
++    __shared__ float scratch[32];
++    __shared__ float bv[8];
++    __shared__ int bi[8];
++    __shared__ float picked_p[8];
++    __shared__ int picked_i[8];
++    const int r = blockIdx.x, e = threadIdx.x, lane = e & 31, warp = e >> 5;
++    const float x = bf(logits[static_cast<size_t>(r) * ld + e]);
++    float mx = warp_max(x);
++    if (lane == 0) scratch[warp] = mx;
++    __syncthreads();
++    mx = lane < 8 ? scratch[lane] : -INFINITY;
++    mx = warp_max(mx);
++    __syncthreads();
++    const float ex = expf(x - mx);
++    const float sum = block_sum(ex, scratch, 8);
++    float p = ex / sum;
++    bool taken = false;
++    for (int k = 0; k < top; ++k) {
++        float cv = taken ? -1.0f : p;
++        int ci = e;
++#pragma unroll
++        for (int m = 16; m; m >>= 1) {
++            const float ov = __shfl_xor_sync(0xffffffffu, cv, m);
++            const int oi = __shfl_xor_sync(0xffffffffu, ci, m);
++            if (ov > cv || (ov == cv && oi < ci)) {
++                cv = ov;
++                ci = oi;
++            }
++        }
++        if (lane == 0) {
++            bv[warp] = cv;
++            bi[warp] = ci;
++        }
++        __syncthreads();
++        if (e == 0) {
++            float best = bv[0];
++            int at = bi[0];
++            for (int w = 1; w < 8; ++w)
++                if (bv[w] > best || (bv[w] == best && bi[w] < at)) {
++                    best = bv[w];
++                    at = bi[w];
++                }
++            picked_p[k] = best;
++            picked_i[k] = at;
++        }
++        __syncthreads();
++        if (e == picked_i[k]) taken = true;
++    }
++    if (e == 0) {
++        float s = 0.f;
++        for (int k = 0; k < top; ++k) s += picked_p[k];
++        for (int k = 0; k < top; ++k) {
++            ids[r * top + k] = picked_i[k];
++            wts[r * top + k] = picked_p[k] / s;
++        }
++    }
++}
++
++// Dynamic group-128 activation quantization: s = max(amax, 1e-10) * (1 / 448).
++// The pinned per_token_group_quant_fp8 JIT uses --use_fast_math: its multiplier is the approximate 448 / amax,
++// not 1 / the rounded scale. Keep that arithmetic local with __fdividef; other kernels retain precise division.
++// q = e4m3(clamp(x * inv, -448, 448)) round-to-nearest-even. x: bf16 rows ld_x apart; q: [rows][K] bytes;
++// s: fp32 [rows][K / 128]. Grid: (rows, K / 512); block 128 (a warp a group, a lane 4 values).
++extern "C" __global__ void __launch_bounds__(128) drama_act_quant(const __nv_bfloat16* x, int ld_x, uint8_t* q,
++                                                                 float* s, int K) {
++    const int r = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int group = blockIdx.y * 4 + warp;
++    if (group * 128 >= K) return;
++    const __nv_bfloat16* xr = x + static_cast<size_t>(r) * ld_x + group * 128 + lane * 4;
++    float v[4];
++    float amax = 0.f;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        v[i] = bf(xr[i]);
++        amax = fmaxf(amax, fabsf(v[i]));
++    }
++    amax = fmaxf(warp_max(amax), 1e-10f);
++    const float sc = amax * (1.0f / 448.0f);
++    const float inv = __fdividef(448.0f, amax);
++    uint32_t packed = 0;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const float c = fminf(fmaxf(v[i] * inv, -448.0f), 448.0f);
++        const uint32_t b = static_cast<uint32_t>(__nv_cvt_float_to_fp8(c, __NV_SATFINITE, __NV_E4M3));
++        packed |= b << (8 * i);
++    }
++    *reinterpret_cast<uint32_t*>(q + static_cast<size_t>(r) * K + group * 128 + lane * 4) = packed;
++    if (lane == 0) s[static_cast<size_t>(r) * (K / 128) + group] = sc;
++}
++
++// SwiGLU (sgl_kernel silu_and_mul): h = bf16(silu(float(gate)) * float(up)), gate | up halves of I each in a row of
++// gu (ld_gu apart). h_out (bf16 [rows][I]) or, for the routed experts, the h's FP8 quantization as
++// drama_act_quant: hq [rows][I] bytes, hs fp32 [rows][I / 128]. Grid: (rows, I / 512); block 128.
++extern "C" __global__ void __launch_bounds__(128) drama_silu_mul(const __nv_bfloat16* gu, int ld_gu, int I,
++                                                                __nv_bfloat16* h_out, uint8_t* hq, float* hs) {
++    const int r = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int group = blockIdx.y * 4 + warp;
++    if (group * 128 >= I) return;
++    const int c0 = group * 128 + lane * 4;
++    const __nv_bfloat16* row = gu + static_cast<size_t>(r) * ld_gu;
++    float h[4];
++    float amax = 0.f;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        h[i] = round_bf(silu(bf(row[c0 + i])) * bf(row[I + c0 + i]));
++        amax = fmaxf(amax, fabsf(h[i]));
++    }
++    if (h_out != nullptr) {
++#pragma unroll
++        for (int i = 0; i < 4; ++i) h_out[static_cast<size_t>(r) * I + c0 + i] = tobf(h[i]);
++    }
++    if (hq != nullptr) {
++        amax = fmaxf(warp_max(amax), 1e-10f);
++        const float sc = amax * (1.0f / 448.0f);
++        const float inv = __fdividef(448.0f, amax);
++        uint32_t packed = 0;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const float c = fminf(fmaxf(h[i] * inv, -448.0f), 448.0f);
++            packed |= static_cast<uint32_t>(__nv_cvt_float_to_fp8(c, __NV_SATFINITE, __NV_E4M3)) << (8 * i);
++        }
++        *reinterpret_cast<uint32_t*>(hq + static_cast<size_t>(r) * I + c0) = packed;
++        if (lane == 0) hs[static_cast<size_t>(r) * (I / 128) + group] = sc;
++    }
++}
++
++// MoE output: routed = bf16(sum over the top slots of float(down[row * top + s])) (moe_sum_reduce, scaling 1),
++// then fused_gate_sigmoid_mul_add: out = bf16(sigmoid(sum_i float(x[i]) float(wg[i])) * float(shared) + routed).
++// x: the MoE input row (post-attention norm); wg: shared_expert_gate.weight [width]. Grid: rows; block 256.
++extern "C" __global__ void __launch_bounds__(256) drama_moe_combine(const __nv_bfloat16* down, int top,
++                                                                   const __nv_bfloat16* x, const __nv_bfloat16* wg,
++                                                                   const __nv_bfloat16* shared, __nv_bfloat16* out,
++                                                                   int width) {
++    __shared__ float scratch[32];
++    const size_t r = blockIdx.x;
++    float part = 0.f;
++    for (int i = threadIdx.x; i < width; i += 256) part += bf(x[r * width + i]) * bf(wg[i]);
++    const float gate = sigmoid(block_sum(part, scratch, 8));
++    for (int i = threadIdx.x; i < width; i += 256) {
++        float acc = 0.f;
++        for (int s = 0; s < top; ++s) acc += bf(down[(r * top + s) * width + i]);
++        const float routed = round_bf(acc);
++        out[r * width + i] = tobf(gate * bf(shared[r * width + i]) + routed);
++    }
++}
+diff --git a/zig/kernels/cuda/drama_backbone_gemm.cu b/zig/kernels/cuda/drama_backbone_gemm.cu
+new file mode 100644
+index 00000000..2c5ad754
+--- /dev/null
++++ b/zig/kernels/cuda/drama_backbone_gemm.cu
+@@ -0,0 +1,260 @@
++// Drama backbone products: bf16 projections (fp32 accumulate, as a torch Linear) and the routed experts'
++// block-FP8 W8A8 products (e4m3 codes, 128 x 128 weight scales, 1 x 128 dynamic activation scales).
++//
++// BF16-output projections use ascending contiguous K16 groups to preserve the reference MMA accumulation order.
++// The FP32 semantic head and FP8 experts retain their existing lane-local grouping.
++// Matching permutations preserve the exact dot product, but can change floating-point accumulation rounding.
++
++#include <cuda_bf16.h>
++#include <stdint.h>
++#include <type_traits>
++
++namespace drama_gemm {
++
++constexpr int WARPS = 4;
++
++__device__ __forceinline__ void mma_bf16(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++                                         uint32_t b0, uint32_t b1) {
++    asm volatile(
++        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++        "{%0,%1,%2,%3};\n"
++        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++}
++
++// e4m3 mma needs sm_89 or newer; older images trap (Model.init refuses those devices before any launch).
++__device__ __forceinline__ void mma_e4m3(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++                                         uint32_t b0, uint32_t b1) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
++    asm volatile(
++        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++        "{%0,%1,%2,%3};\n"
++        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++#else
++    __trap();
++#endif
++}
++
++__device__ __forceinline__ uint4 ld_nc(const uint4* p) {
++    uint4 r;
++    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];\n"
++                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
++                 : "l"(p));
++    return r;
++}
++
++__device__ __forceinline__ uint32_t word(const uint4& v, int i) {
++    return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
++}
++
++// OUT 0: bf16; 2: fp32 holding the bf16-rounded value (a bf16 torch output read back as float).
++template <int OUT>
++__device__ __forceinline__ void store(void* y, size_t at, float v) {
++    if constexpr (OUT == 0) {
++        static_cast<__nv_bfloat16*>(y)[at] = __float2bfloat16_rn(v);
++    } else {
++        static_cast<float*>(y)[at] = __bfloat162float(__float2bfloat16_rn(v));
++    }
++}
++
++// Y[m, n] = sum_k X[m, k] W[n, k] for m < M, n < N. X: bf16 rows ldx elements apart (16-byte aligned rows);
++// W: bf16 row-major [ceil8(N), K] (rows past N zero), K % 32 == 0. A warp owns NT 8-column tiles of one
++// 16 * RT-row tile; a block is WARPS warps side by side in n. Grid: (ceil(N / (8 NT WARPS)), ceil(M / (16 RT))).
++template <int RT, int NT, int OUT>
++__device__ __forceinline__ void gemm_bf16(const __nv_bfloat16* __restrict__ X, int ldx, int M,
++                                          const __nv_bfloat16* __restrict__ W, int N, int K, void* __restrict__ Y,
++                                          int ldy) {
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    const int col0 = (blockIdx.x * WARPS + warp) * (8 * NT);
++    if (col0 >= N) return;
++    const int row0 = blockIdx.y * 16 * RT;
++    using Load = std::conditional_t<OUT == 0, uint32_t, uint4>;
++    const Load* xa[RT];
++    const Load* xb[RT];
++    bool va[RT], vb[RT];
++#pragma unroll
++    for (int r = 0; r < RT; ++r) {
++        const int ra = row0 + r * 16 + g, rb = ra + 8;
++        va[r] = ra < M;
++        vb[r] = rb < M;
++        xa[r] = reinterpret_cast<const Load*>(X + static_cast<size_t>(va[r] ? ra : 0) * ldx) + (OUT == 0 ? 0 : t);
++        xb[r] = reinterpret_cast<const Load*>(X + static_cast<size_t>(vb[r] ? rb : 0) * ldx) + (OUT == 0 ? 0 : t);
++    }
++    const Load* wp[NT];
++#pragma unroll
++    for (int j = 0; j < NT; ++j) {
++        const int n = col0 + j * 8 < N ? col0 + j * 8 + g : g;  // dead tiles read row g and store nothing
++        wp[j] = reinterpret_cast<const Load*>(W + static_cast<size_t>(n) * K) + (OUT == 0 ? 0 : t);
++    }
++    float acc[RT][NT][4];
++#pragma unroll
++    for (int r = 0; r < RT; ++r)
++#pragma unroll
++        for (int j = 0; j < NT; ++j) acc[r][j][0] = acc[r][j][1] = acc[r][j][2] = acc[r][j][3] = 0.f;
++    const int chunks = K / 32;
++#pragma unroll 2
++    for (int c = 0; c < chunks; ++c) {
++        if constexpr (OUT == 0) {
++#pragma unroll
++            for (int s = 0; s < 2; ++s) {
++                // Each word holds k=32c+16s+2t and k+1; the second fragment is eight k positions later.
++                const int lo = 16 * c + 8 * s + t;
++                uint32_t b0[NT], b1[NT], a0[RT], a1[RT], a2[RT], a3[RT];
++#pragma unroll
++                for (int j = 0; j < NT; ++j) {
++                    b0[j] = __ldg(wp[j] + lo);
++                    b1[j] = __ldg(wp[j] + lo + 4);
++                }
++#pragma unroll
++                for (int r = 0; r < RT; ++r) {
++                    a0[r] = va[r] ? __ldg(xa[r] + lo) : 0u;
++                    a2[r] = va[r] ? __ldg(xa[r] + lo + 4) : 0u;
++                    a1[r] = vb[r] ? __ldg(xb[r] + lo) : 0u;
++                    a3[r] = vb[r] ? __ldg(xb[r] + lo + 4) : 0u;
++                }
++#pragma unroll
++                for (int r = 0; r < RT; ++r)
++#pragma unroll
++                    for (int j = 0; j < NT; ++j)
++                        mma_bf16(acc[r][j], a0[r], a1[r], a2[r], a3[r], b0[j], b1[j]);
++            }
++        } else {
++            const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
++            uint4 b[NT], a0[RT], a1[RT];
++#pragma unroll
++            for (int j = 0; j < NT; ++j) b[j] = ld_nc(wp[j] + 4 * c);
++#pragma unroll
++            for (int r = 0; r < RT; ++r) {
++                a0[r] = va[r] ? __ldg(xa[r] + 4 * c) : zero;
++                a1[r] = vb[r] ? __ldg(xb[r] + 4 * c) : zero;
++            }
++#pragma unroll
++            for (int s = 0; s < 2; ++s)
++#pragma unroll
++                for (int r = 0; r < RT; ++r)
++#pragma unroll
++                    for (int j = 0; j < NT; ++j)
++                        mma_bf16(acc[r][j], word(a0[r], 2 * s), word(a1[r], 2 * s), word(a0[r], 2 * s + 1),
++                                 word(a1[r], 2 * s + 1), word(b[j], 2 * s), word(b[j], 2 * s + 1));
++        }
++    }
++#pragma unroll
++    for (int r = 0; r < RT; ++r) {
++        const int ra = row0 + r * 16 + g, rb = ra + 8;
++#pragma unroll
++        for (int j = 0; j < NT; ++j) {
++#pragma unroll
++            for (int q = 0; q < 2; ++q) {
++                const int n = col0 + j * 8 + 2 * t + q;
++                if (n >= N) continue;
++                if (ra < M) store<OUT>(Y, static_cast<size_t>(ra) * ldy + n, acc[r][j][q]);
++                if (rb < M) store<OUT>(Y, static_cast<size_t>(rb) * ldy + n, acc[r][j][2 + q]);
++            }
++        }
++    }
++}
++
++// Routed expert product over the experts.cu plan: item i = (expert, first member, count <= 16), counts[0] items;
++// members[first + r] is a pair id p. A: e4m3 rows of K bytes, the row of pair p is p / a_div (the token for the
++// gate-up product, the pair itself for down); As: fp32 [rows, K / 128] activation scales. W: e4m3 [E][N][K];
++// Ws: fp32 [E][N / 128][K / 128] weight scales (scale_inv as stored: the dequantizing multiplier).
++// Per 128-wide k block: acc += (dot(a_q, w_q) * a_scale) * w_scale, as fused_moe's block-FP8 kernel does.
++// MODE 0: Y[p, n] = bf16(acc); MODE 1: Y[p, n] = bf16(acc * rw[p]) (the routed weight, before the bf16 store).
++// Grid: (max items, ceil(N / (8 NT WARPS))); N % 128 == 0, K % 128 == 0, 8 NT divides 128.
++template <int NT, int MODE>
++__device__ __forceinline__ void expert_fp8(const uint8_t* __restrict__ A, int a_div, const float* __restrict__ As,
++                                           const uint8_t* __restrict__ W, const float* __restrict__ Ws, int N, int K,
++                                           const int* __restrict__ items, const int* __restrict__ counts,
++                                           const int* __restrict__ members, const float* __restrict__ rw,
++                                           __nv_bfloat16* __restrict__ Y) {
++    const int item = blockIdx.x;
++    if (item >= __ldg(counts)) return;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    const int col0 = (blockIdx.y * WARPS + warp) * (8 * NT);
++    if (col0 >= N) return;
++    const int e = __ldg(items + 3 * item), first = __ldg(items + 3 * item + 1), cnt = __ldg(items + 3 * item + 2);
++    const bool v0 = g < cnt, v1 = g + 8 < cnt;
++    const int p0 = v0 ? __ldg(members + first + g) : 0, p1 = v1 ? __ldg(members + first + g + 8) : 0;
++    const int r0 = p0 / a_div, r1 = p1 / a_div;
++    const int KB = K / 128;
++    const uint4* a0p = reinterpret_cast<const uint4*>(A + static_cast<size_t>(r0) * K) + 2 * t;
++    const uint4* a1p = reinterpret_cast<const uint4*>(A + static_cast<size_t>(r1) * K) + 2 * t;
++    const float* s0p = As + static_cast<size_t>(r0) * KB;
++    const float* s1p = As + static_cast<size_t>(r1) * KB;
++    const uint8_t* we = W + static_cast<size_t>(e) * N * K;
++    const uint4* wp[NT];
++#pragma unroll
++    for (int j = 0; j < NT; ++j) wp[j] = reinterpret_cast<const uint4*>(we + static_cast<size_t>(col0 + j * 8 + g) * K) + 2 * t;
++    const float* wsp = Ws + (static_cast<size_t>(e) * (N / 128) + col0 / 128) * KB;
++    float acc[NT][4];
++#pragma unroll
++    for (int j = 0; j < NT; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
++    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
++    for (int kb = 0; kb < KB; ++kb) {
++        // 128 k a block: 32 bytes a lane (two uint4), four k32 steps on the words in pairs
++        const uint4 a0l = v0 ? __ldg(a0p + 8 * kb) : zero, a0h = v0 ? __ldg(a0p + 8 * kb + 1) : zero;
++        const uint4 a1l = v1 ? __ldg(a1p + 8 * kb) : zero, a1h = v1 ? __ldg(a1p + 8 * kb + 1) : zero;
++        float part[NT][4];
++#pragma unroll
++        for (int j = 0; j < NT; ++j) {
++            const uint4 bl = ld_nc(wp[j] + 8 * kb), bh = ld_nc(wp[j] + 8 * kb + 1);
++            part[j][0] = part[j][1] = part[j][2] = part[j][3] = 0.f;
++#pragma unroll
++            for (int s = 0; s < 4; ++s) {
++                const uint4& a0 = s < 2 ? a0l : a0h;
++                const uint4& a1 = s < 2 ? a1l : a1h;
++                const uint4& b = s < 2 ? bl : bh;
++                const int w0 = 2 * (s & 1);
++                mma_e4m3(part[j], word(a0, w0), word(a1, w0), word(a0, w0 + 1), word(a1, w0 + 1), word(b, w0),
++                         word(b, w0 + 1));
++            }
++        }
++        const float sa0 = v0 ? __ldg(s0p + kb) : 0.f, sa1 = v1 ? __ldg(s1p + kb) : 0.f;
++        const float sw = __ldg(wsp + kb);
++#pragma unroll
++        for (int j = 0; j < NT; ++j) {
++            acc[j][0] += part[j][0] * sa0 * sw;
++            acc[j][1] += part[j][1] * sa0 * sw;
++            acc[j][2] += part[j][2] * sa1 * sw;
++            acc[j][3] += part[j][3] * sa1 * sw;
++        }
++    }
++    const float w0 = MODE == 1 && v0 ? __ldg(rw + p0) : 1.f;
++    const float w1 = MODE == 1 && v1 ? __ldg(rw + p1) : 1.f;
++#pragma unroll
++    for (int j = 0; j < NT; ++j) {
++#pragma unroll
++        for (int q = 0; q < 2; ++q) {
++            const int n = col0 + j * 8 + 2 * t + q;
++            if (v0) Y[static_cast<size_t>(p0) * N + n] = __float2bfloat16_rn(MODE == 1 ? acc[j][q] * w0 : acc[j][q]);
++            if (v1)
++                Y[static_cast<size_t>(p1) * N + n] =
++                    __float2bfloat16_rn(MODE == 1 ? acc[j][2 + q] * w1 : acc[j][2 + q]);
++        }
++    }
++}
++
++}  // namespace drama_gemm
++
++#define DRAMA_GEMM(RT, NT, OUT)                                                                                     \
++    extern "C" __global__ void __launch_bounds__(32 * drama_gemm::WARPS)                                           \
++        drama_gemm_bf16_r##RT##_n##NT##_o##OUT(const __nv_bfloat16* X, int ldx, int M, const __nv_bfloat16* W,   \
++                                               int N, int K, void* Y, int ldy) {                                   \
++        drama_gemm::gemm_bf16<RT, NT, OUT>(X, ldx, M, W, N, K, Y, ldy);                                            \
++    }
++DRAMA_GEMM(1, 1, 0)
++DRAMA_GEMM(2, 2, 0)
++DRAMA_GEMM(4, 2, 0)
++DRAMA_GEMM(1, 1, 2)  // the semantic head: the last row, bf16-rounded logits widened to fp32
++
++#define DRAMA_EXPERT(NT, MODE)                                                                                      \
++    extern "C" __global__ void __launch_bounds__(32 * drama_gemm::WARPS) drama_expert_fp8_n##NT##_m##MODE(          \
++        const uint8_t* A, int a_div, const float* As, const uint8_t* W, const float* Ws, int N, int K,            \
++        const int* items, const int* counts, const int* members, const float* rw, __nv_bfloat16* Y) {             \
++        drama_gemm::expert_fp8<NT, MODE>(A, a_div, As, W, Ws, N, K, items, counts, members, rw, Y);                \
++    }
++DRAMA_EXPERT(1, 0)
++DRAMA_EXPERT(2, 0)
++DRAMA_EXPERT(1, 1)
++DRAMA_EXPERT(2, 1)
+diff --git a/zig/kernels/cuda/drama_gdn_chunk.cuh b/zig/kernels/cuda/drama_gdn_chunk.cuh
+new file mode 100644
+index 00000000..3c478c5f
+--- /dev/null
++++ b/zig/kernels/cuda/drama_gdn_chunk.cuh
+@@ -0,0 +1,605 @@
++// Drama Gated DeltaNet prefill: the canonical 64-token chunked algorithm. Included by drama_backbone.cu after its
++// `drama` helpers (bf, tobf, round_bf); backbone_gdn.zig is the only host driver.
++//
++// Source algorithm: SGLang 0.5.21 (Apache License 2.0) chunk_gated_delta_rule with use_qk_l2norm_in_kernel=True,
++// whose fla/ kernels are adapted from flash-linear-attention (https://github.com/fla-org/flash-linear-attention,
++// MIT License), Copyright (c) 2023-2025, Songlin Yang, Yu Zhang. Each stage mirrors one source kernel:
++//   drama_gdn_chunk_l2norm  l2norm_fwd(q), l2norm_fwd(k)                         fla/l2norm.py
++//   drama_gdn_chunk_gate    fused_gdn_gating, chunk_local_cumsum(g, 64)          fla/fused_gdn_gating.py, fla/cumsum.py
++//   drama_gdn_chunk_kkt     chunk_gated_delta_rule_fwd_kkt_solve_kernel           fla/chunk_fwd.py
++//   drama_gdn_chunk_wu      recompute_w_u_fwd_kernel                              fla/wy_fast.py
++//   drama_gdn_chunk_h       chunk_gated_delta_rule_fwd_kernel_h_blockdim64        fla/chunk_delta_h.py
++//   drama_gdn_chunk_o       chunk_fwd_kernel_o                                    fla/chunk_o.py
++// with every source-defined BF16 materialization: normalized q/k, beta, A = (I + A)^-1, w/u, bf16(v * beta),
++// bf16(k * beta * exp(g)), per-chunk h, v_new, bf16(decayed v_new), bf16(masked q.k) and y. g, gc and the persistent
++// state stay fp32.
++//
++// Arithmetic follows the reference's compiled Triton kernels, not only the Python source:
++//   * tl.exp      = mul.f32 x, log2(e); ex2.approx.f32; safe_exp(x) = exp(x <= 0 ? x : -inf) (fla/op.py).
++//   * tl.log      = CUDA logf (the softplus of the gate).
++//   * sigmoid     = div.full.f32(1, 1 + ex2.approx((0 - b) * log2(e))), rounded to bf16.
++//   * l2norm      = the compiled l2norm_fwd_kernel's reduction tree, sqrt.approx.ftz and div.full.
++//   * cumsum      = Hillis-Steele inclusive warp scan (shfl.up 1..16) plus warp 0's total for elements 32..63.
++//   * every bf16 tl.dot = mma.sync m16n8k16 bf16 -> f32 chained over k in ascending 16-steps from zero.
++//   * the block-inverse merge = mma.sync m16n8k8 tf32 on raw fp32 bits (Triton hands fp32 registers to the tf32
++//                   MMA); `dot + dot (+ dot)` sums fused into one accumulator chain; negation = 0 - x.
++//   * forward substitution (num_warps 1, BK 64): per column fma(Ai[g], a[g], Ai[g+8] * a[g+8]) per lane group g,
++//                   then butterfly adds over g ^ 4, g ^ 2, g ^ 1, then b_a + sum.
++//   * state update S = fma(S, exp(g_last), dot).
++//   * output o = fma(b_o * exp(g), scale, scale * dot), the BT 64 contraction, whose final dot spans 64 rows.
++//
++// Canonical streaming (backbone_gdn.zig): chunk boundaries are every 64 prefill tokens since the last reset or
++// decode, across calls. A call is one segment of `rows` tokens that starts at a chunk boundary; the h kernel reads
++// the immutable state_in and writes the state after the segment's last row to a distinct state_out. o writes only
++// rows emit_from .. rows - 1, to y row (t - emit_from). Every short segment uses the BT 64 output form, so a row's
++// output does not depend on how many later rows of its chunk exist yet.
++//
++// Dimensions: D = head_k_dim = head_v_dim = 128; NK key heads, NV value heads, NV % NK == 0; value head h reads key
++// head h / (NV / NK). NT = ceil(rows / 64).
++// Buffers (caller-owned; every workspace element a kernel reads was written earlier in the same segment):
++//   qkv   bf16 [rows][ld_qkv]  [q NK x 128 | k NK x 128 | v NV x 128]
++//   ba    bf16 [rows][ld_ba]   [b NV | a NV]
++//   a_log fp32 [NV]; dt_bias fp32 [NV]
++//   state_in, state_out fp32 [NV][128 v][128 k], distinct;  y bf16 [rows - emit_from][NV][128]
++//   workspace: qk bf16 [rows][2 NK][128] (normalized q heads then k heads); g, gc, beta fp32 [rows][NV];
++//              A bf16 [rows][NV][64]; w, u, vn bf16 [rows][NV][128]; h bf16 [NT][NV][128 v][128 k]
++// Launch sequence per segment (stream order; no dynamic shared memory):
++//   1 drama_gdn_chunk_l2norm  grid ceil(rows * 2 NK / 16)  block 256  static smem 0
++//   2 drama_gdn_chunk_gate    grid (NT, NV)                block 64   static smem 4 B
++//   3 drama_gdn_chunk_kkt     grid (NT, NV)                block 32   static smem 34,304 B
++//   4 drama_gdn_chunk_wu      grid (NT, NV)                block 128  static smem 40,960 B
++//   5 drama_gdn_chunk_h       grid (128 / 32, NV)          block 128  static smem 28,928 B
++//   6 drama_gdn_chunk_o       grid (128 / 64, NT, NV)      block 128  static smem 8,448 B
++// drama_gdn_chunk_append (grid rows, block 256, no shared memory) fills the unfinished chunk's row cache.
++#pragma once
++
++namespace drama_gdn_chunk {
++
++constexpr int D = 128;   // head_k_dim = head_v_dim
++constexpr int BT = 64;   // chunk.py CHUNK_SIZE
++constexpr int BC = 16;   // chunk_fwd.py BC
++constexpr unsigned FULL = 0xffffffffu;
++
++__device__ __forceinline__ float log2e() { return __uint_as_float(0x3FB8AA3Bu); }
++__device__ __forceinline__ float neg_inf() { return __uint_as_float(0xFF800000u); }
++
++__device__ __forceinline__ float ex2_approx(float x) {
++    float r;
++    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
++    return r;
++}
++
++// tl.exp(x): mul.f32 x, log2(e); ex2.approx.f32 (non-ftz).
++__device__ __forceinline__ float tl_exp(float x) { return ex2_approx(__fmul_rn(x, log2e())); }
++
++// fla/op.py safe_exp(x) = exp(where(x <= 0, x, -inf)): mul, select, ex2 (ex2(-inf) = +0).
++__device__ __forceinline__ float safe_exp(float x) {
++    const float m = __fmul_rn(x, log2e());
++    return ex2_approx(x <= 0.f ? m : neg_inf());
++}
++
++// Sum of squares of a half-warp's 8 values a lane, in the compiled l2norm_fwd_kernel's order: x1 * x1, then fma of
++// x0, x2 .. x7, then butterfly adds over lane ^ 8, ^ 4, ^ 2, ^ 1 (own + partner).
++__device__ __forceinline__ float reference_sumsq(const float (&x)[8]) {
++    float s = __fmul_rn(x[1], x[1]);
++    s = __fmaf_rn(x[0], x[0], s);
++#pragma unroll
++    for (int j = 2; j < 8; ++j) s = __fmaf_rn(x[j], x[j], s);
++#pragma unroll
++    for (int m = 8; m; m >>= 1) s = __fadd_rn(s, __shfl_xor_sync(FULL, s, m));
++    return s;
++}
++
++__device__ __forceinline__ float sqrt_approx_ftz(float a) {
++    float r;
++    asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
++    return r;
++}
++
++__device__ __forceinline__ float div_full(float a, float b) {
++    float r;
++    asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
++    return r;
++}
++
++__device__ __forceinline__ unsigned bits(__nv_bfloat16 v) { return __bfloat16_as_ushort(v); }
++__device__ __forceinline__ unsigned pack2(unsigned lo, unsigned hi) { return (lo & 0xFFFFu) | (hi << 16); }
++
++// One warp: C (16 x 8, fp32) += A (16 x 16 ksteps) * B (16 ksteps x 8), A and B bf16 bit patterns returned by
++// a(row, k) and b(k, col); mma.sync m16n8k16, k ascending. g = lane / 4, t = lane % 4.
++// Fragments (PTX ISA, mma.m16n8k16 .bf16): A {(g, 2t..2t+1), (g+8, 2t..), (g, 2t+8..), (g+8, 2t+8..)};
++// B {(2t..2t+1, g), (2t+8..2t+9, g)}; C c0, c1 = (g, 2t), (g, 2t+1); c2, c3 = (g+8, 2t), (g+8, 2t+1).
++template <class FA, class FB>
++__device__ __forceinline__ void mma_bf16_chain(float (&c)[4], FA a, FB b, int ksteps) {
++    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    for (int s = 0; s < ksteps; ++s) {
++        const int k0 = s * 16 + 2 * t;
++        const unsigned a0 = pack2(a(g, k0), a(g, k0 + 1));
++        const unsigned a1 = pack2(a(g + 8, k0), a(g + 8, k0 + 1));
++        const unsigned a2 = pack2(a(g, k0 + 8), a(g, k0 + 9));
++        const unsigned a3 = pack2(a(g + 8, k0 + 8), a(g + 8, k0 + 9));
++        const unsigned b0 = pack2(b(k0, g), b(k0 + 1, g));
++        const unsigned b1 = pack2(b(k0 + 8, g), b(k0 + 9, g));
++        asm volatile(
++            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++            "{%0, %1, %2, %3};\n"
++            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++    }
++}
++
++__device__ __forceinline__ int c_row(int e) { return ((threadIdx.x & 31) >> 2) + ((e >> 1) << 3); }
++__device__ __forceinline__ int c_col(int e) { return ((threadIdx.x & 3) << 1) + (e & 1); }
++
++// One warp: acc (16 x 16 as two n8 tiles) += X (16 x 16) * Y (16 x 16), fp32 row-major in shared memory, as raw
++// tf32 operands; mma.sync m16n8k8 .tf32, per tile k-step 0 then 1.
++// Fragments (PTX ISA, mma.m16n8k8 .tf32): A {(g, t), (g+8, t), (g, t+4), (g+8, t+4)}; B {(t, g), (t+4, g)}.
++__device__ __forceinline__ void mma_tf32_16(float (&acc)[2][4], const float* X, int ldx, const float* Y, int ldy) {
++    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++#pragma unroll
++    for (int ks = 0; ks < 2; ++ks) {
++        const unsigned a0 = __float_as_uint(X[g * ldx + ks * 8 + t]);
++        const unsigned a1 = __float_as_uint(X[(g + 8) * ldx + ks * 8 + t]);
++        const unsigned a2 = __float_as_uint(X[g * ldx + ks * 8 + t + 4]);
++        const unsigned a3 = __float_as_uint(X[(g + 8) * ldx + ks * 8 + t + 4]);
++#pragma unroll
++        for (int nt = 0; nt < 2; ++nt) {
++            const unsigned b0 = __float_as_uint(Y[(ks * 8 + t) * ldy + nt * 8 + g]);
++            const unsigned b1 = __float_as_uint(Y[(ks * 8 + t + 4) * ldy + nt * 8 + g]);
++            asm volatile(
++                "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++                "{%0, %1, %2, %3};\n"
++                : "+f"(acc[nt][0]), "+f"(acc[nt][1]), "+f"(acc[nt][2]), "+f"(acc[nt][3])
++                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++        }
++    }
++}
++
++__device__ __forceinline__ void zero16(float (&acc)[2][4]) {
++#pragma unroll
++    for (int nt = 0; nt < 2; ++nt)
++#pragma unroll
++        for (int e = 0; e < 4; ++e) acc[nt][e] = 0.f;
++}
++
++// dst (16 x 16, ld) = NEG ? 0 - acc : acc
++template <bool NEG>
++__device__ __forceinline__ void store16(const float (&acc)[2][4], float* dst, int ld) {
++#pragma unroll
++    for (int nt = 0; nt < 2; ++nt)
++#pragma unroll
++        for (int e = 0; e < 4; ++e) dst[c_row(e) * ld + nt * 8 + c_col(e)] = NEG ? __fsub_rn(0.f, acc[nt][e]) : acc[nt][e];
++}
++
++// One row of `cols` bf16 values by the whole block: 16 bytes a thread when both rows allow it, else 2 bytes.
++__device__ __forceinline__ void copy_row(const __nv_bfloat16* src, __nv_bfloat16* dst, int cols) {
++    const bool vec = ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 15) == 0 && (cols & 7) == 0;
++    if (vec) {
++        const uint4* s = reinterpret_cast<const uint4*>(src);
++        uint4* d = reinterpret_cast<uint4*>(dst);
++        for (int i = threadIdx.x; i < cols / 8; i += blockDim.x) d[i] = s[i];
++    } else {
++        const unsigned short* s = reinterpret_cast<const unsigned short*>(src);
++        unsigned short* d = reinterpret_cast<unsigned short*>(dst);
++        for (int i = threadIdx.x; i < cols; i += blockDim.x) d[i] = s[i];
++    }
++}
++
++}  // namespace drama_gdn_chunk
++
++// Appends gridDim.x input rows to the unfinished chunk's row cache: qkv row r (qkv_cols values) to
++// qkv_cache[at + r] and ba row r (ba_cols values) to ba_cache[at + r]; the caches are dense, qkv_cols and ba_cols
++// apart. Grid: rows; block 256. ABI 'p i p i p p i i i' = qkv ld_qkv ba ld_ba qkv_cache ba_cache at qkv_cols ba_cols.
++extern "C" __global__ void __launch_bounds__(256) drama_gdn_chunk_append(const __nv_bfloat16* qkv, int ld_qkv,
++                                                                       const __nv_bfloat16* ba, int ld_ba,
++                                                                       __nv_bfloat16* qkv_cache,
++                                                                       __nv_bfloat16* ba_cache, int at, int qkv_cols,
++                                                                       int ba_cols) {
++    using namespace drama_gdn_chunk;
++    const size_t r = blockIdx.x, c = at + r;
++    copy_row(qkv + r * ld_qkv, qkv_cache + c * qkv_cols, qkv_cols);
++    copy_row(ba + r * ld_ba, ba_cache + c * ba_cols, ba_cols);
++}
++
++// 1. l2norm_fwd of every q and k head row (fla/l2norm.py, eps passed as fp32): y = bf16(x / sqrt(sum x^2 + eps)).
++// Row r = t * 2 NK + j reads qkv[t][j * 128 ..] (j < NK: q head j, else k head j - NK) and writes qk[r][0..127].
++// Half-warp per row, 8 values a lane. ABI 'p i p i i f' = qkv ld_qkv qk rows nk eps.
++extern "C" __global__ void __launch_bounds__(256) drama_gdn_chunk_l2norm(const __nv_bfloat16* qkv, int ld_qkv,
++                                                                       __nv_bfloat16* qk, int rows, int nk,
++                                                                       float eps) {
++    using namespace drama_gdn_chunk;
++    const int nrow = rows * 2 * nk;
++    const int r = static_cast<int>(blockIdx.x) * 16 + (threadIdx.x >> 4);
++    const int col = (threadIdx.x & 15) * 8;
++    const bool valid = r < nrow;
++    const int t = valid ? r / (2 * nk) : 0, j = valid ? r % (2 * nk) : 0;
++    const __nv_bfloat16* x = qkv + static_cast<size_t>(t) * ld_qkv + j * D + col;
++    float v[8];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) v[i] = valid ? bf(x[i]) : 0.f;  // masked load, other = 0
++    const float s = reference_sumsq(v);
++    const float n = sqrt_approx_ftz(__fadd_rn(eps, s));
++    if (!valid) return;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) qk[static_cast<size_t>(r) * D + col + i] = tobf(div_full(v[i], n));
++}
++
++// 2. fused_gdn_gating (fla/fused_gdn_gating.py) and chunk_local_cumsum (fla/cumsum.py, BT 64, scalar kernel,
++// num_warps 8: element i of a chunk is lane i % 32 of warp i / 32). Per token t, value head h:
++//   x = a + dt_bias; sp = x <= 20 ? logf(exp(x) + 1) : x; g = (0 - exp(A_log)) * sp;
++//   beta = fp32(bf16(div.full(1, exp(0 - b) + 1)));  gc = chunk-local inclusive cumsum of g.
++// Grid (NT, NV); block 64. ABI 'p i p p p p p i i' = ba ld_ba a_log dt_bias g gc beta rows nv.
++extern "C" __global__ void __launch_bounds__(64) drama_gdn_chunk_gate(const __nv_bfloat16* ba, int ld_ba,
++                                                                    const float* a_log, const float* dt_bias,
++                                                                    float* g, float* gc, float* beta, int rows,
++                                                                    int nv) {
++    using namespace drama_gdn_chunk;
++    __shared__ float total0;
++    const int h = blockIdx.y, i = threadIdx.x, lane = i & 31;
++    const int t = static_cast<int>(blockIdx.x) * BT + i;
++    const bool valid = t < rows;
++    float gv = 0.f;  // masked load of g, other = 0
++    if (valid) {
++        const float bb = bf(ba[static_cast<size_t>(t) * ld_ba + h]);
++        const float aa = bf(ba[static_cast<size_t>(t) * ld_ba + nv + h]);
++        const float x = __fadd_rn(aa, dt_bias[h]);
++        const float sp = x <= 20.f ? logf(__fadd_rn(tl_exp(x), 1.f)) : x;
++        gv = __fmul_rn(__fsub_rn(0.f, tl_exp(a_log[h])), sp);
++        const float s = tl_exp(__fsub_rn(0.f, bb));
++        const float be = round_bf(div_full(1.f, __fadd_rn(s, 1.f)));
++        g[static_cast<size_t>(t) * nv + h] = gv;
++        beta[static_cast<size_t>(t) * nv + h] = be;
++    }
++    float sc = gv;
++#pragma unroll
++    for (int d = 1; d < 32; d <<= 1) {
++        const float up = __shfl_up_sync(FULL, sc, d);
++        if (lane >= d) sc = __fadd_rn(sc, up);
++    }
++    if (i == 31) total0 = sc;
++    __syncthreads();
++    if (i >= 32) sc = __fadd_rn(total0, sc);
++    if (valid) gc[static_cast<size_t>(t) * nv + h] = sc;
++}
++
++// 3. chunk_gated_delta_rule_fwd_kkt_solve_kernel (fla/chunk_fwd.py): for the chunk's 10 lower 16 x 16 blocks
++// A_ij = (k_i k_j^T) * safe_exp(g_r - g_c) [diag: strictly lower and valid only] * beta_r; diagonal blocks inverted by
++// forward substitution; block merge in tf32; A (I + A)^-1 stored bf16 with zero upper blocks. One warp per
++// (chunk, value head), the autotuned num_warps = 1 config. Grid (NT, NV); block 32.
++// ABI 'p p p p i i i' = qk gc beta A rows nk nv.
++extern "C" __global__ void __launch_bounds__(32) drama_gdn_chunk_kkt(const __nv_bfloat16* qk, const float* gc,
++                                                                   const float* beta, __nv_bfloat16* A, int rows,
++                                                                   int nk, int nv) {
++    using namespace drama_gdn_chunk;
++    __shared__ float sA[BT][BT];   // gated, masked, beta-scaled lower blocks
++    __shared__ float sI[BT][BT];   // (I + A)^-1 blocks
++    __shared__ float sT[BC][BC];   // merge temporary
++    __shared__ float sg[BT], sb[BT];
++    const int it = blockIdx.x, h = blockIdx.y, lane = threadIdx.x;
++    const int t0 = it * BT, kh = h / (nv / nk);
++    for (int i = lane; i < BT; i += 32) {
++        const int t = t0 + i;
++        sg[i] = t < rows ? gc[static_cast<size_t>(t) * nv + h] : 0.f;
++        sb[i] = t < rows ? beta[static_cast<size_t>(t) * nv + h] : 0.f;
++    }
++    __syncwarp();
++    auto kbits = [&](int r, int d) -> unsigned {
++        const int t = t0 + r;
++        return t < rows ? bits(qk[(static_cast<size_t>(t) * 2 * nk + nk + kh) * D + d]) : 0u;
++    };
++    // Steps 1-2 (chunk_fwd.py:126-228)
++    for (int bi = 0; bi < 4; ++bi) {
++        for (int bj = 0; bj <= bi; ++bj) {
++            for (int nt = 0; nt < 2; ++nt) {
++                float c[4] = {0.f, 0.f, 0.f, 0.f};
++                mma_bf16_chain(
++                    c, [&](int r, int k) { return kbits(bi * BC + r, k); },
++                    [&](int k, int n) { return kbits(bj * BC + nt * 8 + n, k); }, D / 16);
++#pragma unroll
++                for (int e = 0; e < 4; ++e) {
++                    const int r = c_row(e), cl = nt * 8 + c_col(e);
++                    const int R = bi * BC + r, C = bj * BC + cl;
++                    float v = __fmul_rn(c[e], safe_exp(__fsub_rn(sg[R], sg[C])));
++                    if (bi == bj) v = (r > cl && t0 + R < rows && t0 + C < rows) ? v : 0.f;
++                    sA[R][C] = __fmul_rn(v, sb[R]);
++                }
++            }
++        }
++    }
++    __syncwarp();
++    // Step 3 (chunk_fwd.py:230-266): Ai = -A on the diagonal blocks, forward substitution, Ai += I
++    for (int d = 0; d < 4; ++d) {
++        const int o = d * BC;
++        for (int idx = lane; idx < BC * BC; idx += 32) {
++            const int r = idx / BC, c = idx % BC;
++            sI[o + r][o + c] = -sA[o + r][o + c];
++        }
++        __syncwarp();
++        const int lim = min(BC, rows - (t0 + o));
++        for (int i = 2; i < lim; ++i) {
++            float a_new = 0.f;
++            if (lane < BC) {
++                const int c = lane;
++                float P[8];
++#pragma unroll
++                for (int gq = 0; gq < 8; ++gq) {
++                    const float ag = gq < i ? -sA[o + i][o + gq] : 0.f;
++                    const float ag8 = gq + 8 < i ? -sA[o + i][o + gq + 8] : 0.f;
++                    P[gq] = __fmaf_rn(sI[o + gq][o + c], ag, __fmul_rn(sI[o + gq + 8][o + c], ag8));
++                }
++                const float S = __fadd_rn(__fadd_rn(__fadd_rn(P[0], P[4]), __fadd_rn(P[2], P[6])),
++                                          __fadd_rn(__fadd_rn(P[1], P[5]), __fadd_rn(P[3], P[7])));
++                const float bc = c < i ? -sA[o + i][o + c] : 0.f;
++                a_new = __fadd_rn(bc, S);
++            }
++            __syncwarp();
++            if (lane < BC) sI[o + i][o + lane] = a_new;
++            __syncwarp();
++        }
++        for (int idx = lane; idx < BC * BC; idx += 32) {
++            const int r = idx / BC, c = idx % BC;
++            sI[o + r][o + c] = __fadd_rn(sI[o + r][o + c], r == c ? 1.f : 0.f);
++        }
++        __syncwarp();
++    }
++    // Step 4 (chunk_fwd.py:269-307): block merge, tf32 MMA, source order
++    float acc[2][4];
++    // Ai10 = -(Ai11 @ A10) @ Ai00
++    zero16(acc); mma_tf32_16(acc, &sI[16][16], BT, &sA[16][0], BT); store16<false>(acc, &sT[0][0], BC); __syncwarp();
++    zero16(acc); mma_tf32_16(acc, &sT[0][0], BC, &sI[0][0], BT); store16<true>(acc, &sI[16][0], BT); __syncwarp();
++    // Ai21 = -(Ai22 @ A21) @ Ai11
++    zero16(acc); mma_tf32_16(acc, &sI[32][32], BT, &sA[32][16], BT); store16<false>(acc, &sT[0][0], BC); __syncwarp();
++    zero16(acc); mma_tf32_16(acc, &sT[0][0], BC, &sI[16][16], BT); store16<true>(acc, &sI[32][16], BT); __syncwarp();
++    // Ai32 = -(Ai33 @ A32) @ Ai22
++    zero16(acc); mma_tf32_16(acc, &sI[48][48], BT, &sA[48][32], BT); store16<false>(acc, &sT[0][0], BC); __syncwarp();
++    zero16(acc); mma_tf32_16(acc, &sT[0][0], BC, &sI[32][32], BT); store16<true>(acc, &sI[48][32], BT); __syncwarp();
++    // Ai20 = -Ai22 @ (A20 @ Ai00 + A21 @ Ai10)
++    zero16(acc);
++    mma_tf32_16(acc, &sA[32][0], BT, &sI[0][0], BT);
++    mma_tf32_16(acc, &sA[32][16], BT, &sI[16][0], BT);
++    store16<false>(acc, &sT[0][0], BC); __syncwarp();
++    zero16(acc); mma_tf32_16(acc, &sI[32][32], BT, &sT[0][0], BC); store16<true>(acc, &sI[32][0], BT); __syncwarp();
++    // Ai31 = -Ai33 @ (A31 @ Ai11 + A32 @ Ai21)
++    zero16(acc);
++    mma_tf32_16(acc, &sA[48][16], BT, &sI[16][16], BT);
++    mma_tf32_16(acc, &sA[48][32], BT, &sI[32][16], BT);
++    store16<false>(acc, &sT[0][0], BC); __syncwarp();
++    zero16(acc); mma_tf32_16(acc, &sI[48][48], BT, &sT[0][0], BC); store16<true>(acc, &sI[48][16], BT); __syncwarp();
++    // Ai30 = -Ai33 @ (A30 @ Ai00 + A31 @ Ai10 + A32 @ Ai20)
++    zero16(acc);
++    mma_tf32_16(acc, &sA[48][0], BT, &sI[0][0], BT);
++    mma_tf32_16(acc, &sA[48][16], BT, &sI[16][0], BT);
++    mma_tf32_16(acc, &sA[48][32], BT, &sI[32][0], BT);
++    store16<false>(acc, &sT[0][0], BC); __syncwarp();
++    zero16(acc); mma_tf32_16(acc, &sI[48][48], BT, &sT[0][0], BC); store16<true>(acc, &sI[48][0], BT); __syncwarp();
++    // Step 5 (chunk_fwd.py:309-338): rows < rows only; upper blocks are the source's torch.zeros
++    for (int idx = lane; idx < BT * BT; idx += 32) {
++        const int R = idx / BT, C = idx % BT, t = t0 + R;
++        if (t >= rows) continue;
++        const float v = (C / BC <= R / BC) ? sI[R][C] : 0.f;
++        A[(static_cast<size_t>(t) * nv + h) * BT + C] = tobf(v);
++    }
++}
++
++// 4. recompute_w_u_fwd_kernel (fla/wy_fast.py): u = A @ bf16(v * beta); w = A @ bf16(k * beta * exp(gc)).
++// v is the raw value row (qkv), k the normalized key head. Grid (NT, NV); block 128 (4 warps, 128 output tiles).
++// ABI 'p i p p p p p p i i i' = qkv ld_qkv qk gc beta A w u rows nk nv.
++extern "C" __global__ void __launch_bounds__(128) drama_gdn_chunk_wu(const __nv_bfloat16* qkv, int ld_qkv,
++                                                                   const __nv_bfloat16* qk, const float* gc,
++                                                                   const float* beta, const __nv_bfloat16* A,
++                                                                   __nv_bfloat16* w, __nv_bfloat16* u, int rows,
++                                                                   int nk, int nv) {
++    using namespace drama_gdn_chunk;
++    __shared__ unsigned short sAb[BT][BT];
++    __shared__ unsigned short sV[BT][D];
++    __shared__ unsigned short sK[BT][D];
++    const int it = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5;
++    const int t0 = it * BT, kh = h / (nv / nk);
++    for (int idx = tid; idx < BT * BT; idx += blockDim.x) {
++        const int r = idx / BT, c = idx % BT, t = t0 + r;
++        sAb[r][c] = t < rows ? static_cast<unsigned short>(bits(A[(static_cast<size_t>(t) * nv + h) * BT + c])) : 0;
++    }
++    for (int idx = tid; idx < BT * D; idx += blockDim.x) {
++        const int r = idx / D, d = idx % D, t = t0 + r;
++        unsigned short vb = 0, kb = 0;
++        if (t < rows) {
++            const float be = beta[static_cast<size_t>(t) * nv + h];
++            const float eg = tl_exp(gc[static_cast<size_t>(t) * nv + h]);
++            const float v = bf(qkv[static_cast<size_t>(t) * ld_qkv + 2 * nk * D + h * D + d]);
++            const float k = bf(qk[(static_cast<size_t>(t) * 2 * nk + nk + kh) * D + d]);
++            vb = static_cast<unsigned short>(bits(tobf(__fmul_rn(v, be))));
++            kb = static_cast<unsigned short>(bits(tobf(__fmul_rn(__fmul_rn(k, be), eg))));
++        }
++        sV[r][d] = vb;
++        sK[r][d] = kb;
++    }
++    __syncthreads();
++    for (int tile = warp; tile < 2 * (BT / 16) * (D / 8); tile += 4) {
++        const bool is_w = tile >= (BT / 16) * (D / 8);
++        const int local = is_w ? tile - (BT / 16) * (D / 8) : tile;
++        const int mt = local / (D / 8), nt = local % (D / 8);
++        float c[4] = {0.f, 0.f, 0.f, 0.f};
++        if (is_w) {
++            mma_bf16_chain(
++                c, [&](int r, int k) { return static_cast<unsigned>(sAb[mt * 16 + r][k]); },
++                [&](int k, int n) { return static_cast<unsigned>(sK[k][nt * 8 + n]); }, BT / 16);
++        } else {
++            mma_bf16_chain(
++                c, [&](int r, int k) { return static_cast<unsigned>(sAb[mt * 16 + r][k]); },
++                [&](int k, int n) { return static_cast<unsigned>(sV[k][nt * 8 + n]); }, BT / 16);
++        }
++        __nv_bfloat16* out = is_w ? w : u;
++#pragma unroll
++        for (int e = 0; e < 4; ++e) {
++            const int t = t0 + mt * 16 + c_row(e);
++            if (t < rows) out[(static_cast<size_t>(t) * nv + h) * D + nt * 8 + c_col(e)] = tobf(c[e]);
++        }
++    }
++}
++
++// 5. chunk_gated_delta_rule_fwd_kernel_h_blockdim64 (fla/chunk_delta_h.py), BV 32, fp32 state slice in shared
++// memory for the whole segment. S = state_in; per chunk: h[it] = bf16(S); b_v = u - w @ bf16(S)^T; vn = bf16(b_v);
++// b_v *= safe_exp(g_last - g); S = fma(S, exp(g_last), k^T @ bf16(b_v)). The final S goes to state_out; state_in is
++// never written, so the two must be distinct. Grid (128 / 32, NV); block 128.
++// ABI 'p p p p p p p p i i i' = qk w u gc state_in state_out h vn rows nk nv.
++extern "C" __global__ void __launch_bounds__(128) drama_gdn_chunk_h(const __nv_bfloat16* qk, const __nv_bfloat16* w,
++                                                                  const __nv_bfloat16* u, const float* gc,
++                                                                  const float* state_in, float* state_out,
++                                                                  __nv_bfloat16* hout, __nv_bfloat16* vn, int rows,
++                                                                  int nk, int nv) {
++    using namespace drama_gdn_chunk;
++    constexpr int BV = 32;
++    __shared__ float sS[BV][D];
++    __shared__ unsigned short sH[BV][D];
++    __shared__ unsigned short sVb[BT][BV];
++    __shared__ float sG[BT];
++    const int v0 = blockIdx.x * BV, h = blockIdx.y, tid = threadIdx.x, warp = tid >> 5;
++    const int kh = h / (nv / nk), NT = (rows + BT - 1) / BT;
++    const float* s_in = state_in + static_cast<size_t>(h) * D * D;
++    float* s_out = state_out + static_cast<size_t>(h) * D * D;
++    for (int idx = tid; idx < BV * D; idx += blockDim.x) {
++        const int vr = idx / D, k = idx % D;
++        sS[vr][k] = __fadd_rn(0.f, s_in[static_cast<size_t>(v0 + vr) * D + k]);  // b_h = zeros; b_h += load
++    }
++    for (int it = 0; it < NT; ++it) {
++        const int t0 = it * BT;
++        __syncthreads();
++        for (int idx = tid; idx < BV * D; idx += blockDim.x) {
++            const int vr = idx / D, k = idx % D;
++            const __nv_bfloat16 hb = tobf(sS[vr][k]);
++            sH[vr][k] = static_cast<unsigned short>(bits(hb));
++            hout[((static_cast<size_t>(it) * nv + h) * D + v0 + vr) * D + k] = hb;
++        }
++        for (int i = tid; i < BT; i += blockDim.x) {
++            const int t = t0 + i;
++            sG[i] = t < rows ? gc[static_cast<size_t>(t) * nv + h] : 0.f;
++        }
++        __syncthreads();
++        const float glast = gc[static_cast<size_t>(min(t0 + BT, rows) - 1) * nv + h];
++        const float eg = tl_exp(glast);
++        // b_v [64 t][32 v] = w @ bf16(S)^T, k ascending 0..127 (chunk_delta_h.py:213-231, fused accumulators)
++        for (int tile = warp; tile < (BT / 16) * (BV / 8); tile += 4) {
++            const int mt = tile / (BV / 8), nt = tile % (BV / 8);
++            float c[4] = {0.f, 0.f, 0.f, 0.f};
++            mma_bf16_chain(
++                c,
++                [&](int r, int k) {
++                    const int t = t0 + mt * 16 + r;
++                    return t < rows ? bits(w[(static_cast<size_t>(t) * nv + h) * D + k]) : 0u;
++                },
++                [&](int k, int n) { return static_cast<unsigned>(sH[nt * 8 + n][k]); }, D / 16);
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                const int rr = mt * 16 + c_row(e), vv = nt * 8 + c_col(e), t = t0 + rr;
++                const bool valid = t < rows;
++                const float uu = valid ? bf(u[(static_cast<size_t>(t) * nv + h) * D + v0 + vv]) : 0.f;
++                float bv = __fsub_rn(uu, c[e]);
++                if (valid) vn[(static_cast<size_t>(t) * nv + h) * D + v0 + vv] = tobf(bv);
++                bv = __fmul_rn(bv, safe_exp(__fsub_rn(glast, sG[rr])));
++                sVb[rr][vv] = static_cast<unsigned short>(bits(tobf(bv)));
++            }
++        }
++        __syncthreads();
++        // S[v][k] = fma(S, exp(g_last), sum_t k[t][k] * bf16(b_v)[t][v]), t ascending (chunk_delta_h.py:250-310)
++        for (int tile = warp; tile < (D / 16) * (BV / 8); tile += 4) {
++            const int mt = tile / (BV / 8), nt = tile % (BV / 8);
++            float c[4] = {0.f, 0.f, 0.f, 0.f};
++            mma_bf16_chain(
++                c,
++                [&](int r, int tt) {
++                    const int t = t0 + tt;
++                    return t < rows ? bits(qk[(static_cast<size_t>(t) * 2 * nk + nk + kh) * D + mt * 16 + r]) : 0u;
++                },
++                [&](int tt, int n) { return static_cast<unsigned>(sVb[tt][nt * 8 + n]); }, BT / 16);
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                const int kd = mt * 16 + c_row(e), vv = nt * 8 + c_col(e);
++                sS[vv][kd] = __fmaf_rn(sS[vv][kd], eg, c[e]);
++            }
++        }
++    }
++    __syncthreads();
++    for (int idx = tid; idx < BV * D; idx += blockDim.x) {
++        const int vr = idx / D, k = idx % D;
++        s_out[static_cast<size_t>(v0 + vr) * D + k] = sS[vr][k];
++    }
++}
++
++// 6. chunk_fwd_kernel_o (fla/chunk_o.py), BV 64. b_o = (q @ h[it]^T) * exp(g); b_A = (q @ k^T) * safe_exp(g_i - g_j),
++// j <= i, bf16; o = bf16(fma(b_o, scale, scale * (b_A @ vn))), the final dot over all 64 rows of the chunk (rows past
++// the segment are zero), for every segment length. Only rows emit_from .. rows - 1 are written, to y row
++// (t - emit_from); a warp with none of them skips its products. Grid (128 / 64, NT, NV); block 128 (warp w owns rows
++// 16 w .. 16 w + 15 of its chunk). ABI 'p p p p p i i i i f' = qk vn h gc y rows emit_from nk nv scale.
++extern "C" __global__ void __launch_bounds__(128) drama_gdn_chunk_o(const __nv_bfloat16* qk, const __nv_bfloat16* vn,
++                                                                  const __nv_bfloat16* hin, const float* gc,
++                                                                  __nv_bfloat16* y, int rows, int emit_from, int nk,
++                                                                  int nv, float scale) {
++    using namespace drama_gdn_chunk;
++    constexpr int BV = 64;
++    __shared__ unsigned short sAo[BT][BT];
++    __shared__ float sG[BT];
++    const int vb0 = blockIdx.x * BV, it = blockIdx.y, h = blockIdx.z, tid = threadIdx.x, warp = tid >> 5;
++    const int t0 = it * BT, kh = h / (nv / nk);
++    const int w0 = t0 + warp * 16;
++    const bool active = w0 < rows && w0 + 16 > emit_from;
++    for (int i = tid; i < BT; i += blockDim.x) {
++        const int t = t0 + i;
++        sG[i] = t < rows ? gc[static_cast<size_t>(t) * nv + h] : 0.f;
++    }
++    __syncthreads();
++    auto qbits = [&](int r, int d) -> unsigned {
++        const int t = w0 + r;
++        return t < rows ? bits(qk[(static_cast<size_t>(t) * 2 * nk + kh) * D + d]) : 0u;
++    };
++    float bo[BV / 8][4];
++    if (active) {
++        // b_A tiles of this warp's rows; masked, gated, bf16 into shared memory
++        for (int nt = 0; nt < BT / 8; ++nt) {
++            float c[4] = {0.f, 0.f, 0.f, 0.f};
++            mma_bf16_chain(
++                c, qbits,
++                [&](int d, int n) {
++                    const int t = t0 + nt * 8 + n;
++                    return t < rows ? bits(qk[(static_cast<size_t>(t) * 2 * nk + nk + kh) * D + d]) : 0u;
++                },
++                D / 16);
++#pragma unroll
++            for (int e = 0; e < 4; ++e) {
++                const int i = warp * 16 + c_row(e), j = nt * 8 + c_col(e);
++                float v = __fmul_rn(c[e], safe_exp(__fsub_rn(sG[i], sG[j])));
++                v = i >= j ? v : 0.f;
++                sAo[i][j] = static_cast<unsigned short>(bits(tobf(v)));
++            }
++        }
++        // b_o tiles (registers): q @ h^T, k ascending, then * exp(g)
++        const __nv_bfloat16* h0 = hin + (static_cast<size_t>(it) * nv + h) * D * D;
++        for (int nt = 0; nt < BV / 8; ++nt) {
++#pragma unroll
++            for (int e = 0; e < 4; ++e) bo[nt][e] = 0.f;
++            mma_bf16_chain(
++                bo[nt], qbits,
++                [&](int d, int n) { return bits(h0[static_cast<size_t>(vb0 + nt * 8 + n) * D + d]); }, D / 16);
++#pragma unroll
++            for (int e = 0; e < 4; ++e) bo[nt][e] = __fmul_rn(bo[nt][e], tl_exp(sG[warp * 16 + c_row(e)]));
++        }
++    }
++    __syncthreads();
++    if (!active) return;
++    for (int nt = 0; nt < BV / 8; ++nt) {
++        float c[4] = {0.f, 0.f, 0.f, 0.f};
++        mma_bf16_chain(
++            c, [&](int r, int j) { return static_cast<unsigned>(sAo[warp * 16 + r][j]); },
++            [&](int j, int n) {
++                const int t = t0 + j;
++                return t < rows ? bits(vn[(static_cast<size_t>(t) * nv + h) * D + vb0 + nt * 8 + n]) : 0u;
++            },
++            BT / 16);
++#pragma unroll
++        for (int e = 0; e < 4; ++e) {
++            const int t = w0 + c_row(e);
++            const float o = __fmaf_rn(bo[nt][e], scale, __fmul_rn(scale, c[e]));
++            if (t < rows && t >= emit_from)
++                y[(static_cast<size_t>(t - emit_from) * nv + h) * D + vb0 + nt * 8 + c_col(e)] = tobf(o);
++        }
++    }
++}
+diff --git a/zig/src/families/drama/backbone.zig b/zig/src/families/drama/backbone.zig
+new file mode 100644
+index 00000000..3d3870e2
+--- /dev/null
++++ b/zig/src/families/drama/backbone.zig
+@@ -0,0 +1,496 @@
++//! Native CUDA Drama 3 text backbone (Qwen3.5-35B-A3B hybrid: 30 Gated DeltaNet + 10 gated full-attention layers,
++//! 256-expert top-8 block-FP8 MoE with a gated shared expert), one request's recurrent and KV state per Model.
++//! run appends rows and returns every row's final-norm hidden state plus the last row's semantic logits (EOS, codes).
++const std = @import("std");
++const cuda = @import("cuda");
++
++pub const config = @import("backbone_config.zig");
++pub const weights = @import("backbone_weights.zig");
++pub const kernels = @import("backbone_kernels.zig");
++pub const gdn = @import("backbone_gdn.zig");
++
++const H = config.hidden;
++const top = config.top_k;
++
++pub const Options = struct {
++    context: usize = 8192,
++    max_rows: usize = 128,
++};
++
++/// Prefill is the chunked GDN algorithm (gdn), on 64-token chunks counted from the last reset or decode however runs
++/// split the prompt, with normalized q/k in BF16; packed autoregressive decode keeps them in FP32.
++/// A one-row prompt chunk is still prefill. Callers must select the phase, never infer it from row count.
++pub const Phase = enum { prefill, decode };
++
++pub const Rows = struct {
++    // Borrowed views, valid until next run/reset/deinit. BF16 row-major [rows, hidden].
++    hidden: cuda.DeviceBuffer,
++    // F32 [4097] for the LAST row only: EOS first, then semantic_start..semantic_end.
++    semantic_logits: cuda.DeviceBuffer,
++    rows: usize,
++};
++
++/// Diagnostic per-layer capture points of `forward` (temporary; tf-drama-backbone-trace is the only tracer).
++/// attention_input / attention_residual: the input RMSNorm's normalized output and its updated residual (layer 0:
++/// the embedding). attention_output: the DeltaNet or attention out projection, before the second add-norm.
++/// mlp_input / mlp_residual: the post-attention RMSNorm's normalized output and updated residual. mlp_output: the
++/// complete MoE output (routed experts plus the gated shared expert). All BF16 [rows, hidden] scratch tensors.
++pub const Stage = enum { attention_input, attention_residual, attention_output, mlp_input, mlp_residual, mlp_output };
++
++/// Hashed by the trace driver so a capture names the exact forward it observed; unreferenced in production.
++pub const trace_source = @embedFile("backbone.zig");
++
++/// Diagnostic operator selector for `Model.replayOperator` (temporary; tf-drama-backbone-replay is the only caller).
++/// attention: the layer's production `deltaNet` or `fullAttention`, by its kind. moe: the layer's production `moe`.
++pub const ReplayOperator = enum { attention, moe };
++
++/// Bump offsets in one device allocation, 256-byte aligned.
++const Bump = struct {
++    used: usize = 0,
++
++    fn take(b: *Bump, bytes: usize) usize {
++        const at = std.mem.alignForward(usize, b.used, 256);
++        b.used = at + bytes;
++        return at;
++    }
++};
++
++/// Per-call activations for up to `max_rows` rows (offsets until `place`, then device addresses).
++const Scratch = struct {
++    ids: u64 = 0, // i32 [R]
++    x: u64 = 0, // bf16 [R][H] layer delta (embedding, mixer or MoE output)
++    residual: u64 = 0, // bf16 [R][H]
++    normed: u64 = 0, // bf16 [R][H]
++    proj: u64 = 0, // bf16 [R][max(gdn_in_rows, attn_in_rows)]
++    conv: u64 = 0, // bf16 [R][conv_dim]
++    core: u64 = 0, // bf16 [R][value_dim] recurrence output
++    gated: u64 = 0, // bf16 [R][4096] gated core (DeltaNet) or gated attention, the out projection's input
++    q: u64 = 0, // bf16 [R][heads][head_dim]
++    moe_in: u64 = 0, // bf16 [R][moe_in_rows]
++    picks: u64 = 0, // i32 [P]
++    routed: u64 = 0, // f32 [P]
++    xq: u64 = 0, // e4m3 [R][H]
++    xs: u64 = 0, // f32 [R][H / 128]
++    members: u64 = 0, // i32 [P]
++    items: u64 = 0, // i32 [3 * max items]
++    counts: u64 = 0, // i32 [2]
++    rank: u64 = 0, // i32 [P]
++    hist: u64 = 0, // i32 [ceil(P / 1024) * experts]
++    gu: u64 = 0, // bf16 [P][gu_rows]
++    hq: u64 = 0, // e4m3 [P][expert_inner]
++    hs: u64 = 0, // f32 [P][expert_inner / 128]
++    down: u64 = 0, // bf16 [P][H]
++    shared_h: u64 = 0, // bf16 [R][shared_inner]
++    shared_out: u64 = 0, // bf16 [R][H]
++    gdn: u64 = 0, // the DeltaNet prefill workspace (gdn.Workspace), shared by every layer
++
++    fn layout(rows: usize) struct { Scratch, usize } {
++        const pairs = rows * top;
++        const proj_cols = @max(weights.gdn_in_rows, weights.attn_in_rows);
++        const items = cuda.grouped.maxItems(pairs, config.experts, tile);
++        const blocks = (pairs + 1023) / 1024;
++        var b: Bump = .{};
++        var s: Scratch = .{};
++        s.ids = b.take(rows * 4);
++        s.x = b.take(rows * H * 2);
++        s.residual = b.take(rows * H * 2);
++        s.normed = b.take(rows * H * 2);
++        s.proj = b.take(rows * proj_cols * 2);
++        s.conv = b.take(rows * config.conv_dim * 2);
++        s.core = b.take(rows * config.value_dim * 2);
++        s.gated = b.take(rows * @max(config.value_dim, config.query_heads * config.head_dim) * 2);
++        s.q = b.take(rows * config.query_heads * config.head_dim * 2);
++        s.moe_in = b.take(rows * weights.moe_in_rows * 2);
++        s.picks = b.take(pairs * 4);
++        s.routed = b.take(pairs * 4);
++        s.xq = b.take(rows * H);
++        s.xs = b.take(rows * (H / config.block) * 4);
++        s.members = b.take(pairs * 4);
++        s.items = b.take(3 * items * 4);
++        s.counts = b.take(2 * 4);
++        s.rank = b.take(pairs * 4);
++        s.hist = b.take(blocks * config.experts * 4);
++        s.gu = b.take(pairs * weights.gu_rows * 2);
++        s.hq = b.take(pairs * config.expert_inner);
++        s.hs = b.take(pairs * (config.expert_inner / config.block) * 4);
++        s.down = b.take(pairs * H * 2);
++        s.shared_h = b.take(rows * config.shared_inner * 2);
++        s.shared_out = b.take(rows * H * 2);
++        s.gdn = b.take(gdnWorkspace(rows)[1]);
++        return .{ s, b.used };
++    }
++
++    fn place(s: *Scratch, base: u64) void {
++        inline for (@typeInfo(Scratch).@"struct".field_names) |name| @field(s, name) += base;
++    }
++};
++
++const tile = 16; // routed pairs an expert item takes (the plan's decode tile; the expert kernel's 16 mma rows)
++
++const conv_state_bytes = (config.conv_taps - 1) * config.conv_dim * 2; // bf16 [3][conv_dim] a DeltaNet layer
++const rec_state_bytes = config.linear_value_heads * config.linear_dim * config.linear_dim * 4; // f32 [32][128][128]
++const gdn_qkv_cache_bytes = gdn.chunk_rows * config.conv_dim * 2; // bf16 [64][conv_dim] the unfinished chunk's rows
++const gdn_ba_cache_bytes = gdn.chunk_rows * 2 * config.linear_value_heads * 2; // bf16 [64][b 32 | a 32]
++const gdn_state_bytes = 2 * rec_state_bytes + gdn_qkv_cache_bytes + gdn_ba_cache_bytes; // a DeltaNet layer's gdn.State
++
++fn gdnWorkspace(rows: usize) struct { gdn.Workspace, usize } {
++    return gdn.Workspace.layout(rows, config.linear_key_heads, config.linear_value_heads);
++}
++
++/// DeltaNet layer `slot`'s recurrent state in the state buffer at `base`: two FP32 banks, then the row caches.
++fn gdnState(base: u64, slot: usize) gdn.State {
++    const at = base + config.linear_layers * conv_state_bytes + slot * gdn_state_bytes;
++    return .{
++        .banks = .{ at, at + rec_state_bytes },
++        .qkv_cache = at + 2 * rec_state_bytes,
++        .ba_cache = at + 2 * rec_state_bytes + gdn_qkv_cache_bytes,
++    };
++}
++
++pub const Model = struct {
++    hidden: usize,
++    semantic_start: u32,
++    semantic_end: u32,
++    eos: u32,
++
++    gpa: std.mem.Allocator,
++    d: *const cuda.Driver,
++    options: Options,
++    k: kernels.Kernels,
++    w: weights.Weights,
++    scratch_buf: cuda.DeviceBuffer,
++    state_buf: cuda.DeviceBuffer, // DeltaNet conv states, then per DeltaNet layer its gdn.State banks and row caches
++    kv_buf: cuda.DeviceBuffer, // per attention layer: k cache then v cache, bf16 [context][kv_heads][head_dim]
++    hidden_buf: cuda.DeviceBuffer, // bf16 [max_rows][H]
++    logits_buf: cuda.DeviceBuffer, // f32 [4097], the last row's semantic logits
++    tokens: cuda.HostBuffer, // pinned i32 [max_rows]
++    s: Scratch,
++    gdn_ws: gdn.Workspace, // placed in scratch_buf
++    gdn_states: [config.linear_layers]gdn.State, // per DeltaNet layer: device addresses and chunk metadata
++    pos: usize = 0,
++    /// Set while a run's device work is in flight; a failed run leaves it set and only reset clears it.
++    poisoned: bool = false,
++
++    pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *cuda.Context, checkpoint_dir: []const u8, kernel_dir: []const u8, options: Options) !Model {
++        if (options.max_rows == 0 or options.context == 0 or options.context > 262144) return error.BadDramaOptions;
++        if (try ctx.capability() < 89) return error.DramaNeedsFp8Mma; // the experts' e4m3 mma is sm_89+
++        const d = ctx.d;
++        const c = try config.Config.read(gpa, io, checkpoint_dir);
++        var k = try kernels.Kernels.load(gpa, io, d, kernel_dir);
++        errdefer k.unload();
++        var w = blk: {
++            var stream = try cuda.Stream.init(d, true);
++            defer stream.deinit();
++            break :blk try weights.load(gpa, io, d, stream, checkpoint_dir, c);
++        };
++        errdefer w.deinit();
++        const R = options.max_rows;
++        var s, const scratch_bytes = Scratch.layout(R);
++        var scratch_buf = try cuda.DeviceBuffer.alloc(d, scratch_bytes);
++        errdefer scratch_buf.free();
++        try scratch_buf.fill8(0, null);
++        s.place(scratch_buf.ptr);
++        const gdn_ws = gdnWorkspace(R)[0].place(s.gdn);
++        var state_buf = try cuda.DeviceBuffer.alloc(d, config.linear_layers * (conv_state_bytes + gdn_state_bytes));
++        errdefer state_buf.free();
++        try state_buf.fill8(0, null);
++        var gdn_states: [config.linear_layers]gdn.State = undefined;
++        for (&gdn_states, 0..) |*st, slot| st.* = gdnState(state_buf.ptr, slot);
++        var kv_buf = try cuda.DeviceBuffer.alloc(d, config.full_layers * 2 * kvBytes(options.context));
++        errdefer kv_buf.free();
++        var hidden_buf = try cuda.DeviceBuffer.alloc(d, R * H * 2);
++        errdefer hidden_buf.free();
++        var logits_buf = try cuda.DeviceBuffer.alloc(d, weights.head_cols * 4);
++        errdefer logits_buf.free();
++        const tokens = try cuda.HostBuffer.alloc(d, R * 4);
++        return .{
++            .hidden = H,
++            .semantic_start = c.semantic_start,
++            .semantic_end = c.semantic_end,
++            .eos = c.eos,
++            .gpa = gpa,
++            .d = d,
++            .options = options,
++            .k = k,
++            .w = w,
++            .scratch_buf = scratch_buf,
++            .state_buf = state_buf,
++            .kv_buf = kv_buf,
++            .hidden_buf = hidden_buf,
++            .logits_buf = logits_buf,
++            .tokens = tokens,
++            .s = s,
++            .gdn_ws = gdn_ws,
++            .gdn_states = gdn_states,
++        };
++    }
++
++    pub fn deinit(self: *Model) void {
++        self.tokens.free();
++        self.logits_buf.free();
++        self.hidden_buf.free();
++        self.kv_buf.free();
++        self.state_buf.free();
++        self.scratch_buf.free();
++        self.w.deinit();
++        self.k.unload();
++        self.* = undefined;
++    }
++
++    /// Clears the request: DeltaNet conv and recurrent states and row caches to zero, every layer's chunk metadata,
++    /// position 0 (the KV cache is overwritten).
++    pub fn reset(self: *Model, stream: cuda.Stream) !void {
++        try self.state_buf.fill8(0, stream.handle);
++        try stream.synchronize();
++        for (&self.gdn_states) |*st| st.resetMetadata();
++        self.pos = 0;
++        self.poisoned = false;
++    }
++
++    fn kvBytes(context: usize) usize {
++        return context * config.kv_heads * config.head_dim * 2;
++    }
++
++    fn convState(self: *const Model, slot: usize) u64 {
++        return self.state_buf.ptr + slot * conv_state_bytes;
++    }
++
++    fn kCache(self: *const Model, slot: usize) u64 {
++        return self.kv_buf.ptr + (2 * slot) * kvBytes(self.options.context);
++    }
++
++    fn vCache(self: *const Model, slot: usize) u64 {
++        return self.kv_buf.ptr + (2 * slot + 1) * kvBytes(self.options.context);
++    }
++
++    // Append contiguous rows to this request's state. Reject overflow before mutation.
++    // extra is null for plain text; otherwise BF16 [tokens.len, hidden], codebook-1 embedding.
++    // Semantic rows combine token + extra, scaled by 1/sqrt(2); ordinary rows do not.
++    // tokens and extra may be released after run returns; run must complete its stream work.
++    pub fn run(self: *Model, stream: cuda.Stream, phase: Phase, tokens: []const u32, extra: ?cuda.DeviceBuffer) !Rows {
++        return self.runTraced(stream, phase, tokens, extra, {});
++    }
++
++    /// `run` with stage captures. `trace` is `{}` (void: every capture site is compiled out, so `run` is unchanged)
++    /// or a pointer to a tracer with
++    ///     capture(t, stream: cuda.Stream, layer: usize, stage: Stage, rows: cuda.DeviceBuffer, row0: usize) !void
++    /// called after the stage's producing kernel is queued on `stream`. `rows` borrows the live scratch tensor,
++    /// BF16 [n][hidden]; it holds the stage only in stream order, and the next kernel queued may overwrite it, so the
++    /// tracer must read it on `stream` and complete the read before returning. row0 is the request position of
++    /// the first row, so chunked runs concatenate in logical order. The tracer must not queue other device work.
++    pub fn runTraced(self: *Model, stream: cuda.Stream, phase: Phase, tokens: []const u32, extra: ?cuda.DeviceBuffer, trace: anytype) !Rows {
++        if (self.poisoned) return error.DramaStateNeedsReset;
++        const n = tokens.len;
++        if (n == 0) return error.EmptyDramaRun;
++        if (n > self.options.max_rows) return error.TooManyDramaRows;
++        if (self.pos + n > self.options.context) return error.DramaContextOverflow;
++        for (tokens) |t| if (t >= config.vocab) return error.DramaTokenOutOfRange;
++        if (extra) |e| if (e.len < n * H * 2) return error.DramaExtraRowsShort;
++        self.poisoned = true;
++        errdefer stream.synchronize() catch {}; // queued kernels may still read tokens/extra; drain before returning
++        const ids = self.tokens.slice(i32)[0..n];
++        for (ids, tokens) |*o, t| o.* = @intCast(t);
++        try self.d.check(self.d.api.cuMemcpyHtoDAsync_v2(self.s.ids, ids.ptr, n * 4, stream.handle), "cuMemcpyHtoDAsync");
++        try self.forward(stream, phase, n, extra, trace);
++        try stream.synchronize();
++        self.pos += n;
++        self.poisoned = false;
++        return .{
++            .hidden = .{ .d = self.d, .ptr = self.hidden_buf.ptr, .len = n * H * 2, .borrowed = true },
++            .semantic_logits = .{ .d = self.d, .ptr = self.logits_buf.ptr, .len = weights.head_cols * 4, .borrowed = true },
++            .rows = n,
++        };
++    }
++
++    fn forward(self: *Model, s: cuda.Stream, phase: Phase, n: usize, extra: ?cuda.DeviceBuffer, trace: anytype) !void {
++        const k = &self.k;
++        const sc = &self.s;
++        try k.embed.bf16(s, sc.ids, self.w.embed, sc.x, n, H);
++        if (extra) |e| try k.semanticMix(s, sc.ids, sc.x, e.ptr, n, H, self.semantic_start, self.semantic_end);
++        for (&self.w.layers, 0..) |*l, i| {
++            try k.addNorm(s, sc.x, sc.residual, l.ln1, sc.normed, n, H, config.eps, i == 0);
++            try self.stage(trace, s, i, .attention_input, sc.normed, n);
++            try self.stage(trace, s, i, .attention_residual, sc.residual, n);
++            if (config.linear(i)) try self.deltaNet(s, phase, l, config.slot(i), n) else try self.fullAttention(s, l, config.slot(i), n);
++            try self.stage(trace, s, i, .attention_output, sc.x, n);
++            try k.addNorm(s, sc.x, sc.residual, l.ln2, sc.normed, n, H, config.eps, false);
++            try self.stage(trace, s, i, .mlp_input, sc.normed, n);
++            try self.stage(trace, s, i, .mlp_residual, sc.residual, n);
++            try self.moe(s, l, n);
++            try self.stage(trace, s, i, .mlp_output, sc.x, n);
++        }
++        try k.addNorm(s, sc.x, sc.residual, self.w.final_norm, self.hidden_buf.ptr, n, H, config.eps, false);
++        try k.head(s, self.hidden_buf.ptr + (n - 1) * H * 2, self.w.head, weights.head_cols, H, self.logits_buf.ptr);
++    }
++
++    /// One capture point; with a void trace the comptime-false branch is never analyzed and emits nothing.
++    inline fn stage(self: *const Model, trace: anytype, s: cuda.Stream, layer: usize, comptime which: Stage, ptr: u64, n: usize) !void {
++        if (@TypeOf(trace) != void) try trace.capture(s, layer, which, cuda.DeviceBuffer{ .d = self.d, .ptr = ptr, .len = n * H * 2, .borrowed = true }, self.pos);
++    }
++
++    /// Diagnostic replay (temporary; tf-drama-backbone-replay is the only caller): runs one layer's production
++    /// `deltaNet`/`fullAttention` (`.attention`) or `moe` on caller-supplied rows instead of the layers below it.
++    /// Needs a fresh reset (position 0, not poisoned). Each chunk in order is uploaded on `stream` into
++    /// `Scratch.normed`, the operators' production input; the production method runs at request position `row0`, so
++    /// attention carries the layer's own DeltaNet conv/recurrent state or KV cache across chunks exactly as `forward`
++    /// does; then `Scratch.x`, the operators' production output, is downloaded to `output` at the same rows.
++    /// `input` and `output` are BF16 [sum(chunks)][hidden] host bytes (pinned, for stream-ordered copies) and must
++    /// not be touched until the call returns, which drains the stream first.
++    /// Only this layer's state advances, so the model stays poisoned even on success: run and replayOperator both
++    /// fail with DramaStateNeedsReset until reset. Unreferenced by production, so it is never analyzed there.
++    pub fn replayOperator(self: *Model, stream: cuda.Stream, layer: usize, operator: ReplayOperator, chunks: []const usize, input: []const u8, output: []u8) !void {
++        if (self.poisoned) return error.DramaStateNeedsReset;
++        if (self.pos != 0) return error.DramaReplayNeedsReset;
++        if (layer >= self.w.layers.len) return error.DramaReplayLayerOutOfRange;
++        var rows: usize = 0;
++        for (chunks) |n| {
++            if (n == 0) return error.EmptyDramaRun;
++            if (n > self.options.max_rows) return error.TooManyDramaRows;
++            rows += n;
++        }
++        if (rows == 0) return error.EmptyDramaRun;
++        if (rows > self.options.context) return error.DramaContextOverflow;
++        if (input.len != rows * H * 2 or output.len != rows * H * 2) return error.DramaReplayRowsMismatch;
++        self.poisoned = true; // never cleared here: the other layers' state no longer matches pos
++        errdefer stream.synchronize() catch {}; // queued copies may still touch input/output; drain before returning
++        const l = &self.w.layers[layer];
++        var row0: usize = 0;
++        for (chunks) |n| {
++            const at = row0 * H * 2;
++            const bytes = n * H * 2;
++            const normed: cuda.DeviceBuffer = .{ .d = self.d, .ptr = self.s.normed, .len = bytes, .borrowed = true };
++            try normed.uploadAsync(0, input[at..][0..bytes], stream.handle);
++            self.pos = row0;
++            switch (operator) {
++                .attention => if (config.linear(layer))
++                    try self.deltaNet(stream, .prefill, l, config.slot(layer), n)
++                else
++                    try self.fullAttention(stream, l, config.slot(layer), n),
++                .moe => try self.moe(stream, l, n),
++            }
++            const x: cuda.DeviceBuffer = .{ .d = self.d, .ptr = self.s.x, .len = bytes, .borrowed = true };
++            try x.downloadAsync(0, output[at..][0..bytes], stream.handle);
++            row0 += n;
++        }
++        try stream.synchronize();
++        self.pos = row0;
++    }
++
++    /// Qwen3.5 GatedDeltaNet: in projection, causal conv + silu, gated delta rule, RMSNormGated * silu(z), out_proj.
++    fn deltaNet(self: *Model, s: cuda.Stream, phase: Phase, l: *const weights.Layer, slot: usize, n: usize) !void {
++        const k = &self.k;
++        const sc = &self.s;
++        const ld = weights.gdn_in_rows;
++        try k.gemm(s, sc.normed, H, n, l.gdn_in, ld, H, sc.proj, ld);
++        const recurrence: gdn.Run = .{
++            .qkv = sc.conv,
++            .ld_qkv = config.conv_dim,
++            .ba = sc.proj + weights.gdn_b_col * 2,
++            .ld_ba = ld,
++            .a_log = l.a_log,
++            .dt_bias = l.dt_bias,
++            .y = sc.core,
++            .rows = n,
++            .nk = config.linear_key_heads,
++            .nv = config.linear_value_heads,
++            .dv = config.linear_dim,
++            .scale = @floatCast(1.0 / @sqrt(@as(f64, config.linear_dim))),
++        };
++        const state = &self.gdn_states[slot];
++        switch (phase) {
++            .prefill => {
++                try k.convPrefill(s, sc.proj, ld, l.conv, self.convState(slot), sc.conv, n, config.conv_dim);
++                try k.gdn.prefill(s, state, self.gdn_ws, recurrence);
++            },
++            .decode => {
++                try k.conv(s, sc.proj, ld, l.conv, self.convState(slot), sc.conv, n, config.conv_dim);
++                try k.gdn.decode(s, state, recurrence);
++            },
++        }
++        try k.gatedRms(s, sc.core, config.value_dim, sc.proj + weights.gdn_z_col * 2, ld, l.gnorm, sc.gated, n, config.eps);
++        try k.gemm(s, sc.gated, config.value_dim, n, l.gdn_out, H, config.value_dim, sc.x, H);
++    }
++
++    /// Gated full attention: q|gate, k, v projection; q/k Gemma norm + partial RoPE; causal GQA; sigmoid gate; o_proj.
++    fn fullAttention(self: *Model, s: cuda.Stream, l: *const weights.Layer, slot: usize, n: usize) !void {
++        const k = &self.k;
++        const sc = &self.s;
++        const ld = weights.attn_in_rows;
++        const width = config.query_heads * config.head_dim;
++        try k.gemm(s, sc.normed, H, n, l.attn_in, ld, H, sc.proj, ld);
++        try k.attention(s, .{
++            .qkv = sc.proj,
++            .ld_qkv = ld,
++            .q_norm = l.q_norm,
++            .k_norm = l.k_norm,
++            .inv_freq = self.w.inv_freq,
++            .q = sc.q,
++            .kc = self.kCache(slot),
++            .vc = self.vCache(slot),
++            .out = sc.gated,
++            .pos0 = self.pos,
++            .rows = n,
++            .heads = config.query_heads,
++            .kv_heads = config.kv_heads,
++            .eps = config.eps,
++            .scale = 1.0 / 16.0, // head_dim ** -0.5
++        });
++        try k.gemm(s, sc.gated, width, n, l.attn_out, H, width, sc.x, H);
++    }
++
++    /// Qwen2MoeSparseMoeBlock with bsgemm-moe experts: softmax top-8 renormalized routing, W8A8 block-FP8 experts
++    /// (dynamic 1 x 128 activation scales), SwiGLU, routed-weighted down, plus the sigmoid-gated shared expert.
++    fn moe(self: *Model, s: cuda.Stream, l: *const weights.Layer, n: usize) !void {
++        const k = &self.k;
++        const sc = &self.s;
++        const pairs = n * top;
++        const ld = weights.moe_in_rows;
++        const I = config.expert_inner;
++        try k.gemm(s, sc.normed, H, n, l.moe_in, ld, H, sc.moe_in, ld);
++        try k.topk(s, sc.moe_in + weights.router_col * 2, ld, sc.picks, sc.routed, n, top);
++        try k.actQuant(s, sc.normed, H, sc.xq, sc.xs, n, H);
++        const plan: cuda.grouped.Plan = .{ .members = sc.members, .items = sc.items, .counts = sc.counts, .rank = sc.rank, .hist = sc.hist };
++        try k.router.route(s, sc.picks, pairs, config.experts, tile, plan);
++        const items = cuda.grouped.maxItems(pairs, config.experts, tile);
++        try k.expert(s, plan, pairs, .{
++            .a = sc.xq,
++            .a_div = top,
++            .a_scales = sc.xs,
++            .w = l.gu,
++            .w_scales = l.gu_s,
++            .n = weights.gu_rows,
++            .kdim = H,
++            .max_items = items,
++            .routed = null,
++            .y = sc.gu,
++        });
++        try k.siluMul(s, sc.gu, weights.gu_rows, I, null, sc.hq, sc.hs, pairs);
++        try k.expert(s, plan, pairs, .{
++            .a = sc.hq,
++            .a_div = 1,
++            .a_scales = sc.hs,
++            .w = l.dn,
++            .w_scales = l.dn_s,
++            .n = H,
++            .kdim = I,
++            .max_items = items,
++            .routed = sc.routed,
++            .y = sc.down,
++        });
++        try k.siluMul(s, sc.moe_in, ld, config.shared_inner, sc.shared_h, null, null, n);
++        try k.gemm(s, sc.shared_h, config.shared_inner, n, l.shared_down, H, config.shared_inner, sc.shared_out, H);
++        try k.combine(s, sc.down, top, sc.normed, l.shared_gate, sc.shared_out, sc.x, n, H);
++    }
++};
++
++test "scratch layout keeps every region 256-byte aligned and disjoint" {
++    const s, const total = Scratch.layout(128);
++    var last: u64 = 0;
++    inline for (@typeInfo(Scratch).@"struct".field_names, 0..) |name, i| {
++        const at = @field(s, name);
++        try std.testing.expect(at % 256 == 0);
++        if (i > 0) try std.testing.expect(at > last);
++        last = at;
++    }
++    try std.testing.expect(total > last);
++}
+diff --git a/zig/src/families/drama/backbone_config.zig b/zig/src/families/drama/backbone_config.zig
+new file mode 100644
+index 00000000..03ea0cd5
+--- /dev/null
++++ b/zig/src/families/drama/backbone_config.zig
+@@ -0,0 +1,155 @@
++//! Admission for the Drama 3 (fish_omni) text backbone: the pinned Qwen3.5-35B-A3B hybrid geometry, block-FP8 experts.
++const std = @import("std");
++
++pub const hidden = 2048;
++pub const vocab = 252288;
++pub const layers = 40;
++pub const full_interval = 4; // layers 3, 7, ..., 39 are full attention, the rest Gated DeltaNet
++pub const full_layers = layers / full_interval;
++pub const linear_layers = layers - full_layers;
++
++pub const linear_key_heads = 16;
++pub const linear_value_heads = 32;
++pub const linear_dim = 128; // key and value head width
++pub const conv_taps = 4;
++pub const conv_dim = 2 * linear_key_heads * linear_dim + linear_value_heads * linear_dim; // q | k | v = 8192
++pub const value_dim = linear_value_heads * linear_dim; // 4096 (z and the recurrence output)
++
++pub const query_heads = 16;
++pub const kv_heads = 2;
++pub const head_dim = 256;
++pub const rotary_dim = 64;
++pub const theta: f64 = 10000000;
++
++pub const experts = 256;
++pub const top_k = 8;
++pub const expert_inner = 512;
++pub const shared_inner = 512;
++pub const block = 128; // FP8 weight block rows and columns; activation group width
++
++pub const eps: f32 = 1e-6;
++
++pub const Config = struct {
++    eos: u32,
++    semantic_start: u32,
++    semantic_end: u32,
++
++    pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
++        const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++        defer gpa.free(path);
++        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
++        defer gpa.free(bytes);
++        return parse(gpa, bytes);
++    }
++};
++
++/// Whether layer `index` is a Gated DeltaNet ("linear_attention") layer.
++pub fn linear(index: usize) bool {
++    return index % full_interval != full_interval - 1;
++}
++
++/// The layer's slot among its kind (DeltaNet state or attention cache index).
++pub fn slot(index: usize) usize {
++    return if (linear(index)) index - index / full_interval else index / full_interval;
++}
++
++fn object(v: std.json.Value) !std.json.ObjectMap {
++    return if (v == .object) v.object else error.BadDramaConfig;
++}
++
++fn field(o: std.json.ObjectMap, key: []const u8) !std.json.Value {
++    return o.get(key) orelse error.BadDramaConfig;
++}
++
++fn number(v: std.json.Value) !f64 {
++    return switch (v) {
++        .integer => |i| @floatFromInt(i),
++        .float => |f| f,
++        else => error.BadDramaConfig,
++    };
++}
++
++fn integer(o: std.json.ObjectMap, key: []const u8) !u64 {
++    const v = try field(o, key);
++    if (v != .integer or v.integer < 0) return error.BadDramaConfig;
++    return @intCast(v.integer);
++}
++
++fn string(o: std.json.ObjectMap, key: []const u8, expected: []const u8) !void {
++    const v = try field(o, key);
++    if (v != .string or !std.mem.eql(u8, v.string, expected)) return error.UnsupportedDramaConfig;
++}
++
++fn boolean(o: std.json.ObjectMap, key: []const u8, expected: bool) !void {
++    const v = try field(o, key);
++    if (v != .bool or v.bool != expected) return error.UnsupportedDramaConfig;
++}
++
++fn quantization(o: std.json.ObjectMap) !void {
++    try string(o, "quant_method", "bsgemm-moe");
++    try string(o, "activation_scheme", "dynamic");
++    const size = try field(o, "weight_block_size");
++    if (size != .array or size.array.items.len != 2) return error.UnsupportedDramaQuantization;
++    for (size.array.items) |s| if (s != .integer or s.integer != block) return error.UnsupportedDramaQuantization;
++}
++
++pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
++    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
++    defer parsed.deinit();
++    const root = try object(parsed.value);
++    try string(root, "model_type", "fish_omni");
++    try quantization(try object(try field(root, "quantization_config")));
++    const text = try object(try field(root, "text_config"));
++    try string(text, "model_type", "fish_omni_text");
++    try boolean(text, "tie_word_embeddings", false);
++    try boolean(text, "attention_bias", false);
++    try boolean(text, "attn_output_gate", true);
++    try boolean(text, "use_qk_norm", true);
++    try boolean(text, "layernorm_zero_centered_gamma", true);
++    try boolean(text, "shared_expert_gate", true);
++    // absent in the pinned text_config: Qwen3_5MoeTextConfig's default (true) applies, as SGLang's TopK reads it
++    if (text.get("norm_topk_prob")) |v| if (v != .bool or !v.bool) return error.UnsupportedDramaConfig;
++    try boolean(text, "rotary_interleaved", false);
++    try string(text, "hidden_act", "silu");
++    try string(text, "mamba_ssm_dtype", "float32");
++    const dims = .{
++        .{ "hidden_size", hidden },                    .{ "vocab_size", vocab },                          .{ "num_hidden_layers", layers },
++        .{ "linear_num_key_heads", linear_key_heads }, .{ "linear_num_value_heads", linear_value_heads }, .{ "linear_key_head_dim", linear_dim },
++        .{ "linear_value_head_dim", linear_dim },      .{ "linear_conv_kernel_dim", conv_taps },          .{ "num_attention_heads", query_heads },
++        .{ "num_key_value_heads", kv_heads },          .{ "head_dim", head_dim },                         .{ "num_experts", experts },
++        .{ "num_experts_per_tok", top_k },             .{ "moe_intermediate_size", expert_inner },        .{ "shared_expert_intermediate_size", shared_inner },
++    };
++    inline for (dims) |d| if (try integer(text, d[0]) != d[1]) return error.UnsupportedDramaGeometry;
++    if (try number(try field(text, "rms_norm_eps")) != 1e-6) return error.UnsupportedDramaConfig;
++    const types = try field(text, "layer_types");
++    if (types != .array or types.array.items.len != layers) return error.UnsupportedDramaGeometry;
++    for (types.array.items, 0..) |kind, i| {
++        if (kind != .string or !std.mem.eql(u8, kind.string, if (linear(i)) "linear_attention" else "full_attention"))
++            return error.UnsupportedDramaGeometry;
++    }
++    const mlp = try field(text, "mlp_layer_types");
++    if (mlp != .array or mlp.array.items.len != layers) return error.UnsupportedDramaGeometry;
++    for (mlp.array.items) |kind| if (kind != .string or !std.mem.eql(u8, kind.string, "moe")) return error.UnsupportedDramaGeometry;
++    const rope = try object(try field(text, "rope_parameters"));
++    try string(rope, "rope_type", "default");
++    if (try number(try field(rope, "rope_theta")) != theta or
++        try number(try field(rope, "partial_rotary_factor")) != 0.25) return error.UnsupportedDramaRotary;
++    const audio = try object(try field(root, "audio_decoder_config"));
++    if (try integer(audio, "vq_backbone_codebooks") != 1) return error.UnsupportedDramaConfig;
++    try string(audio, "vq_feature_placement", "backbone_partial");
++    const eos = try integer(root, "eos_token_id");
++    const start = try integer(root, "semantic_start_token_id");
++    const end = try integer(root, "semantic_end_token_id");
++    if (try integer(text, "eos_token_id") != eos) return error.BadDramaConfig;
++    // semantic logits are EOS then the 4096-code band; the band sits above EOS inside the vocabulary
++    if (end < start or end - start + 1 != 4096 or end >= vocab or eos >= start) return error.UnsupportedDramaConfig;
++    return .{ .eos = @intCast(eos), .semantic_start = @intCast(start), .semantic_end = @intCast(end) };
++}
++
++test "layer kinds and slots follow the 3 DeltaNet : 1 attention pattern" {
++    try std.testing.expect(linear(0) and linear(2) and !linear(3) and !linear(39));
++    try std.testing.expectEqual(@as(usize, 2), slot(2));
++    try std.testing.expectEqual(@as(usize, 3), slot(4)); // the fourth DeltaNet layer
++    try std.testing.expectEqual(@as(usize, 9), slot(39)); // the tenth attention layer
++    try std.testing.expectEqual(@as(usize, linear_layers - 1), slot(38));
++}
+diff --git a/zig/src/families/drama/backbone_gdn.zig b/zig/src/families/drama/backbone_gdn.zig
+new file mode 100644
+index 00000000..788c55de
+--- /dev/null
++++ b/zig/src/families/drama/backbone_gdn.zig
+@@ -0,0 +1,368 @@
++//! Drama Gated DeltaNet recurrence: canonical chunked prefill and the packed decode recurrence, for one layer's state.
++//!
++//! Prefill is SGLang 0.5.21's chunk_gated_delta_rule (Apache License 2.0), whose fla/ kernels are adapted from
++//! flash-linear-attention (MIT License, Copyright (c) 2023-2025, Songlin Yang, Yu Zhang); the six kernels of
++//! drama_gdn_chunk.cuh name the source kernel each mirrors. Chunk boundaries are canonical: every 64 prefill tokens
++//! since the last reset or decode, independent of how the caller splits the prompt into calls.
++//!
++//! A layer's State keeps the committed FP32 state at the last chunk boundary, the unfinished chunk's post-convolution
++//! rows (at most 63) and a second FP32 bank holding the state after them (the trial). A prefill call
++//!   1. appends rows to an unfinished chunk and recomputes that chunk from the unchanged committed bank into the
++//!      other bank, emitting only the new rows; a chunk reaching 64 rows commits that bank;
++//!   2. then, at a boundary, runs the largest multiple of 64 remaining rows straight from the caller's inputs in one
++//!      segment and commits once;
++//!   3. then starts a new unfinished chunk with the rest, as in 1.
++//! Decode first adopts the trial bank of an unfinished chunk, then runs the packed decode recurrence in place, so a
++//! later prefill starts a fresh chunk from the decoded state.
++//!
++//! The component owns no memory and no module: states, caches, workspace and outputs are caller device memory, and
++//! every launch goes to the caller's stream. Inputs are never written; y receives exactly run.rows rows. A failed
++//! call leaves device and host state undefined: the caller drains its stream and resets every layer.
++const std = @import("std");
++const cuda = @import("cuda");
++
++/// Prefill chunk length (fla chunk.py CHUNK_SIZE); the row cache holds one chunk.
++pub const chunk_rows: usize = 64;
++/// Key and value head width the kernels are written for.
++const head_dim: usize = 128;
++/// l2norm_fwd's eps.
++const l2norm_eps: f32 = 1e-6;
++const max_int: usize = std.math.maxInt(i32);
++/// Grid y / z limit.
++const max_grid_yz: usize = 65535;
++
++/// One layer's recurrent state. All addresses are caller device memory; resetMetadata never touches it.
++pub const State = struct {
++    banks: [2]u64, // FP32 [nv][128 v][128 k] each, distinct, 16-byte aligned
++    qkv_cache: u64, // BF16 [64, (2*nk+nv)*128]
++    ba_cache: u64, // BF16 [64, 2*nv]
++    pending: usize = 0, // rows of the unfinished chunk in the caches
++    committed_bank: u1 = 0,
++
++    /// The latest state: the trial bank while a chunk is unfinished, else the committed bank.
++    pub fn current(self: *const State) u64 {
++        return self.banks[if (self.pending > 0) ~self.committed_bank else self.committed_bank];
++    }
++
++    /// Back to an empty state's metadata. DOES NOT zero device memory: the caller zeroes the banks first.
++    pub fn resetMetadata(self: *State) void {
++        self.pending = 0;
++        self.committed_bank = 0;
++    }
++
++    fn committed(self: *const State) u64 {
++        return self.banks[self.committed_bank];
++    }
++
++    fn other(self: *const State) u64 {
++        return self.banks[~self.committed_bank];
++    }
++
++    fn commit(self: *State) void {
++        self.committed_bank = ~self.committed_bank;
++        self.pending = 0;
++    }
++};
++
++/// The prefill intermediates for segments of up to `rows` rows (offsets until `place`, then device addresses).
++/// Reusable across layers on one stream.
++pub const Workspace = struct {
++    rows: usize, // capacity, a multiple of chunk_rows
++    nk: usize,
++    nv: usize,
++    qk: u64 = 0, // bf16 [rows][2 nk][128] normalized q heads then k heads
++    g: u64 = 0, // f32 [rows][nv]
++    gc: u64 = 0, // f32 [rows][nv] chunk-local cumsum of g
++    beta: u64 = 0, // f32 [rows][nv] bf16 values
++    a: u64 = 0, // bf16 [rows][nv][64] (I + A)^-1
++    w: u64 = 0, // bf16 [rows][nv][128]
++    u: u64 = 0, // bf16 [rows][nv][128]
++    vn: u64 = 0, // bf16 [rows][nv][128] v_new
++    h: u64 = 0, // bf16 [rows / 64][nv][128 v][128 k] state at each chunk start
++
++    const device = .{ "qk", "g", "gc", "beta", "a", "w", "u", "vn", "h" };
++
++    /// Offsets of every region (256-byte aligned) and the allocation size, for capacity
++    /// max(64, floor(max_rows / 64) * 64): the unfinished chunk or the largest aligned segment of max_rows rows.
++    pub fn layout(max_rows: usize, nk: usize, nv: usize) struct { Workspace, usize } {
++        const rows = @max(chunk_rows, max_rows / chunk_rows * chunk_rows);
++        const vec = rows * nv * head_dim * 2;
++        var used: usize = 0;
++        var ws: Workspace = .{ .rows = rows, .nk = nk, .nv = nv };
++        ws.qk = take(&used, rows * 2 * nk * head_dim * 2);
++        ws.g = take(&used, rows * nv * 4);
++        ws.gc = take(&used, rows * nv * 4);
++        ws.beta = take(&used, rows * nv * 4);
++        ws.a = take(&used, rows * nv * chunk_rows * 2);
++        ws.w = take(&used, vec);
++        ws.u = take(&used, vec);
++        ws.vn = take(&used, vec);
++        ws.h = take(&used, rows / chunk_rows * nv * head_dim * head_dim * 2);
++        return .{ ws, used };
++    }
++
++    /// The same layout at device address `base`.
++    pub fn place(self: Workspace, base: u64) Workspace {
++        var ws = self;
++        inline for (device) |name| @field(ws, name) += base;
++        return ws;
++    }
++
++    fn take(used: *usize, bytes: usize) u64 {
++        const at = std.mem.alignForward(usize, used.*, 256);
++        used.* = at + bytes;
++        return at;
++    }
++};
++
++/// One call's rows. qkv: BF16 [rows][ld_qkv], [q nk x 128 | k nk x 128 | v nv x 128] post-convolution;
++/// ba: BF16 [rows][ld_ba], [b nv | a nv]; a_log, dt_bias: FP32 [nv]; y: BF16 [rows][nv][dv].
++pub const Run = struct {
++    qkv: u64,
++    ld_qkv: usize,
++    ba: u64,
++    ld_ba: usize,
++    a_log: u64,
++    dt_bias: u64,
++    y: u64,
++    rows: usize,
++    nk: usize,
++    nv: usize,
++    dv: usize,
++    scale: f32,
++};
++
++/// One segment of the six-kernel chain: rows from a chunk boundary, state_in -> state_out (distinct banks), output
++/// rows emit_from .. rows - 1 to y.
++const Segment = struct {
++    qkv: u64,
++    ld_qkv: usize,
++    ba: u64,
++    ld_ba: usize,
++    rows: usize,
++    emit_from: usize,
++    y: u64,
++    state_in: u64,
++    state_out: u64,
++};
++
++fn go(s: cuda.Stream, f: cuda.Function, grid: [3]usize, block: u32, a: *cuda.Args) !void {
++    const g: cuda.Dim3 = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) };
++    try cuda.launch.launch(f, .{ .grid = g, .block = .{ .x = block } }, s, a);
++}
++
++fn int(v: usize) i32 {
++    return @intCast(v);
++}
++
++fn checkRun(r: Run) !void {
++    if (r.dv != head_dim or r.nk == 0 or r.nv == 0 or r.nv % r.nk != 0 or r.nv > max_grid_yz) return error.DramaGdnShape;
++    if (r.rows == 0 or r.rows > max_int / (2 * r.nk)) return error.DramaGdnShape;
++    if (r.ld_qkv < (2 * r.nk + r.nv) * head_dim or r.ld_qkv > max_int or r.ld_ba < 2 * r.nv or r.ld_ba > max_int) return error.DramaGdnShape;
++}
++
++fn checkBanks(st: *const State, nv: usize) !void {
++    const bytes = nv * head_dim * head_dim * 4;
++    const lo = @min(st.banks[0], st.banks[1]);
++    const hi = @max(st.banks[0], st.banks[1]);
++    if (st.banks[0] % 16 != 0 or st.banks[1] % 16 != 0 or hi - lo < bytes) return error.DramaGdnState;
++    if (st.pending >= chunk_rows) return error.DramaGdnState;
++}
++
++pub const Kernels = struct {
++    l2norm_fn: cuda.Function,
++    gate_fn: cuda.Function,
++    kkt_fn: cuda.Function,
++    wu_fn: cuda.Function,
++    h_fn: cuda.Function,
++    o_fn: cuda.Function,
++    append_fn: cuda.Function,
++    decode_fn: cuda.Function,
++
++    /// Resolves the exports of the drama_backbone glue image.
++    pub fn init(module: *cuda.Module) !Kernels {
++        return .{
++            .l2norm_fn = try module.function("drama_gdn_chunk_l2norm"),
++            .gate_fn = try module.function("drama_gdn_chunk_gate"),
++            .kkt_fn = try module.function("drama_gdn_chunk_kkt"),
++            .wu_fn = try module.function("drama_gdn_chunk_wu"),
++            .h_fn = try module.function("drama_gdn_chunk_h"),
++            .o_fn = try module.function("drama_gdn_chunk_o"),
++            .append_fn = try module.function("drama_gdn_chunk_append"),
++            .decode_fn = try module.function("drama_gdn_recur"),
++        };
++    }
++
++    /// Prefill rows on canonical chunk boundaries (see the file comment). Validates everything before the first launch.
++    pub fn prefill(self: *const Kernels, stream: cuda.Stream, state: *State, workspace: Workspace, run: Run) !void {
++        try checkRun(run);
++        try checkBanks(state, run.nv);
++        if (state.qkv_cache == 0 or state.ba_cache == 0) return error.DramaGdnState;
++        if (workspace.nk != run.nk or workspace.nv != run.nv or workspace.rows == 0 or workspace.rows % chunk_rows != 0) return error.DramaGdnWorkspace;
++        const head = if (state.pending > 0) @min(chunk_rows - state.pending, run.rows) else 0;
++        const bulk = (run.rows - head) / chunk_rows * chunk_rows;
++        if (bulk > workspace.rows or bulk / chunk_rows > max_grid_yz) return error.DramaGdnWorkspace;
++        const y_row = run.nv * run.dv * 2;
++        var done: usize = 0;
++        if (head > 0) {
++            try self.unfinished(stream, state, workspace, run, 0, head);
++            done = head;
++        }
++        if (bulk > 0) {
++            try self.chain(stream, workspace, run, .{
++                .qkv = run.qkv + done * run.ld_qkv * 2,
++                .ld_qkv = run.ld_qkv,
++                .ba = run.ba + done * run.ld_ba * 2,
++                .ld_ba = run.ld_ba,
++                .rows = bulk,
++                .emit_from = 0,
++                .y = run.y + done * y_row,
++                .state_in = state.committed(),
++                .state_out = state.other(),
++            });
++            state.commit();
++            done += bulk;
++        }
++        if (done < run.rows) try self.unfinished(stream, state, workspace, run, done, run.rows - done);
++    }
++
++    /// Packed decode recurrence (unchanged arithmetic) on the latest state, in place; adopts an unfinished chunk's
++    /// trial bank first.
++    pub fn decode(self: *const Kernels, stream: cuda.Stream, state: *State, run: Run) !void {
++        try checkRun(run);
++        try checkBanks(state, run.nv);
++        if (state.pending > 0) state.commit();
++        var a: cuda.Args = .{};
++        a.add(run.qkv);
++        a.add(int(run.ld_qkv));
++        a.add(run.ba);
++        a.add(int(run.ld_ba));
++        a.add(run.a_log);
++        a.add(run.dt_bias);
++        a.add(state.committed());
++        a.add(run.y);
++        a.add(int(run.rows));
++        a.add(int(run.nk));
++        a.add(int(run.nv));
++        a.add(run.scale);
++        try go(stream, self.decode_fn, .{ run.dv / 32, run.nv, 1 }, 128, &a);
++    }
++
++    /// Appends run rows [from, from + count) to the unfinished chunk (count <= 64 - pending) and recomputes the
++    /// chunk from the committed bank into the other bank, emitting only the appended rows; commits a full chunk.
++    fn unfinished(self: *const Kernels, stream: cuda.Stream, state: *State, ws: Workspace, run: Run, from: usize, count: usize) !void {
++        const at = state.pending;
++        const qkv_cols = (2 * run.nk + run.nv) * head_dim;
++        const ba_cols = 2 * run.nv;
++        var a: cuda.Args = .{};
++        a.add(run.qkv + from * run.ld_qkv * 2);
++        a.add(int(run.ld_qkv));
++        a.add(run.ba + from * run.ld_ba * 2);
++        a.add(int(run.ld_ba));
++        a.add(state.qkv_cache);
++        a.add(state.ba_cache);
++        a.add(int(at));
++        a.add(int(qkv_cols));
++        a.add(int(ba_cols));
++        try go(stream, self.append_fn, .{ count, 1, 1 }, 256, &a);
++        const rows = at + count;
++        try self.chain(stream, ws, run, .{
++            .qkv = state.qkv_cache,
++            .ld_qkv = qkv_cols,
++            .ba = state.ba_cache,
++            .ld_ba = ba_cols,
++            .rows = rows,
++            .emit_from = at,
++            .y = run.y + from * run.nv * run.dv * 2,
++            .state_in = state.committed(),
++            .state_out = state.other(),
++        });
++        if (rows == chunk_rows) state.commit() else state.pending = rows;
++    }
++
++    /// l2norm -> gate -> kkt -> wu -> h -> o over one segment.
++    fn chain(self: *const Kernels, stream: cuda.Stream, ws: Workspace, run: Run, seg: Segment) !void {
++        const nt = (seg.rows + chunk_rows - 1) / chunk_rows;
++        const rows = int(seg.rows);
++        const nk = int(run.nk);
++        const nv = int(run.nv);
++        {
++            var a: cuda.Args = .{};
++            a.add(seg.qkv);
++            a.add(int(seg.ld_qkv));
++            a.add(ws.qk);
++            a.add(rows);
++            a.add(nk);
++            a.add(l2norm_eps);
++            try go(stream, self.l2norm_fn, .{ (seg.rows * 2 * run.nk + 15) / 16, 1, 1 }, 256, &a);
++        }
++        {
++            var a: cuda.Args = .{};
++            a.add(seg.ba);
++            a.add(int(seg.ld_ba));
++            a.add(run.a_log);
++            a.add(run.dt_bias);
++            a.add(ws.g);
++            a.add(ws.gc);
++            a.add(ws.beta);
++            a.add(rows);
++            a.add(nv);
++            try go(stream, self.gate_fn, .{ nt, run.nv, 1 }, 64, &a);
++        }
++        {
++            var a: cuda.Args = .{};
++            a.add(ws.qk);
++            a.add(ws.gc);
++            a.add(ws.beta);
++            a.add(ws.a);
++            a.add(rows);
++            a.add(nk);
++            a.add(nv);
++            try go(stream, self.kkt_fn, .{ nt, run.nv, 1 }, 32, &a);
++        }
++        {
++            var a: cuda.Args = .{};
++            a.add(seg.qkv);
++            a.add(int(seg.ld_qkv));
++            a.add(ws.qk);
++            a.add(ws.gc);
++            a.add(ws.beta);
++            a.add(ws.a);
++            a.add(ws.w);
++            a.add(ws.u);
++            a.add(rows);
++            a.add(nk);
++            a.add(nv);
++            try go(stream, self.wu_fn, .{ nt, run.nv, 1 }, 128, &a);
++        }
++        {
++            var a: cuda.Args = .{};
++            a.add(ws.qk);
++            a.add(ws.w);
++            a.add(ws.u);
++            a.add(ws.gc);
++            a.add(seg.state_in);
++            a.add(seg.state_out);
++            a.add(ws.h);
++            a.add(ws.vn);
++            a.add(rows);
++            a.add(nk);
++            a.add(nv);
++            try go(stream, self.h_fn, .{ head_dim / 32, run.nv, 1 }, 128, &a);
++        }
++        {
++            var a: cuda.Args = .{};
++            a.add(ws.qk);
++            a.add(ws.vn);
++            a.add(ws.h);
++            a.add(ws.gc);
++            a.add(seg.y);
++            a.add(rows);
++            a.add(int(seg.emit_from));
++            a.add(nk);
++            a.add(nv);
++            a.add(run.scale);
++            try go(stream, self.o_fn, .{ head_dim / 64, nt, run.nv }, 128, &a);
++        }
++    }
++};
+diff --git a/zig/src/families/drama/backbone_kernels.zig b/zig/src/families/drama/backbone_kernels.zig
+new file mode 100644
+index 00000000..0f41406c
+--- /dev/null
++++ b/zig/src/families/drama/backbone_kernels.zig
+@@ -0,0 +1,331 @@
++//! Drama backbone glue and GEMMs, embedded like TensorFold's shared kernels.
++//! An explicit kernel directory selects standalone images for numerical-oracle tooling.
++const std = @import("std");
++const cuda = @import("cuda");
++const backbone_gdn = @import("backbone_gdn.zig");
++
++pub const glue_file = "drama_backbone.fatbin";
++pub const gemm_file = "drama_backbone_gemm.fatbin";
++
++/// The bf16 product tilings: (rows a tile, 8-column tiles a warp) for up to 16, 32 and more rows.
++const tilings = [_][2]usize{ .{ 1, 1 }, .{ 2, 2 }, .{ 4, 2 } };
++const gemm_symbols = [3][:0]const u8{ "drama_gemm_bf16_r1_n1_o0", "drama_gemm_bf16_r2_n2_o0", "drama_gemm_bf16_r4_n2_o0" };
++/// One row, fp32 out holding bf16-rounded values (the lm_head's bf16 logits read as float).
++const head_symbol = "drama_gemm_bf16_r1_n1_o2";
++/// Expert products: [mode][column tiles a warp - 1]; mode 1 scales by the routed weight.
++const expert_symbols = [2][2][:0]const u8{
++    .{ "drama_expert_fp8_n1_m0", "drama_expert_fp8_n2_m0" },
++    .{ "drama_expert_fp8_n1_m1", "drama_expert_fp8_n2_m1" },
++};
++const warps = 4;
++
++fn readImage(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![]align(16) u8 {
++    const path = try std.fs.path.join(gpa, &.{ dir, name });
++    defer gpa.free(path);
++    return std.Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .limited(1 << 28), .@"16", null) catch |e| {
++        std.log.err("drama backbone: cannot read kernel image {s}: {s}", .{ path, @errorName(e) });
++        return e;
++    };
++}
++
++fn loadImage(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, name: []const u8) !cuda.Module {
++    const image = try readImage(gpa, io, dir, name);
++    defer gpa.free(image);
++    return cuda.Module.load(d, image);
++}
++
++fn go(s: cuda.Stream, f: cuda.Function, grid: [3]usize, block: u32, a: *cuda.Args) !void {
++    const g: cuda.Dim3 = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) };
++    try cuda.launch.launch(f, .{ .grid = g, .block = .{ .x = block } }, s, a);
++}
++
++fn int(v: usize) i32 {
++    return @intCast(v);
++}
++
++pub const Kernels = struct {
++    glue: cuda.Module,
++    gemm_mod: cuda.Module,
++    experts_mod: cuda.Module,
++    embed: cuda.embed_rows.EmbedRows,
++    router: cuda.grouped.Router,
++    semantic_mix_fn: cuda.Function,
++    add_norm_fn: cuda.Function,
++    gated_rms_fn: cuda.Function,
++    conv_fn: cuda.Function,
++    conv_prefill_fn: cuda.Function,
++    gdn: backbone_gdn.Kernels,
++    attn_prep_fn: cuda.Function,
++    attention_fn: cuda.Function,
++    topk_fn: cuda.Function,
++    act_quant_fn: cuda.Function,
++    silu_mul_fn: cuda.Function,
++    combine_fn: cuda.Function,
++    gemms: [3]cuda.Function,
++    head_fn: cuda.Function,
++    experts: [2][2]cuda.Function,
++
++    pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, kernel_dir: []const u8) !Kernels {
++        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
++        var glue = if (kernel_dir.len == 0) try cuda.Module.load(d, cuda.kernels.drama_backbone) else try loadImage(gpa, io, d, kernel_dir, glue_file);
++        errdefer glue.unload();
++        var gemm_mod = if (kernel_dir.len == 0) try cuda.Module.load(d, cuda.kernels.drama_backbone_gemm) else try loadImage(gpa, io, d, kernel_dir, gemm_file);
++        errdefer gemm_mod.unload();
++        var experts_mod = try cuda.Module.load(d, cuda.kernels.experts);
++        errdefer experts_mod.unload();
++        var embed = try cuda.embed_rows.EmbedRows.load(d);
++        errdefer embed.unload();
++        var k: Kernels = .{
++            .glue = glue,
++            .gemm_mod = gemm_mod,
++            .experts_mod = experts_mod,
++            .embed = embed,
++            .router = try cuda.grouped.Router.resolve(experts_mod),
++            .semantic_mix_fn = try glue.function("drama_semantic_mix"),
++            .add_norm_fn = try glue.function("drama_add_norm"),
++            .gated_rms_fn = try glue.function("drama_gated_rms_128"),
++            .conv_fn = try glue.function("drama_gdn_conv"),
++            .conv_prefill_fn = try glue.function("drama_gdn_conv_prefill"),
++            .gdn = try backbone_gdn.Kernels.init(&glue),
++            .attn_prep_fn = try glue.function("drama_attn_prep"),
++            .attention_fn = try glue.function("drama_attention"),
++            .topk_fn = try glue.function("drama_topk"),
++            .act_quant_fn = try glue.function("drama_act_quant"),
++            .silu_mul_fn = try glue.function("drama_silu_mul"),
++            .combine_fn = try glue.function("drama_moe_combine"),
++            .gemms = undefined,
++            .head_fn = undefined,
++            .experts = undefined,
++        };
++        for (gemm_symbols, 0..) |sym, v| k.gemms[v] = try gemm_mod.function(sym);
++        k.head_fn = try gemm_mod.function(head_symbol);
++        for (expert_symbols, 0..) |row, m| for (row, 0..) |sym, n| {
++            k.experts[m][n] = try gemm_mod.function(sym);
++        };
++        return k;
++    }
++
++    pub fn unload(k: *Kernels) void {
++        k.embed.unload();
++        k.experts_mod.unload();
++        k.gemm_mod.unload();
++        k.glue.unload();
++        k.* = undefined;
++    }
++
++    fn product(f: cuda.Function, s: cuda.Stream, rt: usize, nt: usize, x: u64, ldx: usize, m: usize, w: u64, n: usize, kdim: usize, y: u64, ldy: usize) !void {
++        if (m == 0) return;
++        if (kdim % 32 != 0 or ldx % 8 != 0 or x % 16 != 0 or w % 16 != 0) return error.DramaGemmShape;
++        var a: cuda.Args = .{};
++        a.add(x);
++        a.add(int(ldx));
++        a.add(int(m));
++        a.add(w);
++        a.add(int(n));
++        a.add(int(kdim));
++        a.add(y);
++        a.add(int(ldy));
++        const cols = 8 * nt * warps;
++        try go(s, f, .{ (n + cols - 1) / cols, (m + 16 * rt - 1) / (16 * rt), 1 }, 32 * warps, &a);
++    }
++
++    /// Y[m, n] = bf16(X[m, :] . W[n, :]) (fp32 accumulate). W has ceil8(n) rows; k % 32 == 0; rows 16-byte aligned.
++    pub fn gemm(k: *const Kernels, s: cuda.Stream, x: u64, ldx: usize, m: usize, w: u64, n: usize, kdim: usize, y: u64, ldy: usize) !void {
++        const v: usize = if (m <= 16) 0 else if (m <= 32) 1 else 2;
++        try product(k.gemms[v], s, tilings[v][0], tilings[v][1], x, ldx, m, w, n, kdim, y, ldy);
++    }
++
++    /// y[n] = float(bf16(x . W[n, :])) for one row x.
++    pub fn head(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, n: usize, kdim: usize, y: u64) !void {
++        try product(k.head_fn, s, 1, 1, x, kdim, 1, w, n, kdim, y, n);
++    }
++
++    pub const ExpertCall = struct {
++        a: u64, // e4m3 rows of kdim bytes
++        a_div: usize, // pair p reads row p / a_div
++        a_scales: u64, // f32 [rows][kdim / 128]
++        w: u64, // e4m3 [experts][n][kdim]
++        w_scales: u64, // f32 [experts][n / 128][kdim / 128]
++        n: usize,
++        kdim: usize,
++        max_items: usize,
++        routed: ?u64, // f32 [pairs] routed weights: scale before the bf16 store
++        y: u64, // bf16 [pairs][n]
++    };
++
++    pub fn expert(k: *const Kernels, s: cuda.Stream, plan: cuda.grouped.Plan, pairs: usize, c: ExpertCall) !void {
++        if (c.n % 128 != 0 or c.kdim % 128 != 0) return error.DramaGemmShape;
++        const nt: usize = if (pairs > 64) 2 else 1;
++        var a: cuda.Args = .{};
++        a.add(c.a);
++        a.add(int(c.a_div));
++        a.add(c.a_scales);
++        a.add(c.w);
++        a.add(c.w_scales);
++        a.add(int(c.n));
++        a.add(int(c.kdim));
++        a.add(plan.items);
++        a.add(plan.counts);
++        a.add(plan.members);
++        a.add(c.routed orelse 0);
++        a.add(c.y);
++        const cols = 8 * nt * warps;
++        const f = k.experts[@intFromBool(c.routed != null)][nt - 1];
++        try go(s, f, .{ c.max_items, c.n / cols, 1 }, 32 * warps, &a);
++    }
++
++    pub fn semanticMix(k: *const Kernels, s: cuda.Stream, ids: u64, out: u64, extra: u64, rows: usize, width: usize, lo: u32, hi: u32) !void {
++        var a: cuda.Args = .{};
++        a.add(ids);
++        a.add(out);
++        a.add(extra);
++        a.add(int(width));
++        a.add(@as(i32, @intCast(lo)));
++        a.add(@as(i32, @intCast(hi)));
++        try go(s, k.semantic_mix_fn, .{ rows, 1, 1 }, 256, &a);
++    }
++
++    /// res = x (first) or bf16(x + res); y = bf16(norm(x + res) * (1 + w)).
++    pub fn addNorm(k: *const Kernels, s: cuda.Stream, x: u64, res: u64, w: u64, y: u64, rows: usize, width: usize, eps: f32, first: bool) !void {
++        if (width > 256 * 16) return error.DramaRowShape;
++        var a: cuda.Args = .{};
++        a.add(x);
++        a.add(res);
++        a.add(w);
++        a.add(y);
++        a.add(int(width));
++        a.add(eps);
++        a.add(@as(i32, @intFromBool(first)));
++        try go(s, k.add_norm_fn, .{ rows, 1, 1 }, 256, &a);
++    }
++
++    /// Drama-only 32 x 128 gated RMS; fixed full-extend reduction, independent of token count.
++    pub fn gatedRms(k: *const Kernels, s: cuda.Stream, y: u64, y_ld: usize, z: u64, z_ld: usize, w: u64, out: u64, rows: usize, eps: f32) !void {
++        if (rows == 0) return;
++        var a: cuda.Args = .{};
++        a.add(y);
++        a.add(@as(i64, @intCast(y_ld)));
++        a.add(z);
++        a.add(@as(i64, @intCast(z_ld)));
++        a.add(w);
++        a.add(out);
++        a.add(eps);
++        const threads = cuda.launch.rowThreads(rows, 256, 32);
++        try go(s, k.gated_rms_fn, .{ rows, 32 / (threads / 16), 1 }, threads, &a);
++    }
++
++    pub fn conv(k: *const Kernels, s: cuda.Stream, in: u64, ld_in: usize, w: u64, state: u64, out: u64, rows: usize, channels: usize) !void {
++        try convUsing(k.conv_fn, s, in, ld_in, w, state, out, rows, channels);
++    }
++
++    pub fn convPrefill(k: *const Kernels, s: cuda.Stream, in: u64, ld_in: usize, w: u64, state: u64, out: u64, rows: usize, channels: usize) !void {
++        try convUsing(k.conv_prefill_fn, s, in, ld_in, w, state, out, rows, channels);
++    }
++
++    fn convUsing(kernel: cuda.Function, s: cuda.Stream, in: u64, ld_in: usize, w: u64, state: u64, out: u64, rows: usize, channels: usize) !void {
++        var a: cuda.Args = .{};
++        a.add(in);
++        a.add(int(ld_in));
++        a.add(w);
++        a.add(state);
++        a.add(out);
++        a.add(int(rows));
++        a.add(int(channels));
++        try go(s, kernel, .{ (channels + 255) / 256, 1, 1 }, 256, &a);
++    }
++
++    pub const Attn = struct {
++        qkv: u64,
++        ld_qkv: usize,
++        q_norm: u64,
++        k_norm: u64,
++        inv_freq: u64,
++        q: u64,
++        kc: u64,
++        vc: u64,
++        out: u64,
++        pos0: usize,
++        rows: usize,
++        heads: usize,
++        kv_heads: usize,
++        eps: f32,
++        scale: f32,
++    };
++
++    /// q/k norm + RoPE + cache append, then causal attention with the output gate.
++    pub fn attention(k: *const Kernels, s: cuda.Stream, t: Attn) !void {
++        var a: cuda.Args = .{};
++        a.add(t.qkv);
++        a.add(int(t.ld_qkv));
++        a.add(t.q_norm);
++        a.add(t.k_norm);
++        a.add(t.inv_freq);
++        a.add(t.q);
++        a.add(t.kc);
++        a.add(t.vc);
++        a.add(int(t.pos0));
++        a.add(int(t.heads));
++        a.add(int(t.kv_heads));
++        a.add(t.eps);
++        try go(s, k.attn_prep_fn, .{ t.rows, t.heads + t.kv_heads, 1 }, 32, &a);
++        var b: cuda.Args = .{};
++        b.add(t.q);
++        b.add(t.kc);
++        b.add(t.vc);
++        b.add(t.qkv);
++        b.add(int(t.ld_qkv));
++        b.add(t.out);
++        b.add(int(t.pos0));
++        b.add(int(t.heads));
++        b.add(int(t.kv_heads));
++        b.add(t.scale);
++        try go(s, k.attention_fn, .{ t.rows, t.heads, 1 }, 256, &b);
++    }
++
++    pub fn topk(k: *const Kernels, s: cuda.Stream, logits: u64, ld: usize, ids: u64, wts: u64, rows: usize, top: usize) !void {
++        if (top == 0 or top > 8) return error.DramaRowShape; // drama_topk keeps at most 8 picks in shared memory
++        var a: cuda.Args = .{};
++        a.add(logits);
++        a.add(int(ld));
++        a.add(ids);
++        a.add(wts);
++        a.add(int(top));
++        try go(s, k.topk_fn, .{ rows, 1, 1 }, 256, &a);
++    }
++
++    pub fn actQuant(k: *const Kernels, s: cuda.Stream, x: u64, ld_x: usize, q: u64, scales: u64, rows: usize, kdim: usize) !void {
++        if (kdim % 512 != 0) return error.DramaRowShape;
++        var a: cuda.Args = .{};
++        a.add(x);
++        a.add(int(ld_x));
++        a.add(q);
++        a.add(scales);
++        a.add(int(kdim));
++        try go(s, k.act_quant_fn, .{ rows, kdim / 512, 1 }, 128, &a);
++    }
++
++    /// h = bf16(silu(gate) * up) into h_out, or its FP8 quantization into hq / hs.
++    pub fn siluMul(k: *const Kernels, s: cuda.Stream, gu: u64, ld_gu: usize, inner: usize, h_out: ?u64, hq: ?u64, hs: ?u64, rows: usize) !void {
++        if (inner % 512 != 0) return error.DramaRowShape;
++        var a: cuda.Args = .{};
++        a.add(gu);
++        a.add(int(ld_gu));
++        a.add(int(inner));
++        a.add(h_out orelse 0);
++        a.add(hq orelse 0);
++        a.add(hs orelse 0);
++        try go(s, k.silu_mul_fn, .{ rows, inner / 512, 1 }, 128, &a);
++    }
++
++    pub fn combine(k: *const Kernels, s: cuda.Stream, down: u64, top: usize, x: u64, wg: u64, shared: u64, out: u64, rows: usize, width: usize) !void {
++        var a: cuda.Args = .{};
++        a.add(down);
++        a.add(int(top));
++        a.add(x);
++        a.add(wg);
++        a.add(shared);
++        a.add(out);
++        a.add(int(width));
++        try go(s, k.combine_fn, .{ rows, 1, 1 }, 256, &a);
++    }
++};
+diff --git a/zig/src/families/drama/backbone_weights.zig b/zig/src/families/drama/backbone_weights.zig
+new file mode 100644
+index 00000000..10bd805e
+--- /dev/null
++++ b/zig/src/families/drama/backbone_weights.zig
+@@ -0,0 +1,425 @@
++//! The Drama backbone's checkpoint tensors on the GPU, as stored: bf16 dense weights, e4m3 experts with their fp32
++//! 128 x 128 block scales. Fused projections are row concatenations of the checkpoint matrices; nothing is requantized.
++const std = @import("std");
++const cuda = @import("cuda");
++const cfg = @import("backbone_config.zig");
++
++const Io = std.Io;
++
++pub const prefix = "model.language_model.";
++pub const head_name = "lm_head.weight";
++
++/// Rows of the GDN input projection: in_proj_qkv (8192) | in_proj_z (4096) | in_proj_b (32) | in_proj_a (32).
++pub const gdn_in_rows = cfg.conv_dim + cfg.value_dim + 2 * cfg.linear_value_heads;
++pub const gdn_z_col = cfg.conv_dim;
++pub const gdn_b_col = cfg.conv_dim + cfg.value_dim;
++/// Rows of the attention input projection: q_proj (16 x [q 256 | gate 256]) | k_proj (512) | v_proj (512).
++pub const attn_in_rows = 2 * cfg.query_heads * cfg.head_dim + 2 * cfg.kv_heads * cfg.head_dim;
++/// Rows of the MoE input projection: shared gate_proj (512) | shared up_proj (512) | router gate (256).
++pub const moe_in_rows = 2 * cfg.shared_inner + cfg.experts;
++pub const router_col = 2 * cfg.shared_inner;
++/// Semantic head rows: EOS, the 4096-code band, zero rows to a multiple of 8.
++pub const head_cols = 1 + 4096;
++pub const head_rows = (head_cols + 7) / 8 * 8;
++/// One expert's gate | up rows and their scale blocks.
++pub const gu_rows = 2 * cfg.expert_inner;
++pub const gu_scales = (gu_rows / cfg.block) * (cfg.hidden / cfg.block);
++pub const dn_scales = (cfg.hidden / cfg.block) * (cfg.expert_inner / cfg.block);
++
++pub const Layer = struct {
++    ln1: u64 = 0, // bf16 [hidden] input_layernorm (zero-centered)
++    ln2: u64 = 0, // bf16 [hidden] post_attention_layernorm (zero-centered)
++    // Gated DeltaNet
++    gdn_in: u64 = 0, // bf16 [gdn_in_rows][hidden]
++    conv: u64 = 0, // bf16 [conv_dim][4]
++    a_log: u64 = 0, // f32 [32], widened from the stored bf16
++    dt_bias: u64 = 0, // f32 [32], widened from the stored bf16
++    gnorm: u64 = 0, // bf16 [128] RMSNormGated weight (plain, not zero-centered)
++    gdn_out: u64 = 0, // bf16 [hidden][value_dim]
++    // full attention
++    attn_in: u64 = 0, // bf16 [attn_in_rows][hidden]
++    q_norm: u64 = 0, // bf16 [256] (zero-centered)
++    k_norm: u64 = 0, // bf16 [256] (zero-centered)
++    attn_out: u64 = 0, // bf16 [hidden][query_heads * head_dim]
++    // MoE
++    moe_in: u64 = 0, // bf16 [moe_in_rows][hidden]
++    shared_down: u64 = 0, // bf16 [hidden][shared_inner]
++    shared_gate: u64 = 0, // bf16 [hidden]
++    gu: u64 = 0, // e4m3 [experts][gu_rows][hidden]
++    gu_s: u64 = 0, // f32 [experts][gu_rows / 128][hidden / 128]
++    dn: u64 = 0, // e4m3 [experts][hidden][expert_inner]
++    dn_s: u64 = 0, // f32 [experts][hidden / 128][expert_inner / 128]
++};
++
++pub const Weights = struct {
++    gpa: std.mem.Allocator,
++    buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
++    embed: u64 = 0, // bf16 [vocab][hidden]
++    final_norm: u64 = 0, // bf16 [hidden] (zero-centered)
++    head: u64 = 0, // bf16 [head_rows][hidden]
++    inv_freq: u64 = 0, // f32 [rotary_dim / 2]
++    layers: [cfg.layers]Layer = @splat(.{}),
++    bytes: usize = 0,
++
++    pub fn deinit(w: *Weights) void {
++        for (w.buffers.items) |*b| b.free();
++        w.buffers.deinit(w.gpa);
++        w.* = undefined;
++    }
++
++    fn alloc(w: *Weights, d: *const cuda.Driver, bytes: usize) !u64 {
++        try w.buffers.ensureUnusedCapacity(w.gpa, 1);
++        const b = try cuda.DeviceBuffer.alloc(d, bytes);
++        w.buffers.appendAssumeCapacity(b);
++        w.bytes += bytes;
++        return b.ptr;
++    }
++};
++
++const DType = enum { bf16, f32, f8_e4m3 };
++
++fn parseDType(s: []const u8) ?DType {
++    if (std.mem.eql(u8, s, "BF16")) return .bf16;
++    if (std.mem.eql(u8, s, "F32")) return .f32;
++    if (std.mem.eql(u8, s, "F8_E4M3")) return .f8_e4m3;
++    return null;
++}
++
++fn size(t: DType) usize {
++    return switch (t) {
++        .bf16 => 2,
++        .f32 => 4,
++        .f8_e4m3 => 1,
++    };
++}
++
++const Entry = struct { shard: usize, dtype: ?DType, rank: usize, shape: [3]usize, begin: usize, end: usize };
++
++const Shard = struct { file: Io.File, map: Io.File.MemoryMap, data: usize };
++
++/// The checkpoint's shards mapped read-only, every header entry indexed by name.
++const Source = struct {
++    gpa: std.mem.Allocator,
++    io: Io,
++    arena: std.heap.ArenaAllocator,
++    shards: std.ArrayList(Shard) = .empty,
++    names: std.StringHashMapUnmanaged(Entry) = .empty,
++    backbone: usize = 0, // entries under `prefix`
++    used: usize = 0, // of those, consumed
++
++    fn open(gpa: std.mem.Allocator, io: Io, dir: []const u8) !Source {
++        var s: Source = .{ .gpa = gpa, .io = io, .arena = .init(gpa) };
++        errdefer s.close();
++        const a = s.arena.allocator();
++        const index = try std.fs.path.join(a, &.{ dir, "model.safetensors.index.json" });
++        const text = try Io.Dir.cwd().readFileAlloc(io, index, a, .limited(1 << 26));
++        const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
++        if (doc != .object) return error.BadDramaCheckpoint;
++        const map = doc.object.get("weight_map") orelse return error.BadDramaCheckpoint;
++        if (map != .object) return error.BadDramaCheckpoint;
++        var files: std.StringArrayHashMapUnmanaged(void) = .empty;
++        var it = map.object.iterator();
++        while (it.next()) |e| {
++            if (e.value_ptr.* != .string) return error.BadDramaCheckpoint;
++            try files.put(a, e.value_ptr.string, {});
++        }
++        for (files.keys(), 0..) |name, i| {
++            const path = try std.fs.path.join(a, &.{ dir, name });
++            try s.mapShard(path, i);
++        }
++        // every name the index lists must be in its shard's header
++        it = map.object.iterator();
++        while (it.next()) |e| {
++            const got = s.names.get(e.key_ptr.*) orelse return error.BadDramaCheckpoint;
++            if (!std.mem.eql(u8, files.keys()[got.shard], e.value_ptr.string)) return error.BadDramaCheckpoint;
++        }
++        return s;
++    }
++
++    fn mapShard(s: *Source, path: []const u8, index: usize) !void {
++        const a = s.arena.allocator();
++        // the file and its map belong to `shards` once appended; the errdefers cover only the steps before
++        const sh = blk: {
++            var file = try Io.Dir.cwd().openFile(s.io, path, .{});
++            errdefer file.close(s.io);
++            const len: usize = @intCast(try file.length(s.io));
++            if (len < 8) return error.BadDramaCheckpoint;
++            var map = try Io.File.MemoryMap.create(s.io, file, .{ .len = len, .protection = .{ .read = true, .write = false }, .populate = false });
++            errdefer map.destroy(s.io);
++            const header_len: usize = @intCast(std.mem.readInt(u64, map.memory[0..8], .little));
++            if (header_len > len - 8) return error.BadDramaCheckpoint;
++            try s.shards.append(s.gpa, .{ .file = file, .map = map, .data = 8 + header_len });
++            break :blk s.shards.items[s.shards.items.len - 1];
++        };
++        const data_len = sh.map.memory.len - sh.data;
++        const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, sh.map.memory[8..sh.data], .{ .allocate = .alloc_always });
++        if (doc != .object) return error.BadDramaCheckpoint;
++        var it = doc.object.iterator();
++        while (it.next()) |kv| {
++            if (std.mem.eql(u8, kv.key_ptr.*, "__metadata__")) continue;
++            const o = if (kv.value_ptr.* == .object) kv.value_ptr.object else return error.BadDramaCheckpoint;
++            const dt = o.get("dtype") orelse return error.BadDramaCheckpoint;
++            const shape = o.get("shape") orelse return error.BadDramaCheckpoint;
++            const offs = o.get("data_offsets") orelse return error.BadDramaCheckpoint;
++            if (dt != .string or shape != .array or offs != .array or offs.array.items.len != 2) return error.BadDramaCheckpoint;
++            var e: Entry = .{ .shard = index, .dtype = parseDType(dt.string), .rank = shape.array.items.len, .shape = @splat(1), .begin = 0, .end = 0 };
++            if (e.rank > 3) e.dtype = null; // not a backbone layout; refused if anything asks for it
++            for (shape.array.items, 0..) |d, i| {
++                if (d != .integer or d.integer < 0) return error.BadDramaCheckpoint;
++                if (i < 3) e.shape[i] = @intCast(d.integer);
++            }
++            for (offs.array.items, 0..) |d, i| {
++                if (d != .integer or d.integer < 0) return error.BadDramaCheckpoint;
++                if (i == 0) e.begin = @intCast(d.integer) else e.end = @intCast(d.integer);
++            }
++            if (e.end < e.begin or e.end > data_len) return error.BadDramaCheckpoint;
++            if (std.mem.startsWith(u8, kv.key_ptr.*, prefix)) s.backbone += 1;
++            const got = try s.names.getOrPut(s.gpa, kv.key_ptr.*);
++            if (got.found_existing) return error.BadDramaCheckpoint;
++            got.value_ptr.* = e;
++        }
++    }
++
++    fn close(s: *Source) void {
++        for (s.shards.items) |*sh| {
++            sh.map.destroy(s.io);
++            sh.file.close(s.io);
++        }
++        s.shards.deinit(s.gpa);
++        s.names.deinit(s.gpa);
++        s.arena.deinit();
++        s.* = undefined;
++    }
++
++    /// The bytes of `name`, refused unless its dtype and shape are exactly these.
++    fn get(s: *Source, name: []const u8, dtype: DType, shape: []const usize) ![]const u8 {
++        const e = s.names.get(name) orelse {
++            std.log.err("drama backbone: checkpoint has no {s}", .{name});
++            return error.MissingDramaTensor;
++        };
++        var ok = e.dtype != null and e.dtype.? == dtype and e.rank == shape.len;
++        var n: usize = size(dtype);
++        for (shape, 0..) |d, i| {
++            ok = ok and e.shape[i] == d;
++            n *= d;
++        }
++        if (!ok or e.end - e.begin != n) {
++            std.log.err("drama backbone: {s} is not {s} {any}", .{ name, @tagName(dtype), shape });
++            return error.UnexpectedDramaTensor;
++        }
++        if (std.mem.startsWith(u8, name, prefix)) s.used += 1;
++        const sh = s.shards.items[e.shard];
++        return sh.map.memory[sh.data + e.begin .. sh.data + e.end];
++    }
++};
++
++/// Host-to-device copies through two pinned slots on one stream: a slot is refilled only after its copies land.
++const Stager = struct {
++    const slot_bytes = 64 << 20;
++
++    d: *const cuda.Driver,
++    stream: cuda.Stream,
++    slots: [2]cuda.HostBuffer,
++    events: [2]cuda.Event,
++    pending: [2]bool = .{ false, false },
++    cur: usize = 0,
++    used: usize = 0,
++
++    fn init(d: *const cuda.Driver, stream: cuda.Stream) !Stager {
++        var a = try cuda.HostBuffer.alloc(d, slot_bytes);
++        errdefer a.free();
++        var b = try cuda.HostBuffer.alloc(d, slot_bytes);
++        errdefer b.free();
++        var ea = try cuda.Event.init(d, false);
++        errdefer ea.deinit();
++        const eb = try cuda.Event.init(d, false);
++        return .{ .d = d, .stream = stream, .slots = .{ a, b }, .events = .{ ea, eb } };
++    }
++
++    fn deinit(st: *Stager) void {
++        st.stream.synchronize() catch {};
++        for (&st.slots) |*s| s.free();
++        for (&st.events) |*e| e.deinit();
++        st.* = undefined;
++    }
++
++    fn swap(st: *Stager) !void {
++        try st.events[st.cur].record(st.stream);
++        st.pending[st.cur] = true;
++        st.cur ^= 1;
++        if (st.pending[st.cur]) try st.events[st.cur].synchronize();
++        st.pending[st.cur] = false;
++        st.used = 0;
++    }
++
++    fn put(st: *Stager, dst: u64, bytes: []const u8) !void {
++        var off: usize = 0;
++        while (off < bytes.len) {
++            if (st.used == slot_bytes) try st.swap();
++            const n = @min(bytes.len - off, slot_bytes - st.used);
++            const host = st.slots[st.cur].bytes[st.used..][0..n];
++            @memcpy(host, bytes[off..][0..n]);
++            try st.d.check(st.d.api.cuMemcpyHtoDAsync_v2(dst + off, host.ptr, n, st.stream.handle), "cuMemcpyHtoDAsync");
++            st.used += n;
++            off += n;
++        }
++    }
++
++    fn zero(st: *Stager, dst: u64, n: usize) !void {
++        try st.d.check(st.d.api.cuMemsetD8Async(dst, 0, n, st.stream.handle), "cuMemsetD8Async");
++    }
++
++    fn finish(st: *Stager) !void {
++        try st.stream.synchronize();
++        st.pending = .{ false, false };
++        st.used = 0;
++    }
++};
++
++fn widenBf16(out: []f32, bytes: []const u8) void {
++    for (out, 0..) |*o, i| o.* = @bitCast(@as(u32, std.mem.readInt(u16, bytes[2 * i ..][0..2], .little)) << 16);
++}
++
++const Loader = struct {
++    src: *Source,
++    st: *Stager,
++    w: *Weights,
++    d: *const cuda.Driver,
++    name_buf: [192]u8 = undefined,
++
++    fn name(L: *Loader, comptime fmt: []const u8, args: anytype) ![]const u8 {
++        return std.fmt.bufPrint(&L.name_buf, fmt, args);
++    }
++
++    /// A fresh device tensor holding `name` as stored.
++    fn raw(L: *Loader, n: []const u8, dtype: DType, shape: []const usize) !u64 {
++        const bytes = try L.src.get(n, dtype, shape);
++        const p = try L.w.alloc(L.d, bytes.len);
++        try L.st.put(p, bytes);
++        return p;
++    }
++
++    /// `name` as stored at `dst` (part of a fused tensor).
++    fn into(L: *Loader, dst: u64, n: []const u8, dtype: DType, shape: []const usize) !void {
++        try L.st.put(dst, try L.src.get(n, dtype, shape));
++    }
++
++    fn layerRaw(L: *Loader, i: usize, comptime suffix: []const u8, dtype: DType, shape: []const usize) !u64 {
++        return L.raw(try L.name(prefix ++ "layers.{d}." ++ suffix, .{i}), dtype, shape);
++    }
++
++    fn layerInto(L: *Loader, dst: u64, i: usize, comptime suffix: []const u8, dtype: DType, shape: []const usize) !void {
++        try L.into(dst, try L.name(prefix ++ "layers.{d}." ++ suffix, .{i}), dtype, shape);
++    }
++
++    fn widened(L: *Loader, i: usize, comptime suffix: []const u8) !u64 {
++        const n = cfg.linear_value_heads;
++        const bytes = try L.src.get(try L.name(prefix ++ "layers.{d}." ++ suffix, .{i}), .bf16, &.{n});
++        var host: [n]f32 = undefined;
++        widenBf16(&host, bytes);
++        const p = try L.w.alloc(L.d, n * 4);
++        try L.st.put(p, std.mem.sliceAsBytes(&host));
++        return p;
++    }
++};
++
++const H = cfg.hidden;
++
++fn loadLinear(L: *Loader, i: usize, l: *Layer) !void {
++    const row = H * 2;
++    l.gdn_in = try L.w.alloc(L.d, gdn_in_rows * row);
++    try L.layerInto(l.gdn_in, i, "linear_attn.in_proj_qkv.weight", .bf16, &.{ cfg.conv_dim, H });
++    try L.layerInto(l.gdn_in + gdn_z_col * row, i, "linear_attn.in_proj_z.weight", .bf16, &.{ cfg.value_dim, H });
++    try L.layerInto(l.gdn_in + gdn_b_col * row, i, "linear_attn.in_proj_b.weight", .bf16, &.{ cfg.linear_value_heads, H });
++    try L.layerInto(l.gdn_in + (gdn_b_col + cfg.linear_value_heads) * row, i, "linear_attn.in_proj_a.weight", .bf16, &.{ cfg.linear_value_heads, H });
++    l.conv = try L.layerRaw(i, "linear_attn.conv1d.weight", .bf16, &.{ cfg.conv_dim, 1, cfg.conv_taps });
++    l.a_log = try L.widened(i, "linear_attn.A_log");
++    l.dt_bias = try L.widened(i, "linear_attn.dt_bias");
++    l.gnorm = try L.layerRaw(i, "linear_attn.norm.weight", .bf16, &.{cfg.linear_dim});
++    l.gdn_out = try L.layerRaw(i, "linear_attn.out_proj.weight", .bf16, &.{ H, cfg.value_dim });
++}
++
++fn loadFull(L: *Loader, i: usize, l: *Layer) !void {
++    const row = H * 2;
++    const q_rows = 2 * cfg.query_heads * cfg.head_dim;
++    const kv_rows = cfg.kv_heads * cfg.head_dim;
++    l.attn_in = try L.w.alloc(L.d, attn_in_rows * row);
++    try L.layerInto(l.attn_in, i, "self_attn.q_proj.weight", .bf16, &.{ q_rows, H });
++    try L.layerInto(l.attn_in + q_rows * row, i, "self_attn.k_proj.weight", .bf16, &.{ kv_rows, H });
++    try L.layerInto(l.attn_in + (q_rows + kv_rows) * row, i, "self_attn.v_proj.weight", .bf16, &.{ kv_rows, H });
++    l.q_norm = try L.layerRaw(i, "self_attn.q_norm.weight", .bf16, &.{cfg.head_dim});
++    l.k_norm = try L.layerRaw(i, "self_attn.k_norm.weight", .bf16, &.{cfg.head_dim});
++    l.attn_out = try L.layerRaw(i, "self_attn.o_proj.weight", .bf16, &.{ H, cfg.query_heads * cfg.head_dim });
++}
++
++fn loadMoe(L: *Loader, i: usize, l: *Layer) !void {
++    const row = H * 2;
++    const I = cfg.expert_inner;
++    l.moe_in = try L.w.alloc(L.d, moe_in_rows * row);
++    try L.layerInto(l.moe_in, i, "mlp.shared_expert.gate_proj.weight", .bf16, &.{ cfg.shared_inner, H });
++    try L.layerInto(l.moe_in + cfg.shared_inner * row, i, "mlp.shared_expert.up_proj.weight", .bf16, &.{ cfg.shared_inner, H });
++    try L.layerInto(l.moe_in + router_col * row, i, "mlp.gate.weight", .bf16, &.{ cfg.experts, H });
++    l.shared_down = try L.layerRaw(i, "mlp.shared_expert.down_proj.weight", .bf16, &.{ H, cfg.shared_inner });
++    l.shared_gate = try L.layerRaw(i, "mlp.shared_expert_gate.weight", .bf16, &.{ 1, H });
++    const E = cfg.experts;
++    l.gu = try L.w.alloc(L.d, E * gu_rows * H);
++    l.gu_s = try L.w.alloc(L.d, E * gu_scales * 4);
++    l.dn = try L.w.alloc(L.d, E * H * I);
++    l.dn_s = try L.w.alloc(L.d, E * dn_scales * 4);
++    const gs = &[_]usize{ I / cfg.block, H / cfg.block };
++    const ds = &[_]usize{ H / cfg.block, I / cfg.block };
++    for (0..E) |e| {
++        const gu = l.gu + e * gu_rows * H;
++        const gu_s = l.gu_s + e * gu_scales * 4;
++        try L.into(gu, try L.name(prefix ++ "layers.{d}.mlp.experts.{d}.gate_proj.weight", .{ i, e }), .f8_e4m3, &.{ I, H });
++        try L.into(gu + I * H, try L.name(prefix ++ "layers.{d}.mlp.experts.{d}.up_proj.weight", .{ i, e }), .f8_e4m3, &.{ I, H });
++        try L.into(gu_s, try L.name(prefix ++ "layers.{d}.mlp.experts.{d}.gate_proj.weight_scale_inv", .{ i, e }), .f32, gs);
++        try L.into(gu_s + gu_scales * 2, try L.name(prefix ++ "layers.{d}.mlp.experts.{d}.up_proj.weight_scale_inv", .{ i, e }), .f32, gs);
++        try L.into(l.dn + e * H * I, try L.name(prefix ++ "layers.{d}.mlp.experts.{d}.down_proj.weight", .{ i, e }), .f8_e4m3, &.{ H, I });
++        try L.into(l.dn_s + e * dn_scales * 4, try L.name(prefix ++ "layers.{d}.mlp.experts.{d}.down_proj.weight_scale_inv", .{ i, e }), .f32, ds);
++    }
++}
++
++/// The checkpoint folder's backbone tensors (and the semantic rows of lm_head) uploaded on `stream`; returns after
++/// every copy has landed. Refuses missing, mis-shaped or unconsumed `model.language_model.*` tensors.
++pub fn load(gpa: std.mem.Allocator, io: Io, d: *const cuda.Driver, stream: cuda.Stream, dir: []const u8, c: cfg.Config) !Weights {
++    var src = try Source.open(gpa, io, dir);
++    defer src.close();
++    var st = try Stager.init(d, stream);
++    defer st.deinit();
++    var w: Weights = .{ .gpa = gpa };
++    errdefer {
++        stream.synchronize() catch {};
++        w.deinit();
++    }
++    var L: Loader = .{ .src = &src, .st = &st, .w = &w, .d = d };
++    w.embed = try L.raw(prefix ++ "embed_tokens.weight", .bf16, &.{ cfg.vocab, H });
++    w.final_norm = try L.raw(prefix ++ "norm.weight", .bf16, &.{H});
++    for (&w.layers, 0..) |*l, i| {
++        l.ln1 = try L.layerRaw(i, "input_layernorm.weight", .bf16, &.{H});
++        l.ln2 = try L.layerRaw(i, "post_attention_layernorm.weight", .bf16, &.{H});
++        if (cfg.linear(i)) try loadLinear(&L, i, l) else try loadFull(&L, i, l);
++        try loadMoe(&L, i, l);
++    }
++    // lm_head: only the rows the semantic logits read (EOS, then semantic_start..semantic_end), zero padded.
++    const head = try src.get(head_name, .bf16, &.{ cfg.vocab, H });
++    const row = H * 2;
++    w.head = try w.alloc(d, head_rows * row);
++    try st.zero(w.head, head_rows * row);
++    try st.put(w.head, head[@as(usize, c.eos) * row ..][0..row]);
++    try st.put(w.head + row, head[@as(usize, c.semantic_start) * row ..][0 .. (head_cols - 1) * row]);
++    // RoPE inverse frequencies as SGLang computes them in fp32: 1 / theta^(2i / rotary_dim).
++    var inv: [cfg.rotary_dim / 2]f32 = undefined;
++    for (&inv, 0..) |*f, i| {
++        const e: f32 = @as(f32, @floatFromInt(2 * i)) / @as(f32, cfg.rotary_dim);
++        f.* = 1.0 / std.math.pow(f32, @floatCast(cfg.theta), e);
++    }
++    w.inv_freq = try w.alloc(d, inv.len * 4);
++    try st.put(w.inv_freq, std.mem.sliceAsBytes(&inv));
++    if (src.used != src.backbone) {
++        std.log.err("drama backbone: {d} of {d} {s}* tensors left unused", .{ src.backbone - src.used, src.backbone, prefix });
++        return error.UnusedDramaTensors;
++    }
++    try st.finish();
++    return w;
++}
+diff --git a/zig/src/families/drama/root.zig b/zig/src/families/drama/root.zig
+new file mode 100644
+index 00000000..0cce9063
+--- /dev/null
++++ b/zig/src/families/drama/root.zig
+@@ -0,0 +1,6 @@
++//! Drama 3's native CUDA backbone.
++pub const backbone = @import("backbone.zig");
++
++test {
++    _ = backbone;
++}

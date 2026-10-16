@@ -1,0 +1,1931 @@
+From 618c2cae8ce2ad5e284e0339ad6d79df72c8c538 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 12:16:12 +0800
+Subject: [PATCH 04/30] drama: the speech codec, with codec.pth read without
+ Python
+
+The codec decodes ten codebooks a frame to mono 44.1 kHz PCM, 2048 samples a frame, as the reference's FP16
+vocoder does: RVQ, the windowed post-module transformer, two upsample stages and the DAC decoder. codec_pth.zig
+reads torch.save's zip archive and runs its state-dict pickle on a VM that knows only the opcodes and globals a
+tensor state dict uses, so nothing in the file runs. Weight norm is folded in FP32 and tensors are cast to FP16
+with round-to-nearest-even, as the reference does.
+---
+ zig/kernels/cuda/drama_codec.cu          | 393 +++++++++++++
+ zig/src/families/drama/codec.zig         | 669 +++++++++++++++++++++++
+ zig/src/families/drama/codec_kernels.zig | 251 +++++++++
+ zig/src/families/drama/codec_pth.zig     | 554 +++++++++++++++++++
+ zig/src/families/drama/root.zig          |   5 +-
+ 5 files changed, 1871 insertions(+), 1 deletion(-)
+ create mode 100644 zig/kernels/cuda/drama_codec.cu
+ create mode 100644 zig/src/families/drama/codec.zig
+ create mode 100644 zig/src/families/drama/codec_kernels.zig
+ create mode 100644 zig/src/families/drama/codec_pth.zig
+
+diff --git a/zig/kernels/cuda/drama_codec.cu b/zig/kernels/cuda/drama_codec.cu
+new file mode 100644
+index 00000000..9c1ec33d
+--- /dev/null
++++ b/zig/kernels/cuda/drama_codec.cu
+@@ -0,0 +1,393 @@
++// Drama 3 codec decode: the Fish modded DAC's quantizer decode (DownsampleResidualVectorQuantize.decode:
++// RVQ codes, the causal window-limited transformer, the ConvNeXt upsampler) and its causal decoder, as
++// sglang-omni's FP16 path runs them (ChannelsLastDecoder over a weight-folded, half-cast codec).
++//
++// Storage is FP16 everywhere the reference holds an FP16 tensor; every reduction runs in FP32 and every
++// value is rounded to FP16 exactly where the reference materialises an FP16 tensor:
++//   cuDNN convolutions (bias added by a separate add_):  y = h(h(acc) + b)
++//   cuBLASLt linears (bias in the epilogue):             y = h(acc + b)
++//   elementwise ops: computed in FP32 from FP16 inputs, one rounding each, in the reference's op order.
++// h() is round-to-nearest-even FP16. Activations are channels-last: [rows][channels].
++
++#include <cuda_fp16.h>
++#include <mma.h>
++#include <stdint.h>
++
++namespace {
++
++__device__ __forceinline__ float h2f(__half v) { return __half2float(v); }
++__device__ __forceinline__ __half f2h(float v) { return __float2half_rn(v); }
++// The FP32 value an FP16 tensor would hold.
++__device__ __forceinline__ float rh(float v) { return __half2float(__float2half_rn(v)); }
++
++__device__ __forceinline__ float warp_sum(float v) {
++#pragma unroll
++  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
++  return v;
++}
++
++__device__ __forceinline__ float warp_max(float v) {
++#pragma unroll
++  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
++  return v;
++}
++
++// Sum over the block (blockDim.x a multiple of 32, at most 1024); every thread gets the total.
++__device__ float block_sum(float v, float* part) {
++  v = warp_sum(v);
++  const int w = threadIdx.x >> 5, l = threadIdx.x & 31, n = blockDim.x >> 5;
++  __syncthreads();
++  if (l == 0) part[w] = v;
++  __syncthreads();
++  return warp_sum(l < n ? part[l] : 0.f);
++}
++
++__device__ float block_max(float v, float* part) {
++  v = warp_max(v);
++  const int w = threadIdx.x >> 5, l = threadIdx.x & 31, n = blockDim.x >> 5;
++  __syncthreads();
++  if (l == 0) part[w] = v;
++  __syncthreads();
++  return warp_max(l < n ? part[l] : -__int_as_float(0x7f800000));
++}
++
++constexpr int kLatent = 1024;     // DownsampleResidualVectorQuantize input_dim
++constexpr int kCodebookDim = 8;   // codebook_dim
++constexpr int kBooks = 10;        // 1 semantic + 9 residual
++constexpr int kSemanticSize = 4096;
++constexpr int kResidualSize = 1024;
++constexpr int kHeadDim = 64;
++
++}  // namespace
++
++// rvq.py DownsampleResidualVectorQuantize.decode, before post_module:
++//   codes clamped (semantic to 4095, residual to 1023); each book: embedding row (8) -> out_proj
++//   (weight-folded 1x1 conv 8 -> 1024, cuDNN + bias add_); residual books summed in order from
++//   0.0 (dac ResidualVectorQuantize.from_codes); z = semantic + residual.
++// codes [frames][10] u32; semantic_book [4096][8]; residual_books [9][1024][8]; out_w [10][1024][8];
++// out_b [10][1024]; z [frames][1024]. Grid: frames; block: 256.
++extern "C" __global__ void __launch_bounds__(256) drama_codec_rvq_latent(
++    const uint32_t* __restrict__ codes, const __half* __restrict__ semantic_book,
++    const __half* __restrict__ residual_books, const __half* __restrict__ out_w,
++    const __half* __restrict__ out_b, __half* __restrict__ z) {
++  const size_t t = blockIdx.x;
++  __shared__ float e[kBooks][kCodebookDim];
++  if (threadIdx.x < kBooks * kCodebookDim) {
++    const int book = threadIdx.x / kCodebookDim, i = threadIdx.x % kCodebookDim;
++    uint32_t code = codes[t * kBooks + book];
++    const __half* row;
++    if (book == 0) {
++      code = min(code, (uint32_t)(kSemanticSize - 1));
++      row = semantic_book + (size_t)code * kCodebookDim;
++    } else {
++      code = min(code, (uint32_t)(kResidualSize - 1));
++      row = residual_books + ((size_t)(book - 1) * kResidualSize + code) * kCodebookDim;
++    }
++    e[book][i] = h2f(row[i]);
++  }
++  __syncthreads();
++  for (int c = threadIdx.x; c < kLatent; c += blockDim.x) {
++    float semantic = 0.f, residual = 0.f;
++    for (int book = 0; book < kBooks; ++book) {
++      const __half* w = out_w + ((size_t)book * kLatent + c) * kCodebookDim;
++      float acc = 0.f;
++#pragma unroll
++      for (int i = 0; i < kCodebookDim; ++i) acc = fmaf(e[book][i], h2f(w[i]), acc);
++      const float q = rh(rh(acc) + h2f(out_b[book * kLatent + c]));
++      if (book == 0) semantic = q;
++      else if (book == 1) residual = 0.f + q;
++      else residual = rh(residual + q);
++    }
++    z[t * kLatent + c] = f2h(semantic + residual);
++  }
++}
++
++// modded_dac.py RMSNorm: h(h(x * rsqrt(mean(x*x) + eps)) * w), statistics in FP32.
++// Grid: rows; block: 256.
++extern "C" __global__ void __launch_bounds__(256) drama_codec_rms_norm(
++    const __half* __restrict__ x, const __half* __restrict__ w, __half* __restrict__ y, int width,
++    float eps) {
++  __shared__ float part[32];
++  const __half* xr = x + (size_t)blockIdx.x * width;
++  __half* yr = y + (size_t)blockIdx.x * width;
++  float s = 0.f;
++  for (int c = threadIdx.x; c < width; c += blockDim.x) {
++    const float v = h2f(xr[c]);
++    s += __fmul_rn(v, v);
++  }
++  s = block_sum(s, part);
++  const float r = rsqrtf(__fadd_rn(s / (float)width, eps));
++  for (int c = threadIdx.x; c < width; c += blockDim.x)
++    yr[c] = f2h(__fmul_rn(rh(__fmul_rn(h2f(xr[c]), r)), h2f(w[c])));
++}
++
++// modded_dac.py apply_rotary_emb on q and k of a fused qkv row [q | k | v] (each heads * 64):
++// pairs (2i, 2i+1) of each head, x0*c - x1*s and x1*c + x0*s in FP32 as eager PyTorch evaluates them.
++// table [frames][32][2] holds the FP16 freqs_cis (the BF16 table cast to FP16). Grid: frames; block: 256.
++extern "C" __global__ void __launch_bounds__(256) drama_codec_rope(
++    __half* __restrict__ qkv, const __half* __restrict__ table, int width, int ld) {
++  __half* row = qkv + (size_t)blockIdx.x * ld;
++  const __half* tab = table + (size_t)blockIdx.x * kHeadDim;
++  const int pairs = width / 2;
++  for (int p = threadIdx.x; p < 2 * pairs; p += blockDim.x) {
++    const int which = p / pairs, pp = p % pairs, i = pp % (kHeadDim / 2);
++    __half* e = row + which * width + pp * 2;
++    const float x0 = h2f(e[0]), x1 = h2f(e[1]);
++    const float c = h2f(tab[2 * i]), s = h2f(tab[2 * i + 1]);
++    e[0] = f2h(__fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s)));
++    e[1] = f2h(__fadd_rn(__fmul_rn(x1, c), __fmul_rn(x0, s)));
++  }
++}
++
++// WindowLimitedTransformer's causal window: query t sees max(0, t-window+1)..t.
++// Match the pinned Torch efficient-attention path: absolute 64-key tiles,
++// exp2 softmax, FP16 probabilities for P*V, and FP32 denominator/output accumulation.
++// qkv [frames][3 * heads * 64], out [frames][heads * 64].
++// Grid: (frames, heads); block: 128 threads.
++extern "C" __global__ void __launch_bounds__(128) drama_codec_window_attention(
++    const __half* __restrict__ qkv, __half* __restrict__ out, int heads, int window, float scale) {
++  constexpr int tile = 64;
++  __shared__ float q[kHeadDim], p[tile], part[32];
++  const int t = blockIdx.x, h = blockIdx.y, j = threadIdx.x;
++  const size_t ld = (size_t)3 * heads * kHeadDim;
++  if (j < kHeadDim) q[j] = h2f(qkv[(size_t)t * ld + h * kHeadDim + j]);
++  __syncthreads();
++  const int first = max(0, t - window + 1);
++  float maximum = -__int_as_float(0x7f800000), denominator = 0.f, numerator = 0.f;
++  for (int start = first / tile * tile; start <= t; start += tile) {
++    const int key = start + j;
++    const bool valid = j < tile && key >= first && key <= t;
++    float score = -__int_as_float(0x7f800000);
++    if (valid) {
++      const __half* k = qkv + (size_t)key * ld + (size_t)heads * kHeadDim + h * kHeadDim;
++      float dot = 0.f;
++#pragma unroll 16
++      for (int d = 0; d < kHeadDim; ++d) dot = fmaf(q[d], h2f(k[d]), dot);
++      score = (dot * scale) * 1.4426950408889634074f;
++    }
++    const float next_maximum = fmaxf(maximum, block_max(score, part));
++    const float rescale = exp2f(maximum - next_maximum);
++    const float probability = valid ? exp2f(score - next_maximum) : 0.f;
++    if (j < tile) p[j] = rh(probability);
++    const float mass = block_sum(probability, part);  // also publishes p[]
++    denominator = denominator * rescale + mass;
++    if (j < kHeadDim) {
++      numerator *= rescale;
++      for (int i = 0; i < tile && start + i <= t; ++i) {
++        if (start + i < first) continue;
++        const __half v = qkv[(size_t)(start + i) * ld + (size_t)2 * heads * kHeadDim + h * kHeadDim + j];
++        numerator = fmaf(p[i], h2f(v), numerator);
++      }
++    }
++    maximum = next_maximum;
++    __syncthreads();
++  }
++  if (j < kHeadDim)
++    out[(size_t)t * heads * kHeadDim + h * kHeadDim + j] = f2h(numerator / denominator);
++}
++
++// FeedForward's F.silu(w1(x)) * w3(x) over a fused [rows][2 * width] (w1 | w3) GEMM output:
++// silu = x / (1 + exp(-x)) rounded, then the product rounded. Grid: ceil(rows * width / 256).
++extern "C" __global__ void __launch_bounds__(256) drama_codec_silu_mul(
++    const __half* __restrict__ gu, __half* __restrict__ out, long long rows, int width) {
++  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++  if (i >= rows * width) return;
++  const long long r = i / width, c = i % width;
++  const float a = h2f(gu[r * 2 * width + c]);
++  const float b = h2f(gu[r * 2 * width + width + c]);
++  out[i] = f2h(rh(a / (1.0f + expf(-a))) * b);
++}
++
++// nn.LayerNorm over channels (ConvNeXtBlock.norm, eps 1e-6): mean and biased variance in FP32,
++// y = h(gamma * (rstd * (x - mean)) + beta) as PyTorch's layer-norm kernel computes it.
++// Grid: rows; block: 256.
++extern "C" __global__ void __launch_bounds__(256) drama_codec_layer_norm(
++    const __half* __restrict__ x, const __half* __restrict__ w, const __half* __restrict__ b,
++    __half* __restrict__ y, int width, float eps) {
++  __shared__ float part[32];
++  const __half* xr = x + (size_t)blockIdx.x * width;
++  __half* yr = y + (size_t)blockIdx.x * width;
++  float s = 0.f;
++  for (int c = threadIdx.x; c < width; c += blockDim.x) s += h2f(xr[c]);
++  const float mean = block_sum(s, part) / (float)width;
++  float v = 0.f;
++  for (int c = threadIdx.x; c < width; c += blockDim.x) {
++    const float d = h2f(xr[c]) - mean;
++    v = fmaf(d, d, v);
++  }
++  const float rstd = rsqrtf(block_sum(v, part) / (float)width + eps);
++  for (int c = threadIdx.x; c < width; c += blockDim.x)
++    yr[c] = f2h(fmaf(h2f(w[c]), rstd * (h2f(xr[c]) - mean), h2f(b[c])));
++}
++
++// ConvNeXtBlock.dwconv: causal depthwise conv, kernel 7, left padding 6 (rvq.py CausalConvNet),
++// cuDNN then bias add_. x, y [rows][width]; w [width][7]. Grid: ceil(rows * width / 256).
++extern "C" __global__ void __launch_bounds__(256) drama_codec_dwconv7(
++    const __half* __restrict__ x, const __half* __restrict__ w, const __half* __restrict__ b,
++    __half* __restrict__ y, long long rows, int width) {
++  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++  if (i >= rows * width) return;
++  const long long t = i / width;
++  const int c = (int)(i % width);
++  float acc = 0.f;
++#pragma unroll
++  for (int k = 0; k < 7; ++k) {
++    const long long r = t - 6 + k;
++    if (r >= 0) acc = fmaf(h2f(x[r * width + c]), h2f(w[c * 7 + k]), acc);
++  }
++  y[i] = f2h(rh(acc) + h2f(b[c]));
++}
++
++// dac Snake1d as channels_last_decoder.py's Triton kernel computes it: alpha and 1 / (alpha + 1e-9)
++// in FP32, s = sin(alpha * x), y = x + inv * s * s with the final multiply-add fused. In place allowed.
++// Grid: ceil(n / 256).
++extern "C" __global__ void __launch_bounds__(256) drama_codec_snake(
++    const __half* x, const float* __restrict__ alpha, const float* __restrict__ inv_alpha, __half* y,
++    long long n, int width) {
++  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++  if (i >= n) return;
++  const int c = (int)(i % width);
++  const float v = h2f(x[i]);
++  const float s = sinf(alpha[c] * v);
++  y[i] = f2h(fmaf(inv_alpha[c] * s, s, v));
++}
++
++// The last decoder conv (96 -> 1, kernel 7, causal) and nn.Tanh, written as FP32 PCM:
++// y = float(h(tanh(h(h(acc) + b)))). x [rows][width]; w [7][width]. Grid: ceil(rows / 256).
++extern "C" __global__ void __launch_bounds__(256) drama_codec_conv_out_tanh(
++    const __half* __restrict__ x, const __half* __restrict__ w, const __half* __restrict__ b,
++    float* __restrict__ y, long long rows, int width) {
++  const long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++  if (t >= rows) return;
++  float acc = 0.f;
++  for (int k = 0; k < 7; ++k) {
++    const long long r = t - 6 + k;
++    if (r < 0) continue;
++    const __half* xr = x + r * width;
++    const __half* wk = w + k * width;
++    for (int c = 0; c < width; ++c) acc = fmaf(h2f(xr[c]), h2f(wk[c]), acc);
++  }
++  const float v = rh(rh(acc) + h2f(b[0]));
++  y[t] = rh(tanhf(v));
++}
++
++// One implicit GEMM for every dense conv, transposed conv and linear of the decode:
++//   y[m][n] = epilogue(sum over tap, ci of x[m - (taps - 1 - tap) * dilation][ci] * w[n][tap * cin + ci])
++// rows before 0 read as zero (the causal left padding). A linear is one tap; a causal conv of kernel
++// k and dilation d is k taps; ConvTranspose1d(stride s, kernel 2s) is two taps (rows q-1, q) over
++// n = j * cout + co, its output rows [q][j] being the output samples q * s + j.
++// Epilogue, in the reference's order: bias (fused: h(acc + b); separate: h(h(acc) + b)), GELU
++// (erf form), per-column scale (LayerScale / ConvNeXt gamma), residual add, each rounded to FP16.
++struct GemmParams {
++  const __half* x;
++  const __half* w;
++  const __half* bias;      // [period] or null
++  const __half* scale;     // [period] or null
++  const __half* residual;  // [m][ldr] or null (may alias y)
++  __half* y;
++  long long m;
++  int n, cin, taps, dilation, ldx, ldy, ldr, period, bias_mode, act;
++};
++
++namespace {
++constexpr int BM = 128, BN = 128, BK = 32, LDS = BK + 8;
++
++__device__ __forceinline__ float gemm_epilogue(const GemmParams& p, long long m, int n, float acc) {
++  const int bn = n % p.period;
++  float v;
++  if (p.bias_mode == 1) {
++    v = rh(acc + h2f(p.bias[bn]));
++  } else {
++    v = rh(acc);
++    if (p.bias_mode == 2) v = rh(v + h2f(p.bias[bn]));
++  }
++  if (p.act == 1) v = rh(v * 0.5f * (1.0f + erff(v * 0.70710678118654752440f)));
++  if (p.scale != nullptr) v = rh(v * h2f(p.scale[bn]));
++  if (p.residual != nullptr) v = rh(h2f(p.residual[m * p.ldr + n]) + v);
++  return v;
++}
++}  // namespace
++
++// Block 256 threads (8 warps as 2 x 4, each 64 x 32 of the 128 x 128 tile); grid (ceil(m / 128),
++// ceil(n / 128)). Requires cin, ldx and ldy multiples of 8 and x, w 16-byte aligned.
++extern "C" __global__ void __launch_bounds__(256) drama_codec_conv_gemm(const GemmParams p) {
++  using namespace nvcuda;
++  __shared__ __align__(128) __half as[BM * LDS];
++  __shared__ __align__(128) __half bs[BN * LDS];
++  __shared__ __align__(128) float cs[8][16 * 16];
++  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++  const int wm = warp >> 2, wn = warp & 3;
++  const long long m0 = (long long)blockIdx.x * BM;
++  const int n0 = blockIdx.y * BN;
++  const int ktot = p.taps * p.cin;
++
++  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][2];
++#pragma unroll
++  for (int i = 0; i < 4; ++i)
++#pragma unroll
++    for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.f);
++
++  uint4 ra[2], rb[2];
++  auto fetch = [&](int k0) {
++#pragma unroll
++    for (int i = 0; i < 2; ++i) {
++      const int v = tid + i * 256;
++      const int r = v >> 2, c = (v & 3) * 8;
++      const int kk = k0 + c;
++      uint4 a = make_uint4(0u, 0u, 0u, 0u), b = make_uint4(0u, 0u, 0u, 0u);
++      const long long m = m0 + r;
++      if (m < p.m && kk < ktot) {
++        const int tap = kk / p.cin, ci = kk - tap * p.cin;
++        const long long rin = m - (long long)(p.taps - 1 - tap) * p.dilation;
++        if (rin >= 0) a = *reinterpret_cast<const uint4*>(p.x + rin * p.ldx + ci);
++      }
++      const int n = n0 + r;
++      if (n < p.n && kk < ktot) b = *reinterpret_cast<const uint4*>(p.w + (size_t)n * ktot + kk);
++      ra[i] = a;
++      rb[i] = b;
++    }
++  };
++
++  fetch(0);
++  for (int k0 = 0; k0 < ktot; k0 += BK) {
++    __syncthreads();
++#pragma unroll
++    for (int i = 0; i < 2; ++i) {
++      const int v = tid + i * 256;
++      const int r = v >> 2, c = (v & 3) * 8;
++      *reinterpret_cast<uint4*>(&as[r * LDS + c]) = ra[i];
++      *reinterpret_cast<uint4*>(&bs[r * LDS + c]) = rb[i];
++    }
++    __syncthreads();
++    if (k0 + BK < ktot) fetch(k0 + BK);
++#pragma unroll
++    for (int kk = 0; kk < BK; kk += 16) {
++      wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> af[4];
++      wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> bf[2];
++#pragma unroll
++      for (int i = 0; i < 4; ++i) wmma::load_matrix_sync(af[i], as + (wm * 64 + i * 16) * LDS + kk, LDS);
++#pragma unroll
++      for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(bf[j], bs + (wn * 32 + j * 16) * LDS + kk, LDS);
++#pragma unroll
++      for (int i = 0; i < 4; ++i)
++#pragma unroll
++        for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], af[i], bf[j], acc[i][j]);
++    }
++  }
++
++  float* c = cs[warp];
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++#pragma unroll
++    for (int j = 0; j < 2; ++j) {
++      wmma::store_matrix_sync(c, acc[i][j], 16, wmma::mem_row_major);
++      __syncwarp();
++      for (int e = lane; e < 256; e += 32) {
++        const long long m = m0 + wm * 64 + i * 16 + (e >> 4);
++        const int n = n0 + wn * 32 + j * 16 + (e & 15);
++        if (m < p.m && n < p.n) p.y[m * p.ldy + n] = f2h(gemm_epilogue(p, m, n, c[e]));
++      }
++      __syncwarp();
++    }
++  }
++}
+diff --git a/zig/src/families/drama/codec.zig b/zig/src/families/drama/codec.zig
+new file mode 100644
+index 00000000..0217b042
+--- /dev/null
++++ b/zig/src/families/drama/codec.zig
+@@ -0,0 +1,669 @@
++//! Drama 3's audio codec on CUDA: ten codebooks a frame (one semantic, nine residual) to mono 44.1 kHz
++//! PCM, 2048 samples a frame, as sglang-omni's Drama 3 vocoder decodes them in FP16
++//! (fishaudio_drama3/vocoder.py + channels_last_decoder.py over fish_speech's modded DAC).
++//!
++//! The pipeline is the codec's `quantizer.decode` then `decoder`:
++//!   RVQ: codebook rows through each book's weight-folded out_proj, summed           [T, 1024]
++//!   post_module: 8 causal transformer layers, attention window 128, RoPE           [T, 1024]
++//!   upsample: two (ConvTranspose1d stride 2, ConvNeXt block) stages                [4T, 1024]
++//!   decoder: causal conv 7 to 1536; four (Snake, ConvTranspose1d, three residual
++//!            units of dilation 1, 3, 9) blocks of rates 8, 8, 4, 2; Snake, conv to
++//!            one channel, tanh                                                    [2048T]
++//! Weights come straight from the pinned codec.pth (codec_pth.zig reads it without Python);
++//! weight norm is folded in FP32 as torch._weight_norm folds it, then every tensor the reference
++//! casts to FP16 is cast here with round-to-nearest-even. Snake alphas stay FP32, as the reference's
++//! Triton kernel reads them.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const pth = @import("codec_pth.zig");
++const kern = @import("codec_kernels.zig");
++
++const Allocator = std.mem.Allocator;
++
++pub const Options = struct { max_frames: usize = 1024 };
++
++// modded_dac_vq.yaml and modded_dac.py's geometry for the pinned codec.
++const latent = 1024;
++const codebook_dim = 8;
++const semantic_size = 4096;
++const residual_size = 1024;
++const residual_books = 9;
++const codebooks = 1 + residual_books;
++const layers = 8;
++const heads = 16;
++const head_dim = 64;
++const ffn = 3072;
++const window = 128;
++const rope_base = 10000.0;
++const rms_eps: f32 = 1e-5;
++const layer_norm_eps: f32 = 1e-6;
++const convnext_hidden = 4 * latent;
++const upsample_stages = 2; // downsample_factor [2, 2]
++const decoder_dim = 1536;
++const rates = [_]usize{ 8, 8, 4, 2 };
++const dilations = [_]usize{ 1, 3, 9 };
++const latent_rows_per_frame = 1 << upsample_stages;
++const hop = blk: {
++    var h: usize = 1;
++    for (rates) |r| h *= r;
++    break :blk h;
++};
++const samples_per_frame = latent_rows_per_frame * hop; // DAC.frame_length = hop_length * 4 = 2048
++const out_channels = decoder_dim >> rates.len;
++
++/// FP16 elements a frame each of the three activation buffers holds: the widest tensor of the decode.
++const act_halves_per_frame = blk: {
++    var most: usize = latent_rows_per_frame * convnext_hidden; // ConvNeXt hidden at 4T rows
++    var rows: usize = latent_rows_per_frame;
++    var ch: usize = decoder_dim;
++    most = @max(most, rows * ch);
++    for (rates) |r| {
++        rows *= r;
++        ch /= 2;
++        most = @max(most, rows * ch);
++    }
++    break :blk most;
++};
++
++comptime {
++    std.debug.assert(samples_per_frame == 2048);
++    std.debug.assert(out_channels == 96);
++    // the transformer's scratch (5T and 9T rows of 1024) fits the same buffers
++    std.debug.assert(act_halves_per_frame >= 9 * latent);
++}
++
++const Snake = struct { alpha: u64, inv: u64 };
++
++const Layer = struct {
++    wqkv: u64,
++    wo: u64,
++    w13: u64,
++    w2: u64,
++    attention_norm: u64,
++    ffn_norm: u64,
++    attention_scale: u64,
++    ffn_scale: u64,
++};
++
++const Upsample = struct {
++    conv: u64,
++    conv_b: u64,
++    dw: u64,
++    dw_b: u64,
++    norm_w: u64,
++    norm_b: u64,
++    pw1: u64,
++    pw1_b: u64,
++    pw2: u64,
++    pw2_b: u64,
++    gamma: u64,
++};
++
++const Unit = struct { snake1: Snake, conv7: u64, conv7_b: u64, snake2: Snake, conv1: u64, conv1_b: u64 };
++
++const Block = struct { snake: Snake, conv: u64, conv_b: u64, units: [dilations.len]Unit };
++
++/// Byte offsets into the one device weight buffer.
++const Weights = struct {
++    semantic_book: u64,
++    residual_books: u64,
++    out_w: u64,
++    out_b: u64,
++    layers: [layers]Layer,
++    norm: u64,
++    upsample: [upsample_stages]Upsample,
++    conv0: u64,
++    conv0_b: u64,
++    blocks: [rates.len]Block,
++    out_snake: Snake,
++    out_conv: u64,
++    out_conv_b: u64,
++    rope: u64,
++};
++
++pub const Model = struct {
++    sample_rate: u32 = 44100,
++    frame_length: usize = samples_per_frame,
++    num_codebooks: usize = codebooks,
++    max_frames: usize,
++    ctx: *cuda.Context,
++    kernels: kern.Kernels,
++    weights: cuda.DeviceBuffer,
++    w: Weights,
++    acts: [3]cuda.DeviceBuffer,
++    codes_dev: cuda.DeviceBuffer,
++    audio_dev: cuda.DeviceBuffer,
++    codes_host: cuda.HostBuffer,
++    audio_host: cuda.HostBuffer,
++
++    pub fn init(gpa: Allocator, io: std.Io, ctx: *cuda.Context, checkpoint_dir: []const u8, kernel_dir: []const u8, options: Options) !Model {
++        if (options.max_frames == 0) return error.Invalid;
++        try ctx.makeCurrent();
++        const d = ctx.d;
++        var kernels = try kern.Kernels.load(gpa, io, d, kernel_dir);
++        errdefer kernels.unload();
++
++        const path = try std.fs.path.join(gpa, &.{ checkpoint_dir, "codec.pth" });
++        defer gpa.free(path);
++        var archive = try pth.Archive.open(gpa, io, path);
++        defer archive.close();
++        var names = std.heap.ArenaAllocator.init(gpa);
++        defer names.deinit();
++        var stage: Stage = .{ .gpa = gpa };
++        defer stage.bytes.deinit(gpa);
++        var loader: Loader = .{ .gpa = gpa, .names = names.allocator(), .archive = &archive, .stage = &stage };
++        const w = try loader.weights(options.max_frames);
++        var weights = try cuda.DeviceBuffer.fromHost(d, stage.bytes.items);
++        errdefer weights.free();
++
++        var acts: [3]cuda.DeviceBuffer = undefined;
++        var made: usize = 0;
++        errdefer for (acts[0..made]) |*b| b.free();
++        for (&acts) |*b| {
++            b.* = try cuda.DeviceBuffer.alloc(d, act_halves_per_frame * options.max_frames * 2);
++            made += 1;
++        }
++        var codes_dev = try cuda.DeviceBuffer.alloc(d, options.max_frames * codebooks * @sizeOf(u32));
++        errdefer codes_dev.free();
++        var audio_dev = try cuda.DeviceBuffer.alloc(d, options.max_frames * samples_per_frame * @sizeOf(f32));
++        errdefer audio_dev.free();
++        var codes_host = try cuda.HostBuffer.alloc(d, options.max_frames * codebooks * @sizeOf(u32));
++        errdefer codes_host.free();
++        const audio_host = try cuda.HostBuffer.alloc(d, options.max_frames * samples_per_frame * @sizeOf(f32));
++        return .{
++            .max_frames = options.max_frames,
++            .ctx = ctx,
++            .kernels = kernels,
++            .weights = weights,
++            .w = w,
++            .acts = acts,
++            .codes_dev = codes_dev,
++            .audio_dev = audio_dev,
++            .codes_host = codes_host,
++            .audio_host = audio_host,
++        };
++    }
++
++    pub fn deinit(self: *Model) void {
++        self.ctx.makeCurrent() catch {};
++        self.audio_host.free();
++        self.codes_host.free();
++        self.audio_dev.free();
++        self.codes_dev.free();
++        for (&self.acts) |*b| b.free();
++        self.weights.free();
++        self.kernels.unload();
++        self.* = undefined;
++    }
++
++    /// Codes are frame-major, ten codebooks a frame, EOS rows excluded; out-of-range codes clamp to
++    /// each codebook's last row as rvq.py's decode clamps them. Writes `codes.len * 2048` mono FP32
++    /// samples to `output` and returns that count once every device operation has finished.
++    pub fn decode(self: *Model, stream: cuda.Stream, codes: []const [10]u32, output: []f32) !usize {
++        const frames = codes.len;
++        if (frames == 0) return error.NoFrames;
++        if (frames > self.max_frames) return error.TooManyFrames;
++        const samples = frames * samples_per_frame;
++        if (output.len < samples) return error.OutputTooSmall;
++        try self.ctx.makeCurrent();
++        const code_bytes = std.mem.sliceAsBytes(codes);
++        @memcpy(self.codes_host.bytes[0..code_bytes.len], code_bytes);
++        try self.codes_dev.uploadAsync(0, self.codes_host.bytes[0..code_bytes.len], stream.handle);
++        try self.forward(stream, frames);
++        const audio = self.audio_host.slice(f32)[0..samples];
++        try self.audio_dev.downloadAsync(0, std.mem.sliceAsBytes(audio), stream.handle);
++        try stream.synchronize();
++        @memcpy(output[0..samples], audio);
++        return samples;
++    }
++
++    fn wp(self: *const Model, offset: u64) u64 {
++        return self.weights.ptr + offset;
++    }
++
++    fn forward(self: *Model, s: cuda.Stream, frames: usize) !void {
++        const k = &self.kernels;
++        const w = &self.w;
++        const h = 2; // bytes an FP16 element
++        const p = [3]u64{ self.acts[0].ptr, self.acts[1].ptr, self.acts[2].ptr };
++
++        // rvq.py decode: z = semantic + residual codebooks through out_proj
++        try k.rvqLatent(s, self.codes_dev.ptr, self.wp(w.semantic_book), self.wp(w.residual_books), self.wp(w.out_w), self.wp(w.out_b), p[0], frames);
++
++        // post_module (WindowLimitedTransformer): x in p[0], scratch in p[1] and p[2]
++        const x = p[0];
++        const xn = p[1];
++        const qkv = p[1] + frames * latent * h;
++        const att = p[1] + 4 * frames * latent * h;
++        const gu = p[2];
++        const act = p[2] + frames * 2 * ffn * h;
++        const scale: f32 = 1.0 / @sqrt(@as(f32, head_dim));
++        for (&w.layers) |*l| {
++            try k.rmsNorm(s, x, self.wp(l.attention_norm), xn, frames, latent, rms_eps);
++            try k.gemm(s, .{ .x = xn, .w = self.wp(l.wqkv), .y = qkv, .m = frames, .n = 3 * latent, .cin = latent, .ldx = latent, .ldy = 3 * latent });
++            try k.ropeQk(s, qkv, self.wp(w.rope), frames, latent);
++            try k.windowAttention(s, qkv, att, frames, heads, window, scale);
++            // h = x + attention_layer_scale(wo(y)), in place over x
++            try k.gemm(s, .{ .x = att, .w = self.wp(l.wo), .y = x, .m = frames, .n = latent, .cin = latent, .ldx = latent, .ldy = latent, .scale = self.wp(l.attention_scale), .residual = x, .ldr = latent });
++            try k.rmsNorm(s, x, self.wp(l.ffn_norm), xn, frames, latent, rms_eps);
++            try k.gemm(s, .{ .x = xn, .w = self.wp(l.w13), .y = gu, .m = frames, .n = 2 * ffn, .cin = latent, .ldx = latent, .ldy = 2 * ffn });
++            try k.siluMul(s, gu, act, frames, ffn);
++            try k.gemm(s, .{ .x = act, .w = self.wp(l.w2), .y = x, .m = frames, .n = latent, .cin = ffn, .ldx = ffn, .ldy = latent, .scale = self.wp(l.ffn_scale), .residual = x, .ldr = latent });
++        }
++        try k.rmsNorm(s, x, self.wp(w.norm), p[1], frames, latent, rms_eps);
++
++        // upsample: (ConvTranspose1d k2 s2, ConvNeXtBlock) twice; T rows -> 4T rows
++        var input = p[1];
++        var spent = p[0];
++        var rows = frames;
++        for (&w.upsample) |*u| {
++            const y = spent;
++            try k.gemm(s, .{ .x = input, .w = self.wp(u.conv), .y = y, .m = rows, .n = 2 * latent, .cin = latent, .ldx = latent, .ldy = 2 * latent, .bias = self.wp(u.conv_b), .bias_mode = .separate, .period = latent });
++            rows *= 2;
++            const dw = p[2];
++            const normed = p[2] + rows * latent * h;
++            try k.dwconv(s, y, self.wp(u.dw), self.wp(u.dw_b), dw, rows, latent);
++            try k.layerNorm(s, dw, self.wp(u.norm_w), self.wp(u.norm_b), normed, rows, latent, layer_norm_eps);
++            const hidden = input; // the stage input is spent
++            try k.gemm(s, .{ .x = normed, .w = self.wp(u.pw1), .y = hidden, .m = rows, .n = convnext_hidden, .cin = latent, .ldx = latent, .ldy = convnext_hidden, .bias = self.wp(u.pw1_b), .bias_mode = .fused, .act = .gelu });
++            // y = input + gamma * pwconv2(...), in place over y
++            try k.gemm(s, .{ .x = hidden, .w = self.wp(u.pw2), .y = y, .m = rows, .n = latent, .cin = convnext_hidden, .ldx = convnext_hidden, .ldy = latent, .bias = self.wp(u.pw2_b), .bias_mode = .fused, .scale = self.wp(u.gamma), .residual = y, .ldr = latent });
++            input = y;
++            spent = hidden;
++        }
++
++        // decoder.model: conv 1024 -> 1536 (kernel 7, causal)
++        var cur = spent;
++        try k.gemm(s, .{ .x = input, .w = self.wp(w.conv0), .y = cur, .m = rows, .n = decoder_dim, .cin = latent, .ldx = latent, .ldy = decoder_dim, .taps = 7, .bias = self.wp(w.conv0_b), .bias_mode = .separate });
++        var spare = [2]u64{ input, p[2] };
++        var ch: usize = decoder_dim;
++        for (&w.blocks, rates) |*b, rate| {
++            const out_ch = ch / 2;
++            // DecoderBlock: Snake, then ConvTranspose1d(kernel 2 * rate, stride rate) trimmed causally
++            try k.snake(s, cur, self.wp(b.snake.alpha), self.wp(b.snake.inv), spare[0], rows, ch);
++            try k.gemm(s, .{ .x = spare[0], .w = self.wp(b.conv), .y = spare[1], .m = rows, .n = rate * out_ch, .cin = ch, .ldx = ch, .ldy = rate * out_ch, .taps = 2, .bias = self.wp(b.conv_b), .bias_mode = .separate, .period = out_ch });
++            rows *= rate;
++            ch = out_ch;
++            // ResidualUnits: x + conv1(snake(conv7(snake(x)))), rotating three buffers
++            var xb = spare[1];
++            var sb = cur;
++            var tb = spare[0];
++            for (&b.units, dilations) |*u, dilation| {
++                try k.snake(s, xb, self.wp(u.snake1.alpha), self.wp(u.snake1.inv), sb, rows, ch);
++                try k.gemm(s, .{ .x = sb, .w = self.wp(u.conv7), .y = tb, .m = rows, .n = ch, .cin = ch, .ldx = ch, .ldy = ch, .taps = 7, .dilation = dilation, .bias = self.wp(u.conv7_b), .bias_mode = .separate });
++                try k.snake(s, tb, self.wp(u.snake2.alpha), self.wp(u.snake2.inv), tb, rows, ch);
++                try k.gemm(s, .{ .x = tb, .w = self.wp(u.conv1), .y = sb, .m = rows, .n = ch, .cin = ch, .ldx = ch, .ldy = ch, .bias = self.wp(u.conv1_b), .bias_mode = .separate, .residual = xb, .ldr = ch });
++                const unit_out = sb;
++                sb = tb;
++                tb = xb;
++                xb = unit_out;
++            }
++            cur = xb;
++            spare = .{ sb, tb };
++        }
++        // Snake, conv 96 -> 1 (kernel 7, causal), tanh
++        try k.snake(s, cur, self.wp(w.out_snake.alpha), self.wp(w.out_snake.inv), cur, rows, ch);
++        try k.convOutTanh(s, cur, self.wp(w.out_conv), self.wp(w.out_conv_b), self.audio_dev.ptr, rows, ch);
++    }
++};
++
++/// The weight image built on the host before one upload; every tensor 256-byte aligned.
++const Stage = struct {
++    gpa: Allocator,
++    bytes: std.ArrayList(u8) = .empty,
++
++    fn reserve(st: *Stage, n: usize) !usize {
++        const at = std.mem.alignForward(usize, st.bytes.items.len, 256);
++        try st.bytes.appendNTimes(st.gpa, 0, at + n - st.bytes.items.len);
++        return at;
++    }
++
++    /// FP32 values as FP16, round to nearest even (torch's .to(float16)).
++    fn halves(st: *Stage, values: []const f32) !u64 {
++        const at = try st.reserve(values.len * 2);
++        const dst = st.bytes.items[at..][0 .. values.len * 2];
++        for (values, 0..) |v, i| std.mem.writeInt(u16, dst[i * 2 ..][0..2], halfBits(v), .little);
++        return at;
++    }
++
++    fn floats(st: *Stage, values: []const f32) !u64 {
++        const at = try st.reserve(values.len * 4);
++        @memcpy(st.bytes.items[at..][0 .. values.len * 4], std.mem.sliceAsBytes(values));
++        return at;
++    }
++};
++
++fn halfBits(v: f32) u16 {
++    return @bitCast(@as(f16, @floatCast(v)));
++}
++
++/// float32 rounded to bfloat16 (round to nearest even) and back, as torch rounds it.
++fn bf16Round(v: f32) f32 {
++    const b: u32 = @bitCast(v);
++    const r = b +% (0x7FFF + ((b >> 16) & 1));
++    return @bitCast(r & 0xFFFF0000);
++}
++
++/// Fold torch._weight_norm over dim 0 in place. Match the CUDA first-dimension kernel's
++/// 256-strided FP32 FMA accumulation and reduction tree before rounding weights to FP16.
++fn foldWeightNorm(v: []f32, g: []const f32) !void {
++    if (g.len == 0 or v.len % g.len != 0) return error.Invalid;
++    const row = v.len / g.len;
++    var width: usize = 1;
++    while (width < @min(row, 256)) : (width *= 2) {}
++    var partial: [256]f32 = undefined;
++    for (g, 0..) |gi, i| {
++        const r = v[i * row ..][0..row];
++        for (0..width) |lane| {
++            var sum: f32 = 0;
++            var column = lane;
++            while (column < row) : (column += 256) sum = @mulAdd(f32, r[column], r[column], sum);
++            partial[lane] = sum;
++        }
++        // For short rows, the omitted upper lanes contain only zeros.
++        var stride = width / 2;
++        while (stride != 0) : (stride /= 2) {
++            for (0..stride) |lane| partial[lane] += partial[lane + stride];
++        }
++        const norm: f32 = @sqrt(partial[0]);
++        if (!(norm > 0)) return error.DegenerateWeightNorm;
++        const rnorm: f32 = 1.0 / norm;
++        for (r) |*e| e.* = gi * e.* * rnorm;
++    }
++}
++
++/// Conv1d weight [cout][cin][k] as the implicit GEMM's [cout][k * cin].
++fn convTaps(gpa: Allocator, w: []const f32, cout: usize, cin: usize, k: usize) ![]f32 {
++    if (w.len != cout * cin * k) return error.Invalid;
++    const out = try gpa.alloc(f32, w.len);
++    for (0..cout) |co| {
++        for (0..cin) |ci| {
++            for (0..k) |t| out[(co * k + t) * cin + ci] = w[(co * cin + ci) * k + t];
++        }
++    }
++    return out;
++}
++
++/// ConvTranspose1d weight [cin][cout][k], stride s, as the GEMM's [s * cout][taps * cin]: column
++/// j * cout + co is output sample q * s + j. Kernel 2s: tap 0 reads row q - 1 (kernel index j + s),
++/// tap 1 row q (index j). Kernel s: one tap, row q (index j).
++fn transposedTaps(gpa: Allocator, w: []const f32, cin: usize, cout: usize, s: usize, k: usize) ![]f32 {
++    if (w.len != cin * cout * k or (k != s and k != 2 * s)) return error.Invalid;
++    const taps = k / s;
++    const out = try gpa.alloc(f32, w.len);
++    for (0..s) |j| {
++        for (0..cout) |co| {
++            for (0..taps) |tap| {
++                const kk = if (taps == 2 and tap == 0) j + s else j;
++                for (0..cin) |ci| out[((j * cout + co) * taps + tap) * cin + ci] = w[(ci * cout + co) * k + kk];
++            }
++        }
++    }
++    return out;
++}
++
++/// modded_dac.py precompute_freqs_cis(seq_len, 64, 10000) for the first `frames` positions: FP32
++/// frequencies and angles, cos and sin rounded to BF16 (the buffer's dtype), as [frames][32][2].
++fn ropeTable(gpa: Allocator, frames: usize) ![]f32 {
++    const pairs = head_dim / 2;
++    var freqs: [pairs]f32 = undefined;
++    for (&freqs, 0..) |*f, i| {
++        const x: f32 = @as(f32, @floatFromInt(2 * i)) / @as(f32, head_dim);
++        const p: f32 = @floatCast(std.math.pow(f64, rope_base, @as(f64, x)));
++        f.* = 1.0 / p;
++    }
++    const out = try gpa.alloc(f32, frames * pairs * 2);
++    for (0..frames) |t| {
++        for (freqs, 0..) |f, i| {
++            const angle: f32 = @as(f32, @floatFromInt(t)) * f;
++            const a: f64 = angle;
++            out[(t * pairs + i) * 2] = bf16Round(@floatCast(@cos(a)));
++            out[(t * pairs + i) * 2 + 1] = bf16Round(@floatCast(@sin(a)));
++        }
++    }
++    return out;
++}
++
++const Loader = struct {
++    gpa: Allocator,
++    names: Allocator,
++    archive: *const pth.Archive,
++    stage: *Stage,
++
++    fn name(l: *Loader, comptime fmt: []const u8, args: anytype) ![]const u8 {
++        return std.fmt.allocPrint(l.names, fmt, args);
++    }
++
++    fn read(l: *Loader, tensor: []const u8, shape: []const u64) ![]f32 {
++        return l.archive.readF32(l.gpa, tensor, shape);
++    }
++
++    /// A tensor as FP16 in its checkpoint layout.
++    fn half(l: *Loader, tensor: []const u8, shape: []const u64) !u64 {
++        const v = try l.read(tensor, shape);
++        defer l.gpa.free(v);
++        return l.stage.halves(v);
++    }
++
++    /// A weight-normed tensor folded over dim 0 (caller frees); g is [shape[0], 1, 1].
++    fn folded(l: *Loader, g_name: []const u8, v_name: []const u8, shape: []const u64) ![]f32 {
++        const v = try l.read(v_name, shape);
++        errdefer l.gpa.free(v);
++        const g = try l.read(g_name, &[_]u64{ shape[0], 1, 1 });
++        defer l.gpa.free(g);
++        try foldWeightNorm(v, g);
++        return v;
++    }
++
++    /// A decoder conv (parametrizations.weight_norm) at `prefix`.conv, folded, as GEMM taps in FP16.
++    fn decoderConv(l: *Loader, prefix: []const u8, cout: usize, cin: usize, k: usize) !u64 {
++        const v = try l.folded(
++            try l.name("{s}.conv.parametrizations.weight.original0", .{prefix}),
++            try l.name("{s}.conv.parametrizations.weight.original1", .{prefix}),
++            &[_]u64{ cout, cin, k },
++        );
++        defer l.gpa.free(v);
++        const t = try convTaps(l.gpa, v, cout, cin, k);
++        defer l.gpa.free(t);
++        return l.stage.halves(t);
++    }
++
++    fn snake(l: *Loader, tensor: []const u8, channels: usize) !Snake {
++        const alpha = try l.read(tensor, &[_]u64{ 1, channels, 1 });
++        defer l.gpa.free(alpha);
++        const inv = try l.gpa.alloc(f32, channels);
++        defer l.gpa.free(inv);
++        // (alpha + 1e-9).reciprocal() in FP32
++        for (alpha, inv) |a, *r| r.* = 1.0 / (a + @as(f32, 1e-9));
++        return .{ .alpha = try l.stage.floats(alpha), .inv = try l.stage.floats(inv) };
++    }
++
++    fn weights(l: *Loader, max_frames: usize) !Weights {
++        var w: Weights = undefined;
++        const gpa = l.gpa;
++
++        // quantizer RVQ: codebooks, folded out_proj (legacy weight_norm: weight_g, weight_v)
++        w.semantic_book = try l.half("quantizer.semantic_quantizer.quantizers.0.codebook.weight", &[_]u64{ semantic_size, codebook_dim });
++        {
++            const books = try gpa.alloc(f32, residual_books * residual_size * codebook_dim);
++            defer gpa.free(books);
++            for (0..residual_books) |i| {
++                const v = try l.read(try l.name("quantizer.quantizer.quantizers.{d}.codebook.weight", .{i}), &[_]u64{ residual_size, codebook_dim });
++                defer gpa.free(v);
++                @memcpy(books[i * residual_size * codebook_dim ..][0..v.len], v);
++            }
++            w.residual_books = try l.stage.halves(books);
++        }
++        {
++            const ow = try gpa.alloc(f32, codebooks * latent * codebook_dim);
++            defer gpa.free(ow);
++            const ob = try gpa.alloc(f32, codebooks * latent);
++            defer gpa.free(ob);
++            for (0..codebooks) |i| {
++                const prefix = if (i == 0) "quantizer.semantic_quantizer.quantizers.0" else try l.name("quantizer.quantizer.quantizers.{d}", .{i - 1});
++                const v = try l.folded(try l.name("{s}.out_proj.weight_g", .{prefix}), try l.name("{s}.out_proj.weight_v", .{prefix}), &[_]u64{ latent, codebook_dim, 1 });
++                defer gpa.free(v);
++                @memcpy(ow[i * latent * codebook_dim ..][0..v.len], v);
++                const b = try l.read(try l.name("{s}.out_proj.bias", .{prefix}), &[_]u64{latent});
++                defer gpa.free(b);
++                @memcpy(ob[i * latent ..][0..latent], b);
++            }
++            w.out_w = try l.stage.halves(ow);
++            w.out_b = try l.stage.halves(ob);
++        }
++
++        // post_module transformer
++        for (&w.layers, 0..) |*layer, i| {
++            const p = try l.name("quantizer.post_module.layers.{d}", .{i});
++            layer.wqkv = try l.half(try l.name("{s}.attention.wqkv.weight", .{p}), &[_]u64{ 3 * latent, latent });
++            layer.wo = try l.half(try l.name("{s}.attention.wo.weight", .{p}), &[_]u64{ latent, latent });
++            {
++                const w13 = try gpa.alloc(f32, 2 * ffn * latent);
++                defer gpa.free(w13);
++                const w1 = try l.read(try l.name("{s}.feed_forward.w1.weight", .{p}), &[_]u64{ ffn, latent });
++                defer gpa.free(w1);
++                const w3 = try l.read(try l.name("{s}.feed_forward.w3.weight", .{p}), &[_]u64{ ffn, latent });
++                defer gpa.free(w3);
++                @memcpy(w13[0 .. ffn * latent], w1);
++                @memcpy(w13[ffn * latent ..], w3);
++                layer.w13 = try l.stage.halves(w13);
++            }
++            layer.w2 = try l.half(try l.name("{s}.feed_forward.w2.weight", .{p}), &[_]u64{ latent, ffn });
++            layer.attention_norm = try l.half(try l.name("{s}.attention_norm.weight", .{p}), &[_]u64{latent});
++            layer.ffn_norm = try l.half(try l.name("{s}.ffn_norm.weight", .{p}), &[_]u64{latent});
++            layer.attention_scale = try l.half(try l.name("{s}.attention_layer_scale.gamma", .{p}), &[_]u64{latent});
++            layer.ffn_scale = try l.half(try l.name("{s}.ffn_layer_scale.gamma", .{p}), &[_]u64{latent});
++        }
++        w.norm = try l.half("quantizer.post_module.norm.weight", &[_]u64{latent});
++
++        // upsample stages (plain convs: rvq.py's own CausalConvNet classes carry no weight norm)
++        for (&w.upsample, 0..) |*u, i| {
++            const p = try l.name("quantizer.upsample.{d}", .{i});
++            {
++                const v = try l.read(try l.name("{s}.0.conv.weight", .{p}), &[_]u64{ latent, latent, 2 });
++                defer gpa.free(v);
++                const t = try transposedTaps(gpa, v, latent, latent, 2, 2);
++                defer gpa.free(t);
++                u.conv = try l.stage.halves(t);
++            }
++            u.conv_b = try l.half(try l.name("{s}.0.conv.bias", .{p}), &[_]u64{latent});
++            u.dw = try l.half(try l.name("{s}.1.dwconv.conv.weight", .{p}), &[_]u64{ latent, 1, 7 });
++            u.dw_b = try l.half(try l.name("{s}.1.dwconv.conv.bias", .{p}), &[_]u64{latent});
++            u.norm_w = try l.half(try l.name("{s}.1.norm.weight", .{p}), &[_]u64{latent});
++            u.norm_b = try l.half(try l.name("{s}.1.norm.bias", .{p}), &[_]u64{latent});
++            u.pw1 = try l.half(try l.name("{s}.1.pwconv1.weight", .{p}), &[_]u64{ convnext_hidden, latent });
++            u.pw1_b = try l.half(try l.name("{s}.1.pwconv1.bias", .{p}), &[_]u64{convnext_hidden});
++            u.pw2 = try l.half(try l.name("{s}.1.pwconv2.weight", .{p}), &[_]u64{ latent, convnext_hidden });
++            u.pw2_b = try l.half(try l.name("{s}.1.pwconv2.bias", .{p}), &[_]u64{latent});
++            u.gamma = try l.half(try l.name("{s}.1.gamma", .{p}), &[_]u64{latent});
++        }
++
++        // decoder
++        w.conv0 = try l.decoderConv("decoder.model.0", decoder_dim, latent, 7);
++        w.conv0_b = try l.half("decoder.model.0.conv.bias", &[_]u64{decoder_dim});
++        var ch: usize = decoder_dim;
++        for (&w.blocks, rates, 0..) |*b, rate, i| {
++            const out_ch = ch / 2;
++            const p = try l.name("decoder.model.{d}.block", .{i + 1});
++            b.snake = try l.snake(try l.name("{s}.0.alpha", .{p}), ch);
++            {
++                const v = try l.folded(
++                    try l.name("{s}.1.conv.parametrizations.weight.original0", .{p}),
++                    try l.name("{s}.1.conv.parametrizations.weight.original1", .{p}),
++                    &[_]u64{ ch, out_ch, 2 * rate },
++                );
++                defer gpa.free(v);
++                const t = try transposedTaps(gpa, v, ch, out_ch, rate, 2 * rate);
++                defer gpa.free(t);
++                b.conv = try l.stage.halves(t);
++            }
++            b.conv_b = try l.half(try l.name("{s}.1.conv.bias", .{p}), &[_]u64{out_ch});
++            for (&b.units, 0..) |*u, j| {
++                const q = try l.name("{s}.{d}.block", .{ p, j + 2 });
++                u.snake1 = try l.snake(try l.name("{s}.0.alpha", .{q}), out_ch);
++                u.conv7 = try l.decoderConv(try l.name("{s}.1", .{q}), out_ch, out_ch, 7);
++                u.conv7_b = try l.half(try l.name("{s}.1.conv.bias", .{q}), &[_]u64{out_ch});
++                u.snake2 = try l.snake(try l.name("{s}.2.alpha", .{q}), out_ch);
++                u.conv1 = try l.decoderConv(try l.name("{s}.3", .{q}), out_ch, out_ch, 1);
++                u.conv1_b = try l.half(try l.name("{s}.3.conv.bias", .{q}), &[_]u64{out_ch});
++            }
++            ch = out_ch;
++        }
++        const tail = rates.len + 1;
++        w.out_snake = try l.snake(try l.name("decoder.model.{d}.alpha", .{tail}), out_channels);
++        {
++            const v = try l.folded(
++                try l.name("decoder.model.{d}.conv.parametrizations.weight.original0", .{tail + 1}),
++                try l.name("decoder.model.{d}.conv.parametrizations.weight.original1", .{tail + 1}),
++                &[_]u64{ 1, out_channels, 7 },
++            );
++            defer gpa.free(v);
++            // [1][96][7] -> [7][96], the rows the output kernel walks
++            var t: [7 * out_channels]f32 = undefined;
++            for (0..out_channels) |c| {
++                for (0..7) |tap| t[tap * out_channels + c] = v[c * 7 + tap];
++            }
++            w.out_conv = try l.stage.halves(&t);
++        }
++        w.out_conv_b = try l.half(try l.name("decoder.model.{d}.conv.bias", .{tail + 1}), &[_]u64{1});
++
++        const rope = try ropeTable(gpa, max_frames);
++        defer gpa.free(rope);
++        w.rope = try l.stage.halves(rope);
++        return w;
++    }
++};
++
++test "transposed-conv taps reproduce ConvTranspose1d with the causal trim" {
++    // cin 2, cout 1, stride 2, kernel 4: direct definition vs the GEMM's two-tap form
++    const cin = 2;
++    const cout = 1;
++    const s = 2;
++    const k = 4;
++    const w = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 }; // [cin][cout][k]
++    const x = [_][cin]f32{ .{ 1, -1 }, .{ 2, 0.5 }, .{ -3, 4 } }; // [L][cin]
++    const taps = try transposedTaps(std.testing.allocator, &w, cin, cout, s, k);
++    defer std.testing.allocator.free(taps);
++    for (0..x.len) |q| {
++        for (0..s) |j| {
++            // reference: y[p] = sum over i, kk with p = i * s + kk, of x[i] * w[ci][0][kk]
++            const pos = q * s + j;
++            var want: f32 = 0;
++            for (0..x.len) |i| {
++                for (0..k) |kk| {
++                    if (i * s + kk != pos) continue;
++                    for (0..cin) |ci| want += x[i][ci] * w[ci * k + kk];
++                }
++            }
++            var got: f32 = 0;
++            for (0..2) |tap| {
++                if (tap == 0 and q == 0) continue;
++                const row = if (tap == 0) q - 1 else q;
++                for (0..cin) |ci| got += x[row][ci] * taps[(j * cout * 2 + tap) * cin + ci];
++            }
++            try std.testing.expectEqual(want, got);
++        }
++    }
++}
++
++test "weight norm folds per output row and bf16 rounding ties to even" {
++    var v = [_]f32{ 3, 4, 0, 5 };
++    try foldWeightNorm(&v, &.{ 10, 2 });
++    try std.testing.expectEqualSlices(f32, &.{ 6, 8, 0, 2 }, &v);
++    // 1 + 2^-8 is halfway between bf16 neighbours 1 and 1 + 2^-7: ties to the even 1
++    try std.testing.expectEqual(@as(f32, 1.0), bf16Round(1.0 + 1.0 / 256.0));
++    try std.testing.expectEqual(@as(f32, 1.0 + 1.0 / 64.0), bf16Round(1.0 + 3.0 / 256.0));
++}
++
++test "weight norm preserves FP16 rounding across the CUDA reduction boundary" {
++    // Synthetic values: an FP64 sum changes this folded weight by one FP16 ULP.
++    var state: u32 = 689124668;
++    var v: [257]f32 = undefined;
++    for (&v) |*value| {
++        state = state *% 1664525 +% 1013904223;
++        value.* = @as(f32, @floatFromInt(state >> 8)) / 8388608.0 - 1.0;
++    }
++    try foldWeightNorm(&v, &.{1});
++    try std.testing.expectEqual(@as(u16, 0xab13), halfBits(v[105]));
++}
+diff --git a/zig/src/families/drama/codec_kernels.zig b/zig/src/families/drama/codec_kernels.zig
+new file mode 100644
+index 00000000..7009aacc
+--- /dev/null
++++ b/zig/src/families/drama/codec_kernels.zig
+@@ -0,0 +1,251 @@
++//! drama_codec.cu's kernels: loaded from `<kernel_dir>/drama_codec.fatbin`, launched with their exact C argument types.
++
++const std = @import("std");
++const cuda = @import("cuda");
++
++pub const fatbin_name = "drama_codec.fatbin";
++
++pub const BiasMode = enum(i32) {
++    none = 0,
++    /// cuBLASLt's bias epilogue: h(acc + b).
++    fused = 1,
++    /// cuDNN then add_: h(h(acc) + b).
++    separate = 2,
++};
++
++pub const Act = enum(i32) { none = 0, gelu = 1 };
++
++/// drama_codec.cu's GemmParams, field for field.
++const GemmParams = extern struct {
++    x: u64,
++    w: u64,
++    bias: u64,
++    scale: u64,
++    residual: u64,
++    y: u64,
++    m: i64,
++    n: i32,
++    cin: i32,
++    taps: i32,
++    dilation: i32,
++    ldx: i32,
++    ldy: i32,
++    ldr: i32,
++    period: i32,
++    bias_mode: i32,
++    act: i32,
++};
++
++/// One implicit-GEMM call (drama_codec_conv_gemm): `m` output rows of `n` columns from `taps`
++/// shifted reads of `cin` channels of `x`. Leading dimensions are in elements.
++pub const Gemm = struct {
++    x: u64,
++    w: u64,
++    y: u64,
++    m: usize,
++    n: usize,
++    cin: usize,
++    ldx: usize,
++    ldy: usize,
++    taps: usize = 1,
++    dilation: usize = 1,
++    bias: u64 = 0,
++    bias_mode: BiasMode = .none,
++    /// Bias and scale index n % period; 0 means n.
++    period: usize = 0,
++    act: Act = .none,
++    scale: u64 = 0,
++    residual: u64 = 0,
++    ldr: usize = 0,
++};
++
++fn small(v: usize) !i32 {
++    if (v > std.math.maxInt(i32)) return error.Invalid;
++    return @intCast(v);
++}
++
++fn blocks(n: usize, per: usize) !u32 {
++    const b = (n + per - 1) / per;
++    if (b == 0 or b > std.math.maxInt(i32)) return error.Invalid;
++    return @intCast(b);
++}
++
++pub const Kernels = struct {
++    module: cuda.Module,
++    rvq: cuda.Function,
++    rms_norm: cuda.Function,
++    rope: cuda.Function,
++    attention: cuda.Function,
++    silu_mul: cuda.Function,
++    layer_norm: cuda.Function,
++    dwconv7: cuda.Function,
++    snake_fn: cuda.Function,
++    out_tanh: cuda.Function,
++    gemm_fn: cuda.Function,
++
++    pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, kernel_dir: []const u8) !Kernels {
++        var module = if (kernel_dir.len == 0) try cuda.Module.load(d, cuda.kernels.drama_codec) else blk: {
++            const path = try std.fs.path.join(gpa, &.{ kernel_dir, fatbin_name });
++            defer gpa.free(path);
++            const image = std.Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .limited(1 << 28), .@"16", null) catch |e| {
++                std.log.err("drama codec kernels: cannot read {s}: {s}", .{ path, @errorName(e) });
++                return e;
++            };
++            defer gpa.free(image);
++            break :blk try cuda.Module.load(d, image);
++        };
++        errdefer module.unload();
++        return .{
++            .module = module,
++            .rvq = try module.function("drama_codec_rvq_latent"),
++            .rms_norm = try module.function("drama_codec_rms_norm"),
++            .rope = try module.function("drama_codec_rope"),
++            .attention = try module.function("drama_codec_window_attention"),
++            .silu_mul = try module.function("drama_codec_silu_mul"),
++            .layer_norm = try module.function("drama_codec_layer_norm"),
++            .dwconv7 = try module.function("drama_codec_dwconv7"),
++            .snake_fn = try module.function("drama_codec_snake"),
++            .out_tanh = try module.function("drama_codec_conv_out_tanh"),
++            .gemm_fn = try module.function("drama_codec_conv_gemm"),
++        };
++    }
++
++    pub fn unload(k: *Kernels) void {
++        k.module.unload();
++        k.* = undefined;
++    }
++
++    fn run(f: cuda.Function, s: cuda.Stream, grid: cuda.Dim3, threads: u32, a: *cuda.Args) !void {
++        try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = threads } }, s, a);
++    }
++
++    /// codes [frames][10] u32 -> z [frames][1024].
++    pub fn rvqLatent(k: *const Kernels, s: cuda.Stream, codes: u64, semantic_book: u64, residual_books: u64, out_w: u64, out_b: u64, z: u64, frames: usize) !void {
++        var a: cuda.Args = .{};
++        a.add(codes);
++        a.add(semantic_book);
++        a.add(residual_books);
++        a.add(out_w);
++        a.add(out_b);
++        a.add(z);
++        try run(k.rvq, s, .{ .x = try blocks(frames, 1) }, 256, &a);
++    }
++
++    pub fn rmsNorm(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, y: u64, rows: usize, width: usize, eps: f32) !void {
++        var a: cuda.Args = .{};
++        a.add(x);
++        a.add(w);
++        a.add(y);
++        a.add(try small(width));
++        a.add(eps);
++        try run(k.rms_norm, s, .{ .x = try blocks(rows, 1) }, 256, &a);
++    }
++
++    /// In place on the q and k thirds of qkv [frames][3 * width].
++    pub fn ropeQk(k: *const Kernels, s: cuda.Stream, qkv: u64, table: u64, frames: usize, width: usize) !void {
++        var a: cuda.Args = .{};
++        a.add(qkv);
++        a.add(table);
++        a.add(try small(width));
++        a.add(try small(3 * width));
++        try run(k.rope, s, .{ .x = try blocks(frames, 1) }, 256, &a);
++    }
++
++    pub fn windowAttention(k: *const Kernels, s: cuda.Stream, qkv: u64, out: u64, frames: usize, heads: usize, window: usize, scale: f32) !void {
++        if (window == 0 or window > 128) return error.Invalid;
++        var a: cuda.Args = .{};
++        a.add(qkv);
++        a.add(out);
++        a.add(try small(heads));
++        a.add(try small(window));
++        a.add(scale);
++        try run(k.attention, s, .{ .x = try blocks(frames, 1), .y = @intCast(heads) }, 128, &a);
++    }
++
++    pub fn siluMul(k: *const Kernels, s: cuda.Stream, gu: u64, out: u64, rows: usize, width: usize) !void {
++        var a: cuda.Args = .{};
++        a.add(gu);
++        a.add(out);
++        a.add(@as(i64, @intCast(rows)));
++        a.add(try small(width));
++        try run(k.silu_mul, s, .{ .x = try blocks(rows * width, 256) }, 256, &a);
++    }
++
++    pub fn layerNorm(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, b: u64, y: u64, rows: usize, width: usize, eps: f32) !void {
++        var a: cuda.Args = .{};
++        a.add(x);
++        a.add(w);
++        a.add(b);
++        a.add(y);
++        a.add(try small(width));
++        a.add(eps);
++        try run(k.layer_norm, s, .{ .x = try blocks(rows, 1) }, 256, &a);
++    }
++
++    pub fn dwconv(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, b: u64, y: u64, rows: usize, width: usize) !void {
++        var a: cuda.Args = .{};
++        a.add(x);
++        a.add(w);
++        a.add(b);
++        a.add(y);
++        a.add(@as(i64, @intCast(rows)));
++        a.add(try small(width));
++        try run(k.dwconv7, s, .{ .x = try blocks(rows * width, 256) }, 256, &a);
++    }
++
++    /// Snake over [rows][width]; x and y may be the same buffer.
++    pub fn snake(k: *const Kernels, s: cuda.Stream, x: u64, alpha: u64, inv_alpha: u64, y: u64, rows: usize, width: usize) !void {
++        var a: cuda.Args = .{};
++        a.add(x);
++        a.add(alpha);
++        a.add(inv_alpha);
++        a.add(y);
++        a.add(@as(i64, @intCast(rows * width)));
++        a.add(try small(width));
++        try run(k.snake_fn, s, .{ .x = try blocks(rows * width, 256) }, 256, &a);
++    }
++
++    /// The final conv and tanh into FP32 PCM [rows].
++    pub fn convOutTanh(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, b: u64, y: u64, rows: usize, width: usize) !void {
++        var a: cuda.Args = .{};
++        a.add(x);
++        a.add(w);
++        a.add(b);
++        a.add(y);
++        a.add(@as(i64, @intCast(rows)));
++        a.add(try small(width));
++        try run(k.out_tanh, s, .{ .x = try blocks(rows, 256) }, 256, &a);
++    }
++
++    pub fn gemm(k: *const Kernels, s: cuda.Stream, g: Gemm) !void {
++        const ktot = g.taps * g.cin;
++        if (g.m == 0 or g.n == 0 or g.taps == 0 or g.cin == 0) return error.Invalid;
++        if (g.cin % 8 != 0 or g.ldx % 8 != 0 or g.ldx < g.cin or g.ldy < g.n) return error.Invalid;
++        if (g.x % 16 != 0 or g.w % 16 != 0) return error.Misaligned;
++        if ((g.bias_mode != .none) != (g.bias != 0)) return error.Invalid;
++        if (g.residual != 0 and g.ldr < g.n) return error.Invalid;
++        const p: GemmParams = .{
++            .x = g.x,
++            .w = g.w,
++            .bias = g.bias,
++            .scale = g.scale,
++            .residual = g.residual,
++            .y = g.y,
++            .m = @intCast(g.m),
++            .n = try small(g.n),
++            .cin = try small(g.cin),
++            .taps = try small(g.taps),
++            .dilation = try small(g.dilation),
++            .ldx = try small(g.ldx),
++            .ldy = try small(g.ldy),
++            .ldr = try small(g.ldr),
++            .period = try small(if (g.period == 0) g.n else g.period),
++            .bias_mode = @backingInt(g.bias_mode),
++            .act = @backingInt(g.act),
++        };
++        _ = try small(ktot);
++        var a: cuda.Args = .{};
++        a.add(p);
++        try run(k.gemm_fn, s, .{ .x = try blocks(g.m, 128), .y = try blocks(g.n, 128) }, 256, &a);
++    }
++};
+diff --git a/zig/src/families/drama/codec_pth.zig b/zig/src/families/drama/codec_pth.zig
+new file mode 100644
+index 00000000..b5c6673a
+--- /dev/null
++++ b/zig/src/families/drama/codec_pth.zig
+@@ -0,0 +1,554 @@
++//! The Drama 3 codec checkpoint (codec.pth) read without Python: torch.save's zip archive of stored
++//! members, and its state-dict pickle run by a VM that knows only the opcodes and globals a tensor
++//! state dict uses (the allow-list torch.load(weights_only=True) enforces). Nothing in the file runs.
++
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++
++pub const DType = enum { f64, f32, f16, bf16, i64, i32, i16, i8, u8, bool };
++
++pub fn elementBytes(t: DType) usize {
++    return switch (t) {
++        .f64, .i64 => 8,
++        .f32, .i32 => 4,
++        .f16, .bf16, .i16 => 2,
++        .i8, .u8, .bool => 1,
++    };
++}
++
++/// torch's legacy storage class names, as torch.save pickles them.
++fn storageType(name: []const u8) ?DType {
++    const table = [_]struct { []const u8, DType }{
++        .{ "DoubleStorage", .f64 },    .{ "FloatStorage", .f32 }, .{ "HalfStorage", .f16 },
++        .{ "BFloat16Storage", .bf16 }, .{ "LongStorage", .i64 },  .{ "IntStorage", .i32 },
++        .{ "ShortStorage", .i16 },     .{ "CharStorage", .i8 },   .{ "ByteStorage", .u8 },
++        .{ "BoolStorage", .bool },
++    };
++    for (table) |e| if (std.mem.eql(u8, e[0], name)) return e[1];
++    return null;
++}
++
++/// One state-dict entry: a view into the storage member `data/<storage>`.
++pub const Tensor = struct {
++    dtype: DType,
++    storage: []const u8,
++    storage_numel: u64,
++    offset: u64, // elements
++    shape: []const u64,
++    stride: []const u64,
++};
++
++const Member = struct { local: u64, size: u64, crc: u32 };
++
++pub const Archive = struct {
++    arena: std.heap.ArenaAllocator,
++    io: std.Io,
++    file: std.Io.File,
++    members: std.StringHashMapUnmanaged(Member),
++    tensors: std.StringHashMapUnmanaged(Tensor),
++    /// The archive's top directory with its slash ("<name>/"), as torch.save names it.
++    prefix: []const u8,
++
++    pub fn open(gpa: Allocator, io: std.Io, path: []const u8) !Archive {
++        var arena = std.heap.ArenaAllocator.init(gpa);
++        errdefer arena.deinit();
++        const a = arena.allocator();
++        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
++        errdefer file.close(io);
++        const members = try readDirectory(a, io, file);
++        var pickle_name: ?[]const u8 = null;
++        var it = members.iterator();
++        while (it.next()) |e| {
++            if (!std.mem.endsWith(u8, e.key_ptr.*, "/data.pkl")) continue;
++            if (pickle_name != null) return error.BadArchive;
++            pickle_name = e.key_ptr.*;
++        }
++        const name = pickle_name orelse return error.BadArchive;
++        const prefix = name[0 .. name.len - "data.pkl".len];
++        const order_name = try std.mem.concat(a, u8, &.{ prefix, "byteorder" });
++        if (members.get(order_name)) |m| {
++            if (m.size > 16) return error.BadArchive;
++            const order = try a.alloc(u8, @intCast(m.size));
++            try readMember(io, file, m, order);
++            if (!std.mem.eql(u8, order, "little")) return error.BigEndianArchive;
++        }
++        const pm = members.get(name).?;
++        if (pm.size > 64 << 20) return error.BadArchive;
++        const pickle = try a.alloc(u8, @intCast(pm.size));
++        try readMember(io, file, pm, pickle);
++        const tensors = try unpickle(a, pickle);
++        return .{ .arena = arena, .io = io, .file = file, .members = members, .tensors = tensors, .prefix = prefix };
++    }
++
++    pub fn close(self: *Archive) void {
++        self.file.close(self.io);
++        self.arena.deinit();
++        self.* = undefined;
++    }
++
++    pub fn tensor(self: *const Archive, name: []const u8) !Tensor {
++        return self.tensors.get(name) orelse {
++            std.log.err("codec.pth has no tensor {s}", .{name});
++            return error.MissingTensor;
++        };
++    }
++
++    /// `name`'s float32 elements in row-major order (caller frees), its shape checked against `shape`
++    /// and its whole storage member checked against the archive's CRC-32.
++    pub fn readF32(self: *const Archive, gpa: Allocator, name: []const u8, shape: []const u64) ![]f32 {
++        const t = try self.tensor(name);
++        if (t.dtype != .f32) {
++            std.log.err("codec.pth tensor {s} is {s}, not float32", .{ name, @tagName(t.dtype) });
++            return error.UnexpectedDType;
++        }
++        if (!std.mem.eql(u64, t.shape, shape)) {
++            std.log.err("codec.pth tensor {s} has shape {any}, expected {any}", .{ name, t.shape, shape });
++            return error.ShapeMismatch;
++        }
++        var numel: u64 = 1;
++        var i = t.shape.len;
++        while (i > 0) {
++            i -= 1;
++            if (t.shape[i] != 1 and t.stride[i] != numel) return error.NonContiguousTensor;
++            numel *= t.shape[i];
++        }
++        if (t.offset > t.storage_numel or numel > t.storage_numel - t.offset) return error.BadArchive;
++        const key = try std.fmt.allocPrint(gpa, "{s}data/{s}", .{ self.prefix, t.storage });
++        defer gpa.free(key);
++        const m = self.members.get(key) orelse return error.MissingStorage;
++        if (m.size != t.storage_numel * 4) return error.BadArchive;
++        const all = try gpa.alloc(f32, @intCast(t.storage_numel));
++        errdefer gpa.free(all);
++        try readMember(self.io, self.file, m, std.mem.sliceAsBytes(all));
++        if (t.offset == 0 and numel == all.len) return all;
++        const out = try gpa.dupe(f32, all[@intCast(t.offset)..][0..@intCast(numel)]);
++        gpa.free(all);
++        return out;
++    }
++};
++
++fn readU16(b: []const u8, at: usize) u16 {
++    return std.mem.readInt(u16, b[at..][0..2], .little);
++}
++
++fn readU32(b: []const u8, at: usize) u32 {
++    return std.mem.readInt(u32, b[at..][0..4], .little);
++}
++
++fn readU64(b: []const u8, at: usize) u64 {
++    return std.mem.readInt(u64, b[at..][0..8], .little);
++}
++
++/// A stored member's bytes into `out` (exactly its size), CRC-checked.
++fn readMember(io: std.Io, file: std.Io.File, m: Member, out: []u8) !void {
++    if (out.len != m.size) return error.BadArchive;
++    var head: [30]u8 = undefined;
++    if (try file.readPositionalAll(io, &head, m.local) != head.len) return error.ShortRead;
++    if (readU32(&head, 0) != 0x04034b50) return error.BadArchive;
++    const data: u64 = m.local + @as(u64, head.len) + @as(u64, readU16(&head, 26)) + @as(u64, readU16(&head, 28));
++    if (try file.readPositionalAll(io, out, data) != out.len) return error.ShortRead;
++    if (std.hash.Crc32.hash(out) != m.crc) return error.ChecksumMismatch;
++}
++
++/// The central directory: every member stored (method 0), zip64 records honoured.
++fn readDirectory(a: Allocator, io: std.Io, file: std.Io.File) !std.StringHashMapUnmanaged(Member) {
++    const size = try file.length(io);
++    if (size < 22) return error.BadArchive;
++    const tail_len: usize = @intCast(@min(size, 22 + 0xFFFF));
++    const tail = try a.alloc(u8, tail_len);
++    if (try file.readPositionalAll(io, tail, size - @as(u64, tail_len)) != tail_len) return error.ShortRead;
++    var at: usize = tail_len - 22;
++    while (readU32(tail, at) != 0x06054b50) {
++        if (at == 0) return error.BadArchive;
++        at -= 1;
++    }
++    var count: u64 = readU16(tail, at + 10);
++    var cd_size: u64 = readU32(tail, at + 12);
++    var cd_off: u64 = readU32(tail, at + 16);
++    if (count == 0xFFFF or cd_size == 0xFFFFFFFF or cd_off == 0xFFFFFFFF) {
++        if (at < 20 or readU32(tail, at - 20) != 0x07064b50) return error.BadArchive;
++        var rec: [56]u8 = undefined;
++        if (try file.readPositionalAll(io, &rec, readU64(tail, at - 20 + 8)) != rec.len) return error.ShortRead;
++        if (readU32(&rec, 0) != 0x06064b50) return error.BadArchive;
++        count = readU64(&rec, 32);
++        cd_size = readU64(&rec, 40);
++        cd_off = readU64(&rec, 48);
++    }
++    if (cd_size > 64 << 20 or cd_off > size or cd_size > size - cd_off) return error.BadArchive;
++    const cd = try a.alloc(u8, @intCast(cd_size));
++    if (try file.readPositionalAll(io, cd, cd_off) != cd.len) return error.ShortRead;
++    var members: std.StringHashMapUnmanaged(Member) = .empty;
++    var p: usize = 0;
++    var n: u64 = 0;
++    while (n < count) : (n += 1) {
++        if (cd.len - p < 46 or readU32(cd, p) != 0x02014b50) return error.BadArchive;
++        const method = readU16(cd, p + 10);
++        const crc = readU32(cd, p + 16);
++        var csize: u64 = readU32(cd, p + 20);
++        var usize_: u64 = readU32(cd, p + 24);
++        const nlen: usize = readU16(cd, p + 28);
++        const xlen: usize = readU16(cd, p + 30);
++        const clen: usize = readU16(cd, p + 32);
++        var local: u64 = readU32(cd, p + 42);
++        if (cd.len - p - 46 < nlen + xlen + clen) return error.BadArchive;
++        const name = cd[p + 46 ..][0..nlen];
++        var x = p + 46 + nlen;
++        const xend = x + xlen;
++        while (xend - x >= 4) {
++            const id = readU16(cd, x);
++            const len: usize = readU16(cd, x + 2);
++            if (xend - x - 4 < len) return error.BadArchive;
++            if (id == 0x0001) {
++                var f = x + 4;
++                const fend = f + len;
++                if (usize_ == 0xFFFFFFFF) {
++                    if (fend - f < 8) return error.BadArchive;
++                    usize_ = readU64(cd, f);
++                    f += 8;
++                }
++                if (csize == 0xFFFFFFFF) {
++                    if (fend - f < 8) return error.BadArchive;
++                    csize = readU64(cd, f);
++                    f += 8;
++                }
++                if (local == 0xFFFFFFFF) {
++                    if (fend - f < 8) return error.BadArchive;
++                    local = readU64(cd, f);
++                }
++            }
++            x += 4 + len;
++        }
++        if (method != 0 or csize != usize_) {
++            std.log.err("codec.pth member {s} is compressed; torch.save stores members", .{name});
++            return error.CompressedMember;
++        }
++        if (local > size or usize_ > size - local) return error.BadArchive;
++        try members.put(a, name, .{ .local = local, .size = usize_, .crc = crc });
++        p += 46 + nlen + xlen + clen;
++    }
++    return members;
++}
++
++const GlobalRef = union(enum) { ordered_dict, rebuild_tensor_v2, storage_type: DType };
++
++const Storage = struct { dtype: DType, key: []const u8, numel: u64 };
++
++const Dict = struct {
++    keys: std.ArrayList(Value) = .empty,
++    values: std.ArrayList(Value) = .empty,
++
++    fn put(d: *Dict, a: Allocator, k: Value, v: Value) !void {
++        try d.keys.append(a, k);
++        try d.values.append(a, v);
++    }
++};
++
++const Value = union(enum) {
++    none,
++    boolean: bool,
++    int: i64,
++    str: []const u8,
++    tuple: []const Value,
++    dict: *Dict,
++    global: GlobalRef,
++    storage: Storage,
++    tensor: *const Tensor,
++};
++
++const Reader = struct {
++    data: []const u8,
++    at: usize = 0,
++
++    fn bytes(r: *Reader, n: usize) ![]const u8 {
++        if (r.data.len - r.at < n) return error.BadPickle;
++        defer r.at += n;
++        return r.data[r.at..][0..n];
++    }
++
++    fn byte(r: *Reader) !u8 {
++        return (try r.bytes(1))[0];
++    }
++
++    fn int(r: *Reader, comptime T: type) !T {
++        return std.mem.readInt(T, (try r.bytes(@sizeOf(T)))[0..@sizeOf(T)], .little);
++    }
++
++    fn line(r: *Reader) ![]const u8 {
++        const end = std.mem.indexOfScalarPos(u8, r.data, r.at, '\n') orelse return error.BadPickle;
++        defer r.at = end + 1;
++        return r.data[r.at..end];
++    }
++};
++
++fn resolveGlobal(module: []const u8, name: []const u8) !GlobalRef {
++    if (std.mem.eql(u8, module, "collections") and std.mem.eql(u8, name, "OrderedDict")) return .ordered_dict;
++    if (std.mem.eql(u8, module, "torch._utils") and std.mem.eql(u8, name, "_rebuild_tensor_v2")) return .rebuild_tensor_v2;
++    if (std.mem.eql(u8, module, "torch")) if (storageType(name)) |t| return .{ .storage_type = t };
++    std.log.warn("codec.pth pickle names {s}.{s}, outside the tensor state-dict allow-list", .{ module, name });
++    return error.ForbiddenGlobal;
++}
++
++fn pop(stack: *std.ArrayList(Value)) !Value {
++    return stack.pop() orelse error.BadPickle;
++}
++
++fn topDict(stack: *std.ArrayList(Value)) !*Dict {
++    if (stack.items.len == 0) return error.BadPickle;
++    return switch (stack.items[stack.items.len - 1]) {
++        .dict => |d| d,
++        else => error.BadPickle,
++    };
++}
++
++fn newDict(a: Allocator) !*Dict {
++    const d = try a.create(Dict);
++    d.* = .{};
++    return d;
++}
++
++fn nonNegative(v: Value) !u64 {
++    return switch (v) {
++        .int => |i| if (i < 0) error.BadPickle else @intCast(i),
++        else => error.BadPickle,
++    };
++}
++
++fn intTuple(a: Allocator, v: Value) ![]const u64 {
++    const items = switch (v) {
++        .tuple => |t| t,
++        else => return error.BadPickle,
++    };
++    const out = try a.alloc(u64, items.len);
++    for (items, out) |item, *o| o.* = try nonNegative(item);
++    return out;
++}
++
++/// torch.save's persistent id for a storage: ("storage", <Type>Storage, key, location, numel).
++fn persistent(pid: Value) !Storage {
++    const t = switch (pid) {
++        .tuple => |t| t,
++        else => return error.BadPickle,
++    };
++    if (t.len != 5) return error.BadPickle;
++    if (t[0] != .str or !std.mem.eql(u8, t[0].str, "storage")) return error.BadPickle;
++    const dtype = switch (t[1]) {
++        .global => |g| switch (g) {
++            .storage_type => |d| d,
++            else => return error.BadPickle,
++        },
++        else => return error.BadPickle,
++    };
++    if (t[2] != .str or t[3] != .str) return error.BadPickle;
++    return .{ .dtype = dtype, .key = t[2].str, .numel = try nonNegative(t[4]) };
++}
++
++fn reduce(a: Allocator, f: Value, args: Value) !Value {
++    const items = switch (args) {
++        .tuple => |t| t,
++        else => return error.BadPickle,
++    };
++    const g = switch (f) {
++        .global => |g| g,
++        else => return error.BadPickle,
++    };
++    switch (g) {
++        .ordered_dict => {
++            if (items.len != 0) return error.BadPickle;
++            return .{ .dict = try newDict(a) };
++        },
++        .rebuild_tensor_v2 => {
++            // (storage, storage_offset, size, stride, requires_grad, backward_hooks[, metadata])
++            if (items.len < 6 or items.len > 7) return error.BadPickle;
++            const st = switch (items[0]) {
++                .storage => |s| s,
++                else => return error.BadPickle,
++            };
++            const shape = try intTuple(a, items[2]);
++            const stride = try intTuple(a, items[3]);
++            if (shape.len != stride.len) return error.BadPickle;
++            if (items[4] != .boolean) return error.BadPickle;
++            switch (items[5]) {
++                .dict => |d| if (d.keys.items.len != 0) return error.BadPickle,
++                else => return error.BadPickle,
++            }
++            const t = try a.create(Tensor);
++            t.* = .{ .dtype = st.dtype, .storage = st.key, .storage_numel = st.numel, .offset = try nonNegative(items[1]), .shape = shape, .stride = stride };
++            return .{ .tensor = t };
++        },
++        .storage_type => return error.BadPickle,
++    }
++}
++
++/// The state dict's tensors by name. Unknown opcodes and globals are refused, never run.
++fn unpickle(a: Allocator, data: []const u8) !std.StringHashMapUnmanaged(Tensor) {
++    var stack: std.ArrayList(Value) = .empty;
++    var marks: std.ArrayList(usize) = .empty;
++    var memo: std.AutoHashMapUnmanaged(u32, Value) = .empty;
++    var r: Reader = .{ .data = data };
++    while (true) {
++        const op = try r.byte();
++        switch (op) {
++            0x80 => { // PROTO
++                const v = try r.byte();
++                if (v < 2 or v > 5) return error.UnsupportedPickle;
++            },
++            '}' => try stack.append(a, .{ .dict = try newDict(a) }), // EMPTY_DICT
++            ')' => try stack.append(a, .{ .tuple = &.{} }), // EMPTY_TUPLE
++            '(' => try marks.append(a, stack.items.len), // MARK
++            't' => { // TUPLE
++                const at = marks.pop() orelse return error.BadPickle;
++                if (at > stack.items.len) return error.BadPickle;
++                const items = try a.dupe(Value, stack.items[at..]);
++                stack.shrinkRetainingCapacity(at);
++                try stack.append(a, .{ .tuple = items });
++            },
++            0x85, 0x86, 0x87 => { // TUPLE1, TUPLE2, TUPLE3
++                const n: usize = op - 0x84;
++                if (stack.items.len < n) return error.BadPickle;
++                const at = stack.items.len - n;
++                const items = try a.dupe(Value, stack.items[at..]);
++                stack.shrinkRetainingCapacity(at);
++                try stack.append(a, .{ .tuple = items });
++            },
++            'X' => try stack.append(a, .{ .str = try r.bytes(try r.int(u32)) }), // BINUNICODE
++            0x8c => try stack.append(a, .{ .str = try r.bytes(try r.byte()) }), // SHORT_BINUNICODE
++            'c' => { // GLOBAL
++                const module = try r.line();
++                const name = try r.line();
++                try stack.append(a, .{ .global = try resolveGlobal(module, name) });
++            },
++            'K' => try stack.append(a, .{ .int = try r.byte() }), // BININT1
++            'M' => try stack.append(a, .{ .int = try r.int(u16) }), // BININT2
++            'J' => try stack.append(a, .{ .int = try r.int(i32) }), // BININT
++            0x8a => { // LONG1
++                const n = try r.byte();
++                if (n > 8) return error.UnsupportedPickle;
++                const b = try r.bytes(n);
++                var v: i64 = 0;
++                if (n > 0) {
++                    var buf: [8]u8 = if (b[n - 1] & 0x80 != 0) @splat(0xFF) else @splat(0);
++                    @memcpy(buf[0..n], b);
++                    v = std.mem.readInt(i64, &buf, .little);
++                }
++                try stack.append(a, .{ .int = v });
++            },
++            'N' => try stack.append(a, .none),
++            0x88 => try stack.append(a, .{ .boolean = true }), // NEWTRUE
++            0x89 => try stack.append(a, .{ .boolean = false }), // NEWFALSE
++            'q', 'r' => { // BINPUT, LONG_BINPUT
++                const key: u32 = if (op == 'q') try r.byte() else try r.int(u32);
++                if (stack.items.len == 0) return error.BadPickle;
++                try memo.put(a, key, stack.items[stack.items.len - 1]);
++            },
++            'h', 'j' => { // BINGET, LONG_BINGET
++                const key: u32 = if (op == 'h') try r.byte() else try r.int(u32);
++                try stack.append(a, memo.get(key) orelse return error.BadPickle);
++            },
++            'Q' => try stack.append(a, .{ .storage = try persistent(try pop(&stack)) }), // BINPERSID
++            'R' => { // REDUCE
++                const args = try pop(&stack);
++                const f = try pop(&stack);
++                try stack.append(a, try reduce(a, f, args));
++            },
++            's' => { // SETITEM
++                const v = try pop(&stack);
++                const k = try pop(&stack);
++                try (try topDict(&stack)).put(a, k, v);
++            },
++            'u' => { // SETITEMS
++                const at = marks.pop() orelse return error.BadPickle;
++                if (at == 0 or at > stack.items.len) return error.BadPickle;
++                const d = switch (stack.items[at - 1]) {
++                    .dict => |d| d,
++                    else => return error.BadPickle,
++                };
++                const items = stack.items[at..];
++                if (items.len % 2 != 0) return error.BadPickle;
++                var i: usize = 0;
++                while (i < items.len) : (i += 2) try d.put(a, items[i], items[i + 1]);
++                stack.shrinkRetainingCapacity(at);
++            },
++            'b' => { // BUILD: the state dict's _metadata attribute, not needed to read tensors
++                switch (try pop(&stack)) {
++                    .dict, .none => {},
++                    else => return error.BadPickle,
++                }
++                _ = try topDict(&stack);
++            },
++            '.' => { // STOP
++                const root = switch (try pop(&stack)) {
++                    .dict => |d| d,
++                    else => return error.BadPickle,
++                };
++                var out: std.StringHashMapUnmanaged(Tensor) = .empty;
++                for (root.keys.items, root.values.items) |k, v| {
++                    if (k != .str or v != .tensor) return error.BadPickle;
++                    const gop = try out.getOrPut(a, k.str);
++                    if (gop.found_existing) return error.BadPickle;
++                    gop.value_ptr.* = v.tensor.*;
++                }
++                return out;
++            },
++            else => {
++                std.log.warn("codec.pth pickle opcode 0x{x:0>2} is outside the state-dict subset", .{op});
++                return error.UnsupportedPickle;
++            },
++        }
++    }
++}
++
++test "the state-dict VM reads torch.save's tensor records and their views" {
++    // A protocol-2 pickle as torch.save writes a state dict (persistent storages, _rebuild_tensor_v2,
++    // OrderedDict hooks, SETITEMS and the _metadata BUILD), built by a Python pickler without torch.
++    const fixture = [_]u8{
++        0x80, 0x02, 0x63, 0x63, 0x6f, 0x6c, 0x6c, 0x65, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x0a, 0x4f,
++        0x72, 0x64, 0x65, 0x72, 0x65, 0x64, 0x44, 0x69, 0x63, 0x74, 0x0a, 0x71, 0x00, 0x29, 0x52, 0x71,
++        0x01, 0x28, 0x58, 0x08, 0x00, 0x00, 0x00, 0x61, 0x2e, 0x77, 0x65, 0x69, 0x67, 0x68, 0x74, 0x71,
++        0x02, 0x63, 0x74, 0x6f, 0x72, 0x63, 0x68, 0x2e, 0x5f, 0x75, 0x74, 0x69, 0x6c, 0x73, 0x0a, 0x5f,
++        0x72, 0x65, 0x62, 0x75, 0x69, 0x6c, 0x64, 0x5f, 0x74, 0x65, 0x6e, 0x73, 0x6f, 0x72, 0x5f, 0x76,
++        0x32, 0x0a, 0x71, 0x03, 0x28, 0x28, 0x58, 0x07, 0x00, 0x00, 0x00, 0x73, 0x74, 0x6f, 0x72, 0x61,
++        0x67, 0x65, 0x71, 0x04, 0x63, 0x74, 0x6f, 0x72, 0x63, 0x68, 0x0a, 0x46, 0x6c, 0x6f, 0x61, 0x74,
++        0x53, 0x74, 0x6f, 0x72, 0x61, 0x67, 0x65, 0x0a, 0x71, 0x05, 0x58, 0x01, 0x00, 0x00, 0x00, 0x30,
++        0x71, 0x06, 0x58, 0x03, 0x00, 0x00, 0x00, 0x63, 0x70, 0x75, 0x71, 0x07, 0x4b, 0x06, 0x74, 0x71,
++        0x08, 0x51, 0x4b, 0x00, 0x4b, 0x02, 0x4b, 0x03, 0x86, 0x71, 0x09, 0x4b, 0x03, 0x4b, 0x01, 0x86,
++        0x71, 0x0a, 0x89, 0x68, 0x00, 0x29, 0x52, 0x71, 0x0b, 0x74, 0x71, 0x0c, 0x52, 0x71, 0x0d, 0x58,
++        0x06, 0x00, 0x00, 0x00, 0x61, 0x2e, 0x62, 0x69, 0x61, 0x73, 0x71, 0x0e, 0x68, 0x03, 0x28, 0x28,
++        0x68, 0x04, 0x68, 0x05, 0x68, 0x06, 0x68, 0x07, 0x4b, 0x06, 0x74, 0x71, 0x0f, 0x51, 0x4b, 0x04,
++        0x4b, 0x02, 0x85, 0x71, 0x10, 0x4b, 0x01, 0x85, 0x71, 0x11, 0x89, 0x68, 0x00, 0x29, 0x52, 0x71,
++        0x12, 0x74, 0x71, 0x13, 0x52, 0x71, 0x14, 0x58, 0x01, 0x00, 0x00, 0x00, 0x62, 0x71, 0x15, 0x68,
++        0x03, 0x28, 0x28, 0x68, 0x04, 0x63, 0x74, 0x6f, 0x72, 0x63, 0x68, 0x0a, 0x42, 0x46, 0x6c, 0x6f,
++        0x61, 0x74, 0x31, 0x36, 0x53, 0x74, 0x6f, 0x72, 0x61, 0x67, 0x65, 0x0a, 0x71, 0x16, 0x58, 0x01,
++        0x00, 0x00, 0x00, 0x31, 0x71, 0x17, 0x68, 0x07, 0x4d, 0x2c, 0x01, 0x74, 0x71, 0x18, 0x51, 0x4b,
++        0x00, 0x4d, 0x2c, 0x01, 0x85, 0x71, 0x19, 0x68, 0x11, 0x89, 0x68, 0x00, 0x29, 0x52, 0x71, 0x1a,
++        0x74, 0x71, 0x1b, 0x52, 0x71, 0x1c, 0x75, 0x7d, 0x71, 0x1d, 0x58, 0x09, 0x00, 0x00, 0x00, 0x5f,
++        0x6d, 0x65, 0x74, 0x61, 0x64, 0x61, 0x74, 0x61, 0x71, 0x1e, 0x68, 0x00, 0x29, 0x52, 0x71, 0x1f,
++        0x28, 0x58, 0x00, 0x00, 0x00, 0x00, 0x71, 0x20, 0x7d, 0x71, 0x21, 0x58, 0x07, 0x00, 0x00, 0x00,
++        0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x71, 0x22, 0x4b, 0x01, 0x73, 0x58, 0x01, 0x00, 0x00,
++        0x00, 0x61, 0x71, 0x23, 0x7d, 0x71, 0x24, 0x68, 0x22, 0x4b, 0x02, 0x73, 0x75, 0x73, 0x62, 0x2e,
++    };
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const tensors = try unpickle(arena.allocator(), &fixture);
++    try std.testing.expectEqual(@as(u32, 3), tensors.count());
++    const w = tensors.get("a.weight").?;
++    try std.testing.expectEqual(DType.f32, w.dtype);
++    try std.testing.expectEqualStrings("0", w.storage);
++    try std.testing.expectEqual(@as(u64, 6), w.storage_numel);
++    try std.testing.expectEqualSlices(u64, &.{ 2, 3 }, w.shape);
++    try std.testing.expectEqualSlices(u64, &.{ 3, 1 }, w.stride);
++    const b = tensors.get("a.bias").?;
++    try std.testing.expectEqual(@as(u64, 4), b.offset);
++    try std.testing.expectEqualSlices(u64, &.{2}, b.shape);
++    const c = tensors.get("b").?;
++    try std.testing.expectEqual(DType.bf16, c.dtype);
++    try std.testing.expectEqual(@as(u64, 300), c.storage_numel);
++    try std.testing.expectEqualSlices(u64, &.{300}, c.shape);
++}
++
++test "the state-dict VM refuses globals outside the allow-list" {
++    // PROTO 2; GLOBAL os.system; STOP
++    const evil = "\x80\x02cos\nsystem\n.";
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    try std.testing.expectError(error.ForbiddenGlobal, unpickle(arena.allocator(), evil));
++}
+diff --git a/zig/src/families/drama/root.zig b/zig/src/families/drama/root.zig
+index d6c7cb96..f7cc8f89 100644
+--- a/zig/src/families/drama/root.zig
++++ b/zig/src/families/drama/root.zig
+@@ -1,8 +1,11 @@
+-//! Drama 3's native CUDA backbone and temporal codebook tower.
++//! Drama 3's native CUDA backbone, temporal codebook tower and speech codec.
+ pub const backbone = @import("backbone.zig");
+ pub const tower = @import("tower.zig");
++pub const codec = @import("codec.zig");
+ 
+ test {
+     _ = backbone;
+     _ = tower;
++    _ = codec;
++    _ = @import("codec_pth.zig");
+ }

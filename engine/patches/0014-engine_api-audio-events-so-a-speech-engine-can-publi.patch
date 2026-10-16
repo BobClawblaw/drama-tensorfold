@@ -1,0 +1,223 @@
+From 59a00becc044a44e252f54c2abc00ce2251720eb Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 11:12:49 +0800
+Subject: [PATCH 14/30] engine_api: audio events, so a speech engine can
+ publish PCM while it generates
+
+A streamed speech request now receives audio events: each one hands the caller a final, rising prefix of the PCM
+before the finished event. The Drama host decodes the first frame alone, for the earliest audio, then frames in
+groups, and publishes each decoded prefix.
+---
+ zig/src/core/engine_api.zig           |  6 +++++-
+ zig/src/core/lane_host_reuse_test.zig |  6 +++---
+ zig/src/native/drama_host.zig         | 30 ++++++++++++++++++++++++---
+ zig/src/server/mailbox.zig            |  2 ++
+ zig/tests/qwen27/dflash_served.zig    |  2 +-
+ zig/tests/qwen27/reuse.zig            |  2 +-
+ zig/tests/qwen27/served.zig           |  2 +-
+ 7 files changed, 40 insertions(+), 10 deletions(-)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 9ccffa76..86da5f2c 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -93,7 +93,7 @@ pub const Request = struct {
+ /// Mono PCM written before a successful speech request's finished event.
+ pub const SpeechResult = struct { samples: usize = 0 };
+ 
+-/// The request and all its storage remain caller-owned until finished, including on cancellation.
++/// Caller-owned until finished, even on cancellation; a streamed request's pcm[0..n] is the caller's after ``audio`` n.
+ pub const SpeechRequest = struct {
+     prompt: []const u32,
+     pcm: []f32,
+@@ -103,6 +103,8 @@ pub const SpeechRequest = struct {
+     temperature: f32 = 1,
+     top_p: f32 = 0.9,
+     top_k: u32 = 30,
++    /// Decode while generating and report each final prefix with ``audio`` events; false: one decode after EOS.
++    stream: bool = false,
+ };
+ 
+ pub const SpeechInfo = struct {
+@@ -140,6 +142,8 @@ pub const Event = union(enum) {
+     prompt_logprobs: []const LogprobRow,
+     /// Tokens committed for this request, in order; valid only during the call.
+     tokens: []const u32,
++    /// A streamed speech request's samples now final, from its start: whole frames, rising, all before ``finished``.
++    audio: usize,
+     /// The reply ended; nothing follows. ``message`` says why a failed reply failed.
+     finished: struct { reason: Reason, stats: Stats = .{}, message: []const u8 = "" },
+ };
+diff --git a/zig/src/core/lane_host_reuse_test.zig b/zig/src/core/lane_host_reuse_test.zig
+index 01b1fc6b..586b0932 100644
+--- a/zig/src/core/lane_host_reuse_test.zig
++++ b/zig/src/core/lane_host_reuse_test.zig
+@@ -51,7 +51,7 @@ test "a lane host resumes a conversation from its kept prompt state and reports
+             defer b.mutex.unlock(std.testing.io);
+             switch (e.*) {
+                 .prefilled => |c| b.cached = c,
+-                .logprobs, .prompt_logprobs => {},
++                .logprobs, .prompt_logprobs, .audio => {},
+                 .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
+                 .finished => |f| b.done = f.reason,
+             }
+@@ -161,7 +161,7 @@ test "a turn's mark evicting the state it resumed from: the hit is reported firs
+             defer b.mutex.unlock(std.testing.io);
+             switch (e.*) {
+                 .prefilled => |c| b.cached = c,
+-                .logprobs, .prompt_logprobs => {},
++                .logprobs, .prompt_logprobs, .audio => {},
+                 .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
+                 .finished => |f| b.done = f.reason,
+             }
+@@ -277,7 +277,7 @@ test "a learn step that moves the weights drops every kept state: the next turn
+             defer b.mutex.unlock(std.testing.io);
+             switch (e.*) {
+                 .prefilled => |c| b.cached = c,
+-                .logprobs, .prompt_logprobs => {},
++                .logprobs, .prompt_logprobs, .audio => {},
+                 .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
+                 .finished => |f| b.done = f.reason,
+             }
+diff --git a/zig/src/native/drama_host.zig b/zig/src/native/drama_host.zig
+index b818a953..61dcd8ab 100644
+--- a/zig/src/native/drama_host.zig
++++ b/zig/src/native/drama_host.zig
+@@ -24,6 +24,8 @@ const tower_hidden = 2048;
+ const logit_cols = drama.backbone.weights.head_cols;
+ const sample_rate = 44100;
+ const frame_length = 2048;
++/// Frames a streamed request decodes together after its first, which is decoded alone for the earliest audio.
++const stream_chunk_frames = 4;
+ 
+ pub const Options = struct {
+     context: usize = 8192,
+@@ -220,7 +222,7 @@ const Host = struct {
+         const r = job.request;
+         var stats: api.Stats = .{};
+         const began = h.now();
+-        const samples = h.synthesize(r, &stats, began) catch |e| {
++        const samples = h.synthesize(job, &stats, began) catch |e| {
+             h.stream.synchronize() catch {}; // no device work outlives the request it served
+             if (e == error.Cancelled) return h.finish(job, .cancelled, stats, "");
+             std.log.warn("drama: synthesis {d} failed: {s}", .{ job.id, @errorName(e) });
+@@ -243,8 +245,9 @@ const Host = struct {
+         job.sink.event(job.sink.ctx, job.id, &event);
+     }
+ 
+-    /// Prompt pass, frame generation and codec decode into the request's PCM; returns the sample count.
+-    fn synthesize(h: *Host, r: *const api.SpeechRequest, stats: *api.Stats, began: i96) !usize {
++    /// Prompt pass, frame generation and codec decode into the request's PCM (streamed by `publish`); returns samples.
++    fn synthesize(h: *Host, job: Job, stats: *api.Stats, began: i96) !usize {
++        const r = job.request;
+         try h.check();
+         try h.ctx.makeCurrent(); // CUDA binds per thread: the worker's calls need the context current
+         const b = &h.backbone;
+@@ -283,6 +286,8 @@ const Host = struct {
+         var hidden = try lastRow(last.hidden, last.rows, b.hidden * 2);
+         var logits = try lastRow(last.semantic_logits, 1, logit_cols * 4);
+         var count: usize = 0;
++        var published: usize = 0; // frames a streamed request's caller owns
++        if (r.stream) h.codec.begin();
+         while (true) {
+             try h.check();
+             const frame = try t.generate(s, logits, hidden, sampling);
+@@ -293,6 +298,7 @@ const Host = struct {
+             count += 1;
+             h.noteFrames(count);
+             if (count == r.max_frames) return error.SpeechTruncated;
++            if (r.stream and (published == 0 or count - published == stream_chunk_frames)) published = try h.publish(job, count);
+             h.frames[0] = frame;
+             const extra = try t.setInput(s, h.frames[0..1]);
+             const rows = try b.run(s, .decode, h.frames[0][0..1], extra);
+@@ -303,6 +309,10 @@ const Host = struct {
+         if (count == 0) return error.EmptySpeech;
+ 
+         try h.check();
++        if (r.stream) {
++            if (count > published) _ = try h.publish(job, count);
++            return count * frame_length;
++        }
+         const want = count * frame_length;
+         const samples = try h.codec.decode(s, h.codes[0..count], r.pcm);
+         if (samples != want) return error.CodecSampleCount;
+@@ -311,6 +321,20 @@ const Host = struct {
+         return samples;
+     }
+ 
++    /// Decodes the frames not yet decoded, checks them, then hands pcm[0..frames * 2048] over with an `audio` event.
++    fn publish(h: *Host, job: Job, frames: usize) !usize {
++        try h.check();
++        const r = job.request;
++        const from = h.codec.decoded * frame_length;
++        const samples = try h.codec.advance(h.stream, h.codes[0..frames], r.pcm);
++        if (samples != frames * frame_length) return error.CodecSampleCount;
++        for (r.pcm[from..samples]) |x| if (!std.math.isFinite(x)) return error.NonFiniteAudio;
++        try h.check();
++        const event: api.Event = .{ .audio = samples };
++        job.sink.event(job.sink.ctx, job.id, &event);
++        return frames;
++    }
++
+     fn notePrefill(h: *Host, tokens: usize, began: i96, done: i96) void {
+         h.lock();
+         defer h.unlock();
+diff --git a/zig/src/server/mailbox.zig b/zig/src/server/mailbox.zig
+index 8a3e4e50..ec953de0 100644
+--- a/zig/src/server/mailbox.zig
++++ b/zig/src/server/mailbox.zig
+@@ -14,6 +14,7 @@ pub const Mailbox = struct {
+     prompt_rows: ?[]api.LogprobRow = null, // one a prompt token after the first, for requests with prompt_logprobs
+     cached: ?u32 = null,
+     prefilled_ns: ?i96 = null,
++    audio: usize = 0, // samples a streamed speech request has made final
+     finished: bool = false,
+     reason: api.Reason = .stop,
+     stats: api.Stats = .{},
+@@ -37,6 +38,7 @@ pub const Mailbox = struct {
+                 m.tokens.appendSlice(m.gpa, t) catch {};
+                 m.chunks.append(m.gpa, m.tokens.items.len) catch {};
+             },
++            .audio => |n| m.audio = n,
+             .finished => |f| {
+                 m.finished = true;
+                 m.reason = f.reason;
+diff --git a/zig/tests/qwen27/dflash_served.zig b/zig/tests/qwen27/dflash_served.zig
+index ca9b3c2b..b1e836a0 100644
+--- a/zig/tests/qwen27/dflash_served.zig
++++ b/zig/tests/qwen27/dflash_served.zig
+@@ -48,7 +48,7 @@ const Box = struct {
+         defer b.mutex.unlock(b.io);
+         switch (value.*) {
+             .prefilled => {},
+-            .logprobs, .prompt_logprobs => {},
++            .logprobs, .prompt_logprobs, .audio => {},
+             .tokens => |ids| {
+                 b.tokens.appendSlice(b.a, ids) catch {};
+                 if (b.cancel_after) |count| if (b.tokens.items.len >= count) if (b.engine) |engine| engine.cancel(b.id);
+diff --git a/zig/tests/qwen27/reuse.zig b/zig/tests/qwen27/reuse.zig
+index 46ce1ed9..f8aeee22 100644
+--- a/zig/tests/qwen27/reuse.zig
++++ b/zig/tests/qwen27/reuse.zig
+@@ -20,7 +20,7 @@ const Box = struct {
+         defer b.mutex.unlock(b.io);
+         switch (value.*) {
+             .prefilled => |n| b.cached = n,
+-            .logprobs, .prompt_logprobs => {},
++            .logprobs, .prompt_logprobs, .audio => {},
+             .tokens => |got| b.tokens.appendSlice(b.a, got) catch {},
+             .finished => |f| {
+                 b.done = f.reason;
+diff --git a/zig/tests/qwen27/served.zig b/zig/tests/qwen27/served.zig
+index 10f98439..858dabf5 100644
+--- a/zig/tests/qwen27/served.zig
++++ b/zig/tests/qwen27/served.zig
+@@ -18,7 +18,7 @@ const Box = struct {
+         defer b.mutex.unlock(b.io);
+         switch (value.*) {
+             .prefilled => {},
+-            .logprobs, .prompt_logprobs => {},
++            .logprobs, .prompt_logprobs, .audio => {},
+             .tokens => |ids| b.tokens.appendSlice(b.a, ids) catch {},
+             .finished => |f| {
+                 b.done = f.reason;
