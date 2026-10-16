@@ -124,8 +124,9 @@ python3 recipe/pilot.py … -- --max-frames 4096 --long-form --long-form-chars 2
 - **Delivery:** if you re-encode replies to Opus, use `-application audio` at 64 kbps or more. `voip` at 48 kbps
   cut 4-8 kHz by up to 4.8 dB in our tests.
 
-Without these flags every reply is unchanged: the 44 normal default-voice corpus replies are byte-identical,
-streams pass 9 of 9 checks, and only long-05 changes, cut at 20.8 s, 10 s into its silent stall.
+Without these flags replies are unchanged except where the silence guard ends a stall: all 46 normal default-voice
+corpus replies (23 texts, two passes) are byte-identical and streams pass 9 of 9 checks; long-05 is cut at 20.8 s,
+10 s into its silent stall.
 
 ## Status
 

@@ -36,4 +36,4 @@ b68639202cc50953852bd593b5e40a32c1a2cdfca7190121128ad36d4d7d5afb  0025-drama-the
 5af560e26556465dc04c549da8fbcabdd76e3c27404ff6621099885be091c31b  0036-drama-long-form-joins-rest-as-the-punctuation-asks-a.patch
 30be9ec92a2d7358a5b1f1de74c7dfc265d21319a29678519c0edab472a07684  0037-drama-long-form-cuts-the-fewest-balanced-segments-wh.patch
 19c5fb60232a991fed4ad7e650e7e530064d4183823fe250c5d12fd685b4fbcd  0038-drama-max-frames-lets-one-synthesis-speak-a-whole-lo.patch
-7adeacde2cb31004b60cb49af51b81ed69e79db32187aea49e74bd6276e5853d  0039-drama-a-synthesis-that-stays-silent-for-10-s-ends-th.patch
+24e53dc4f392f8ae0b90c74e96d5725368ec42fb375d2142c779ab13e897636d  0039-drama-a-synthesis-that-stays-silent-for-10-s-ends-th.patch
