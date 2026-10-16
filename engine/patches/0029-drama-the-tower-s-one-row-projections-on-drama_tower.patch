@@ -1,0 +1,425 @@
+From ef562e89cc0e1184d20a22959eb060afcb98ce23 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 11:13:28 +0800
+Subject: [PATCH 29/30] drama: the tower's one-row projections on
+ drama_tower_gemv, in cuBLASLt's summation order
+
+drama_tower_gemv sums in the order of the gemv kernel cuBLASLt picks for the tower's one-row plans. At init each
+projection is checked against its cuBLASLt plan bit for bit and uses the kernel only if they agree.
+---
+ zig/build/cuda.zig                   |   1 +
+ zig/kernels/cuda/drama_tower_gemv.cu |  87 ++++++++++
+ zig/src/cuda/kernels.zig             |   1 +
+ zig/src/families/drama/tower.zig     | 238 ++++++++++++++++++++++++++-
+ 4 files changed, 320 insertions(+), 7 deletions(-)
+ create mode 100644 zig/kernels/cuda/drama_tower_gemv.cu
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 1c8a4a17..577c4d02 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -51,6 +51,7 @@ const kernels = [_]Kernel{
+     .{ .name = "drama_backbone", .flags = glue },
+     .{ .name = "drama_backbone_gemm", .flags = &.{"-O3"} },
+     .{ .name = "drama_tower", .flags = glue },
++    .{ .name = "drama_tower_gemv", .flags = glue },
+     .{ .name = "drama_codec", .flags = glue },
+ };
+ 
+diff --git a/zig/kernels/cuda/drama_tower_gemv.cu b/zig/kernels/cuda/drama_tower_gemv.cu
+new file mode 100644
+index 00000000..4799996e
+--- /dev/null
++++ b/zig/kernels/cuda/drama_tower_gemv.cu
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: Apache-2.0
++// The tower's one-row bf16 projections y = W x in the order of the kernel cuBLASLt 13.1.1 runs for the tower's
++// one-row plans on GB10: internal::gemvx::kernel<int, int, bf16, bf16, bf16, float, false, true, true, false, 6,
++// false, ...> with block (16, 4), chunk 64, step 16, alpha 1, beta 0, no bias and no clamp. tower.zig's qualifyGemv
++// uses it for a projection only after that projection's plan reproduced it bit for bit at init. The sum for
++// output n is:
++//   p[t] = fma chain over k = t, t + 16, t + 32, .. ascending, from +0, of float(W[n][k]) * float(x[k]), t = 0..15;
++//   p[t] += p[t + 8] (t < 8), then p[t] += p[t + 4] (t < 4), p[t] += p[t + 2] (t < 2), p[0] += p[1];
++//   y[n] = bf16_rn(fma(1, p[0], 0) + 0).
++// Only the weight path differs: a warp owns 8 rows and streams them through a shared ring with cp.async, as
++// drama_backbone_gemm's one-row GEMV does; each lane then runs 4 of a row's 16 chains.
++#include <cuda_bf16.h>
++#include <stdint.h>
++
++namespace {
++
++constexpr int kRows = 8;
++constexpr int kChunk = 256;  // k a stage
++constexpr int kStages = 3;
++constexpr int kRowBytes = kChunk * 2;
++constexpr int kStageBytes = kRows * kRowBytes;
++static_assert(kRowBytes == 32 * 16, "a stage row is one 16-byte copy a lane");
++
++__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
++    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
++}
++
++// bf16 to fp32 is exact: the low and the high element of a little-endian pair.
++__device__ __forceinline__ float lo(uint32_t w) { return __uint_as_float(w << 16); }
++__device__ __forceinline__ float hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
++
++}  // namespace
++
++// Lane (g, c) = (lane / 4, lane % 4) runs chains 4c .. 4c + 3 of row g. Rows are copied unpadded, so each 128-byte
++// line lands aligned; 16-byte piece p of row r sits at p ^ 2(r % 4), so the 32 bytes a stage step reads from each
++// of a half-warp's four rows fall in distinct banks.
++// W: bf16 [N][K], 16-byte aligned rows; x: 8-byte aligned. N % 8 == 0, K % 256 == 0. Grid: N / 8; block: 32.
++extern "C" __global__ void __launch_bounds__(32) drama_tower_gemv(const __nv_bfloat16* __restrict__ x,
++                                                                  const __nv_bfloat16* __restrict__ w,
++                                                                  __nv_bfloat16* __restrict__ y, int k) {
++    __shared__ __align__(128) unsigned char ring[kStages * kStageBytes];
++    const int lane = threadIdx.x, g = lane >> 2, c = lane & 3;
++    const unsigned char* rows = reinterpret_cast<const unsigned char*>(w + static_cast<size_t>(blockIdx.x) * kRows * k);
++    const int chunks = k / kChunk;
++    auto issue = [&](int s) {
++        unsigned char* stage = ring + (s % kStages) * kStageBytes;
++#pragma unroll
++        for (int r = 0; r < kRows; ++r)
++            cp_async16(stage + r * kRowBytes + 16 * (lane ^ (2 * (r & 3))),
++                       rows + static_cast<size_t>(r) * k * 2 + static_cast<size_t>(s) * kRowBytes + 16 * lane);
++    };
++#pragma unroll
++    for (int s = 0; s < kStages - 1; ++s) {
++        if (s < chunks) issue(s);
++        asm volatile("cp.async.commit_group;\n");
++    }
++    float p[4] = {0.f, 0.f, 0.f, 0.f};
++    for (int s = 0; s < chunks; ++s) {
++        if (s + kStages - 1 < chunks) issue(s + kStages - 1);
++        asm volatile("cp.async.commit_group;\n");
++        asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 1));
++        __syncwarp();
++        const unsigned char* row = ring + (s % kStages) * kStageBytes + g * kRowBytes;
++        const uint2* xs = reinterpret_cast<const uint2*>(x + s * kChunk) + c;
++#pragma unroll
++        for (int j = 0; j < kChunk / 16; ++j) {
++            // k = 256 s + 16 j + 4 c ..: bytes 32 j + 8 c of the stage row, piece 2 j + c / 2
++            const uint2 a = *reinterpret_cast<const uint2*>(row + 16 * ((2 * j + (c >> 1)) ^ (2 * (g & 3))) + 8 * (c & 1));
++            const uint2 b = __ldg(xs + 4 * j);
++            p[0] = fmaf(lo(a.x), lo(b.x), p[0]);
++            p[1] = fmaf(hi(a.x), hi(b.x), p[1]);
++            p[2] = fmaf(lo(a.y), lo(b.y), p[2]);
++            p[3] = fmaf(hi(a.y), hi(b.y), p[3]);
++        }
++        __syncwarp();
++    }
++    // chain t = 4c + i: t + 8 is lane c + 2's p[i], t + 4 is lane c + 1's
++#pragma unroll
++    for (int i = 0; i < 4; ++i) p[i] += __shfl_down_sync(0xffffffffu, p[i], 2);
++#pragma unroll
++    for (int i = 0; i < 4; ++i) p[i] += __shfl_down_sync(0xffffffffu, p[i], 1);
++    if (c != 0) return;
++    const float sum = (p[0] + p[2]) + (p[1] + p[3]);
++    // the epilogue's fma(alpha = 1, sum, 0) and its +0 bias are exactly sum + 0 (-0 becomes +0)
++    y[blockIdx.x * kRows + g] = __float2bfloat16_rn(sum + 0.0f);
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 78066914..4c857717 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -49,6 +49,7 @@ pub const embed_rows: []const u8 = if (available) &Blob("fatbin_embed_rows").byt
+ pub const drama_backbone: []const u8 = if (available) &Blob("fatbin_drama_backbone").bytes else &.{};
+ pub const drama_backbone_gemm: []const u8 = if (available) &Blob("fatbin_drama_backbone_gemm").bytes else &.{};
+ pub const drama_tower: []const u8 = if (available) &Blob("fatbin_drama_tower").bytes else &.{};
++pub const drama_tower_gemv: []const u8 = if (available) &Blob("fatbin_drama_tower_gemv").bytes else &.{};
+ pub const drama_codec: []const u8 = if (available) &Blob("fatbin_drama_codec").bytes else &.{};
+ 
+ /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
+diff --git a/zig/src/families/drama/tower.zig b/zig/src/families/drama/tower.zig
+index f1b983f1..c4121a57 100644
+--- a/zig/src/families/drama/tower.zig
++++ b/zig/src/families/drama/tower.zig
+@@ -147,6 +147,10 @@ const Impl = struct {
+     buffers: std.ArrayList(Buffer) = .empty,
+     plans: std.ArrayList(Linear) = .empty,
+     module: ?cuda.Module = null,
++    gemv_module: ?cuda.Module = null,
++    gemv: cuda.Function = undefined,
++    /// Per projection kind: qualifyGemv found drama_tower_gemv bit-identical to its one-row plan.
++    gemv_exact: [projections.len]bool = @splat(false),
+     library: cuda.cublaslt.Library = undefined,
+     library_open: bool = false,
+     kernels: Kernels = undefined,
+@@ -184,6 +188,7 @@ const Impl = struct {
+         for (p.buffers.items) |*buffer| buffer.free();
+         p.buffers.deinit(p.gpa);
+         if (p.module) |*module| module.unload();
++        if (p.gemv_module) |*module| module.unload();
+         const gpa = p.gpa;
+         gpa.destroy(p);
+     }
+@@ -237,10 +242,71 @@ const Impl = struct {
+     }
+ 
+     fn project(p: *Impl, stream: cuda.Stream, rows: usize, kind: usize, x: Buffer, w: Buffer, out: Buffer) !void {
++        if (rows == 1 and p.gemv_exact[kind]) return p.gemvRow(stream, kind, x, w, out);
+         const plan = &p.plans.items[(rows - 1) * projections.len + kind];
+         try plan.run(x.ptr, w.ptr, out.ptr, p.workspace.ptr, p.workspace.len, stream.handle);
+     }
+ 
++    fn gemvRow(p: *Impl, stream: cuda.Stream, kind: usize, x: Buffer, w: Buffer, out: Buffer) !void {
++        comptime for (projections) |shape| std.debug.assert(shape[0] % 8 == 0 and shape[1] % 256 == 0);
++        var a: cuda.Args = .{};
++        a.add(x.ptr);
++        a.add(w.ptr);
++        a.add(out.ptr);
++        a.add(@as(i32, @intCast(projections[kind][1])));
++        try launch(p.gemv, stream, projections[kind][0] / 8, 32, 0, &a);
++    }
++
++    /// drama_tower_gemv sums in the order of the gemvx kernel cuBLASLt 13.1.1 picks for these plans on GB10, but a
++    /// plan's arithmetic is the heuristic's choice. So a projection switches only once its own one-row plan, run as
++    /// project() runs it, matched the kernel bit for bit on rows that separate association orders (probeWeights);
++    /// any other device, library or result keeps cuBLASLt, and an error commits nothing (qualifyAll).
++    fn qualifyGemv(p: *Impl, io: std.Io, ctx: *cuda.Context, kernel_dir: []const u8) !void {
++        const capability = try ctx.capability();
++        const version = p.library.api.cublasLtGetVersion();
++        if (capability != 121 or version != 130101) {
++            std.log.info("drama tower: one-row projections on cuBLASLt: drama_tower_gemv is qualified on sm 121 with cuBLASLt 130101, not sm {d} with {d}", .{ capability, version });
++            return;
++        }
++        p.gemv_module = try loadModule(p.gpa, io, p.driver, kernel_dir, "drama_tower_gemv.fatbin", cuda.kernels.drama_tower_gemv);
++        errdefer {
++            p.gemv_module.?.unload();
++            p.gemv_module = null;
++        }
++        p.gemv = try p.gemv_module.?.function("drama_tower_gemv");
++        const most = comptime blk: {
++            var m: struct { weights: usize = 0, n: usize = 0, k: usize = 0 } = .{};
++            for (projections) |shape| {
++                m.weights = @max(m.weights, shape[0] * shape[1]);
++                m.n = @max(m.n, shape[0]);
++                m.k = @max(m.k, shape[1]);
++            }
++            break :blk m;
++        };
++        const host = try p.gpa.alloc(u16, @max(probe_rows * most.k, 2 * most.n));
++        defer p.gpa.free(host);
++        var w = try Buffer.alloc(p.driver, most.weights * 2);
++        defer w.free();
++        var x = try Buffer.alloc(p.driver, most.k * 2);
++        defer x.free();
++        var planned = try Buffer.alloc(p.driver, most.n * 2);
++        defer planned.free();
++        var kernel = try Buffer.alloc(p.driver, most.n * 2);
++        defer kernel.free();
++        // blocking: its work waits for the uploads, which may return before a pageable copy has landed
++        var stream = try cuda.Stream.init(p.driver, false);
++        defer stream.deinit();
++        // drained before the scratch is freed or the image unloaded, on every path
++        defer stream.synchronize() catch {};
++        @memset(host[0..most.k], 0x3f80); // x = 1
++        try x.upload(0, std.mem.sliceAsBytes(host[0..most.k]));
++        try qualifyAll(&p.gemv_exact, GemvProbe{ .p = p, .stream = stream, .host = host, .w = w, .x = x, .planned = planned, .kernel = kernel });
++        const e = p.gemv_exact;
++        std.log.info("drama tower: one-row projections on drama_tower_gemv (1) or cuBLASLt (0): eh {d} wqkv {d} wo {d} gate_up {d} down {d} head {d}", .{
++            @intFromBool(e[0]), @intFromBool(e[1]), @intFromBool(e[2]), @intFromBool(e[3]), @intFromBool(e[4]), @intFromBool(e[5]),
++        });
++    }
++
+     fn norm(p: *Impl, stream: cuda.Stream, rows: usize, x: Buffer, residual: ?Buffer, w: Buffer, out: Buffer, residual_out: ?Buffer) !void {
+         var a: cuda.Args = .{};
+         a.add(x.ptr);
+@@ -387,6 +453,93 @@ fn launch(function: cuda.Function, stream: cuda.Stream, blocks: usize, threads:
+     try cuda.launch.launch(function, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = threads, .y = 1, .z = 1 }, .shared = shared }, stream, args);
+ }
+ 
++/// `file` from `kernel_dir`, else the embedded image.
++fn loadModule(gpa: Allocator, io: std.Io, d: *const cuda.Driver, kernel_dir: []const u8, file: []const u8, embedded: []const u8) !cuda.Module {
++    if (kernel_dir.len == 0) return cuda.Module.load(d, embedded);
++    const path = try std.fs.path.join(gpa, &.{ kernel_dir, file });
++    defer gpa.free(path);
++    const image = try std.Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .limited(1 << 26), .@"16", null);
++    defer gpa.free(image);
++    return cuda.Module.load(d, image);
++}
++
++/// Distinct probe rows: qualifyGemv repeats them down each weight matrix (every output row is summed alone).
++const probe_rows = 256;
++
++/// Each projection's decision from `probe.bitIdentical(kind)`, committed to `exact` only once all of them ran, so an
++/// error, even after earlier projections passed, leaves every projection on its plan.
++fn qualifyAll(exact: *[projections.len]bool, probe: anytype) !void {
++    var staged: [projections.len]bool = undefined;
++    for (&staged, 0..) |*s, kind| s.* = try probe.bitIdentical(kind);
++    exact.* = staged;
++}
++
++/// qualifyGemv's scratch, on its blocking stream.
++const GemvProbe = struct {
++    p: *Impl,
++    stream: cuda.Stream,
++    host: []u16,
++    w: Buffer,
++    x: Buffer,
++    planned: Buffer,
++    kernel: Buffer,
++
++    /// The projection's one-row plan, through project() while it is not yet switched, against drama_tower_gemv on
++    /// probe rows; different output fills, so an output either side failed to write cannot match.
++    fn bitIdentical(g: GemvProbe, kind: usize) !bool {
++        const n = projections[kind][0];
++        const k = projections[kind][1];
++        probeWeights(g.host[0 .. probe_rows * k], k);
++        try g.w.upload(0, std.mem.sliceAsBytes(g.host[0 .. probe_rows * k]));
++        var filled: usize = probe_rows;
++        while (filled < n) {
++            const more = @min(filled, n - filled);
++            try g.w.copyFrom(filled * k * 2, g.w.ptr, more * k * 2, g.stream.handle);
++            filled += more;
++        }
++        try g.planned.fill8(0xff, g.stream.handle);
++        try g.kernel.fill8(0x00, g.stream.handle);
++        try g.p.project(g.stream, 1, kind, g.x, g.w, g.planned);
++        try g.p.gemvRow(g.stream, kind, g.x, g.w, g.kernel);
++        try g.stream.synchronize();
++        try g.planned.download(0, std.mem.sliceAsBytes(g.host[0..n]));
++        try g.kernel.download(0, std.mem.sliceAsBytes(g.host[n .. 2 * n]));
++        return std.mem.eql(u16, g.host[0..n], g.host[n .. 2 * n]);
++    }
++};
++
++/// qualifyGemv's weights, read with x = 1. Row r pairs column c with c ^ m (m random a row, below 2048, so the pair
++/// stays inside K) and gives the pair an exactly cancelling ±2^0..2^20 value, or, one pair in eight, two independent
++/// ±2^-7..2^0 values. What survives of the small terms depends on which chains the large ones accumulated in, in
++/// which order, and the tree joining the chains, so another association order changes most rows (test below).
++fn probeWeights(w: []u16, k: usize) void {
++    for (0..w.len / k) |r| {
++        const h = splitmix(r);
++        const m: usize = @intCast(1 + h % 2047);
++        const row = w[r * k ..][0..k];
++        for (0..k) |c| {
++            const partner = c ^ m;
++            if (partner < c) continue;
++            const q = splitmix(h ^ @as(u64, c));
++            const small = (q & 7) == 0;
++            row[c] = probeValue(q, small);
++            row[partner] = if (small) probeValue(splitmix(q), true) else row[c] ^ 0x8000;
++        }
++    }
++}
++
++fn probeValue(q: u64, small: bool) u16 {
++    const exponent: u64 = if (small) 120 + (q >> 8) % 8 else 127 + (q >> 8) % 21;
++    return @intCast((q >> 24 & 1) << 15 | exponent << 7 | (q >> 16 & 0x7f));
++}
++
++fn splitmix(z0: u64) u64 {
++    var z = z0 +% 0x9e3779b97f4a7c15;
++    z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
++    z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
++    return z ^ (z >> 31);
++}
++
+ pub const Model = struct {
+     impl: *Impl,
+ 
+@@ -408,13 +561,7 @@ pub const Model = struct {
+         const p = try gpa.create(Impl);
+         p.* = .{ .gpa = gpa, .driver = ctx.d, .options = options, .semantic_start = parsed.value.semantic_start_token_id, .semantic_end = parsed.value.semantic_end_token_id, .eos = parsed.value.eos_token_id, .eps = c.norm_eps, .rope_base = c.rope_base };
+         errdefer p.release();
+-        p.module = if (kernel_dir.len == 0) try cuda.Module.load(ctx.d, cuda.kernels.drama_tower) else blk: {
+-            const kernel_path = try std.fs.path.join(gpa, &.{ kernel_dir, "drama_tower.fatbin" });
+-            defer gpa.free(kernel_path);
+-            const image = try std.Io.Dir.cwd().readFileAllocOptions(io, kernel_path, gpa, .limited(1 << 26), .@"16", null);
+-            defer gpa.free(image);
+-            break :blk try cuda.Module.load(ctx.d, image);
+-        };
++        p.module = try loadModule(gpa, io, ctx.d, kernel_dir, "drama_tower.fatbin", cuda.kernels.drama_tower);
+         p.kernels = try Kernels.resolve(p.module.?);
+         try p.kernels.sample.allowDynamicShared(sample_shared_bytes);
+         p.library = try cuda.cublaslt.Library.open();
+@@ -460,6 +607,13 @@ pub const Model = struct {
+         p.output_hidden = try p.allocate(rows * hidden * 2);
+         p.head_logits = try p.allocate(4096 * 2);
+         p.result = try p.allocate(48 + 16 * 4);
++        // The probe is an optimization: a failure that leaves the context usable keeps every projection on its plan
++        // (qualifyGemv commits nothing and unloads its image). A sticky fault poisons the context for the whole
++        // model, so that one stays fatal.
++        p.qualifyGemv(io, ctx, kernel_dir) catch |e| {
++            try ctx.synchronize();
++            std.log.warn("drama tower: one-row projections on cuBLASLt: drama_tower_gemv qualification failed: {s}", .{@errorName(e)});
++        };
+         return .{ .impl = p };
+     }
+ 
+@@ -560,3 +714,73 @@ pub const Model = struct {
+         return result[0..11].*;
+     }
+ };
++
++/// One output of a bf16 row times x = 1 summed as `chains` fp32 fma chains (strided by `chains`, or contiguous
++/// slices), joined by a halving or a sequential tree, then cuBLASLt's epilogue and the bf16 rounding.
++fn probeSum(row: []const u16, chains: usize, strided: bool, halving: bool) u16 {
++    var p: [32]f32 = @splat(0);
++    const len = row.len / chains;
++    for (0..chains) |t| for (0..len) |j| {
++        const v: f32 = @bitCast(@as(u32, row[if (strided) t + j * chains else t * len + j]) << 16);
++        p[t] = @mulAdd(f32, v, 1, p[t]);
++    };
++    if (halving) {
++        var h = chains / 2;
++        while (h >= 1) : (h /= 2) for (0..h) |t| {
++            p[t] = p[t] + p[t + h];
++        };
++    } else for (1..chains) |t| {
++        p[0] = p[0] + p[t];
++    }
++    const u: u32 = @bitCast(@mulAdd(f32, 1, p[0], 0) + 0);
++    return @truncate((u + 0x7fff + (u >> 16 & 1)) >> 16);
++}
++
++test "the gemv probe separates the one-row plans' summation order from its neighbours" {
++    const rows = probe_rows;
++    const w = try std.testing.allocator.alloc(u16, rows * intermediate);
++    defer std.testing.allocator.free(w);
++    // (chains, strided, halving tree); the first is cuBLASLt's order on GB10, the others what another kernel might do
++    const orders = [_]struct { usize, bool, bool }{
++        .{ 16, true, true }, .{ 1, true, true }, .{ 16, true, false }, .{ 8, true, true }, .{ 32, true, true }, .{ 16, false, true },
++    };
++    for (projections) |shape| {
++        const k = shape[1];
++        probeWeights(w[0 .. rows * k], k);
++        var differ: [orders.len]usize = @splat(0);
++        for (0..rows) |r| {
++            const row = w[r * k ..][0..k];
++            const model = probeSum(row, orders[0][0], orders[0][1], orders[0][2]);
++            for (orders[1..], differ[1..]) |o, *d| d.* += @intFromBool(probeSum(row, o[0], o[1], o[2]) != model);
++        }
++        // measured: each wrong order changes 211..256 of these rows, so half is a floor with margin
++        for (differ[1..]) |d| try std.testing.expect(d >= rows / 2);
++    }
++}
++
++test "gemv qualification commits its decisions only when every projection was probed" {
++    // Stands in for GemvProbe: `fail_at` injects the error any of its steps (upload, copy, fill, launch,
++    // synchronize, download) would return, at that projection.
++    const Fake = struct {
++        fail_at: usize,
++        mismatch: usize,
++        probed: *usize,
++        fn bitIdentical(f: @This(), kind: usize) !bool {
++            if (kind == f.fail_at) return error.InjectedProbeFailure;
++            f.probed.* += 1;
++            return kind != f.mismatch;
++        }
++    };
++    const none = projections.len;
++    var probed: usize = 0;
++    var exact: [projections.len]bool = @splat(false);
++    try qualifyAll(&exact, Fake{ .fail_at = none, .mismatch = 2, .probed = &probed });
++    try std.testing.expectEqual([_]bool{ true, true, false, true, true, true }, exact);
++    for (0..projections.len) |kind| {
++        exact = @splat(false);
++        probed = 0;
++        try std.testing.expectError(error.InjectedProbeFailure, qualifyAll(&exact, Fake{ .fail_at = kind, .mismatch = none, .probed = &probed }));
++        try std.testing.expectEqual(kind, probed); // every projection before it passed...
++        try std.testing.expectEqual(@as([projections.len]bool, @splat(false)), exact); // ...and none switched
++    }
++}

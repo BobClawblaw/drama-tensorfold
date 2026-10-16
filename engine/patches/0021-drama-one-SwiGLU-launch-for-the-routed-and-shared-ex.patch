@@ -1,0 +1,141 @@
+From ffb8ac68ded7b918569889a2e91f4028ba1e1ed5 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 11:13:18 +0800
+Subject: [PATCH 21/30] drama: one SwiGLU launch for the routed and shared
+ experts
+
+The routed rows are stored as their FP8 quantization and the shared expert's rows as BF16, in one launch instead
+of two, with the same arithmetic per row.
+---
+ zig/kernels/cuda/drama_backbone.cu          | 41 +++++++++++----------
+ zig/src/families/drama/backbone.zig         |  4 +-
+ zig/src/families/drama/backbone_kernels.zig | 16 +++++---
+ 3 files changed, 33 insertions(+), 28 deletions(-)
+
+diff --git a/zig/kernels/cuda/drama_backbone.cu b/zig/kernels/cuda/drama_backbone.cu
+index 1965fa35..4d54b002 100644
+--- a/zig/kernels/cuda/drama_backbone.cu
++++ b/zig/kernels/cuda/drama_backbone.cu
+@@ -564,16 +564,21 @@ extern "C" __global__ void __launch_bounds__(128) drama_act_quant(const __nv_bfl
+     if (lane == 0) s[static_cast<size_t>(r) * (K / 128) + group] = sc;
+ }
+ 
+-// SwiGLU (sgl_kernel silu_and_mul): h = bf16(silu(float(gate)) * float(up)), gate | up halves of I each in a row of
+-// gu (ld_gu apart). h_out (bf16 [rows][I]) or, for the routed experts, the h's FP8 quantization as
+-// drama_act_quant: hq [rows][I] bytes, hs fp32 [rows][I / 128]. Grid: (rows, I / 512); block 128.
+-extern "C" __global__ void __launch_bounds__(128) drama_silu_mul(const __nv_bfloat16* gu, int ld_gu, int I,
+-                                                                __nv_bfloat16* h_out, uint8_t* hq, float* hs) {
+-    const int r = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++// SwiGLU (sgl_kernel silu_and_mul): h = bf16(silu(float(gate)) * float(up)), gate | up halves of I each in a row.
++// Rows below `routed` are the routed experts' rows of gu (ld_gu apart), stored as h's FP8 quantization as
++// drama_act_quant: hq [routed][I] bytes, hs fp32 [routed][I / 128]. The rest are the shared expert's rows of sgu
++// (ld_sgu apart), stored as bf16 h_out [rows - routed][I], so both experts take one launch.
++// Grid: (rows, I / 512); block 128.
++extern "C" __global__ void __launch_bounds__(128) drama_silu_mul(const __nv_bfloat16* gu, int ld_gu, int routed,
++                                                                uint8_t* hq, float* hs, const __nv_bfloat16* sgu,
++                                                                int ld_sgu, __nv_bfloat16* h_out, int I) {
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     const int group = blockIdx.y * 4 + warp;
+     if (group * 128 >= I) return;
++    const bool quant = blockIdx.x < routed;
++    const int r = quant ? blockIdx.x : blockIdx.x - routed;
+     const int c0 = group * 128 + lane * 4;
+-    const __nv_bfloat16* row = gu + static_cast<size_t>(r) * ld_gu;
++    const __nv_bfloat16* row = quant ? gu + static_cast<size_t>(r) * ld_gu : sgu + static_cast<size_t>(r) * ld_sgu;
+     float h[4];
+     float amax = 0.f;
+ #pragma unroll
+@@ -581,23 +586,19 @@ extern "C" __global__ void __launch_bounds__(128) drama_silu_mul(const __nv_bflo
+         h[i] = round_bf(silu(bf(row[c0 + i])) * bf(row[I + c0 + i]));
+         amax = fmaxf(amax, fabsf(h[i]));
+     }
+-    if (h_out != nullptr) {
++    if (!quant) {
+ #pragma unroll
+         for (int i = 0; i < 4; ++i) h_out[static_cast<size_t>(r) * I + c0 + i] = tobf(h[i]);
++        return;
+     }
+-    if (hq != nullptr) {
+-        amax = fmaxf(warp_max(amax), 1e-10f);
+-        const float sc = amax * (1.0f / 448.0f);
+-        const float inv = __fdividef(448.0f, amax);
+-        uint32_t packed = 0;
++    amax = fmaxf(warp_max(amax), 1e-10f);
++    const float sc = amax * (1.0f / 448.0f);
++    const float inv = __fdividef(448.0f, amax);
++    uint32_t packed = 0;
+ #pragma unroll
+-        for (int i = 0; i < 4; ++i) {
+-            const float c = fminf(fmaxf(h[i] * inv, -448.0f), 448.0f);
+-            packed |= static_cast<uint32_t>(__nv_cvt_float_to_fp8(c, __NV_SATFINITE, __NV_E4M3)) << (8 * i);
+-        }
+-        *reinterpret_cast<uint32_t*>(hq + static_cast<size_t>(r) * I + c0) = packed;
+-        if (lane == 0) hs[static_cast<size_t>(r) * (I / 128) + group] = sc;
+-    }
++    for (int i = 0; i < 4; ++i) packed |= e4m3(h[i], inv) << (8 * i);
++    *reinterpret_cast<uint32_t*>(hq + static_cast<size_t>(r) * I + c0) = packed;
++    if (lane == 0) hs[static_cast<size_t>(r) * (I / 128) + group] = sc;
+ }
+ 
+ // MoE output: routed = bf16(sum over the top slots of float(down[row * top + s])) (moe_sum_reduce, scaling 1),
+diff --git a/zig/src/families/drama/backbone.zig b/zig/src/families/drama/backbone.zig
+index 4c0a4335..53754a5b 100644
+--- a/zig/src/families/drama/backbone.zig
++++ b/zig/src/families/drama/backbone.zig
+@@ -451,6 +451,7 @@ pub const Model = struct {
+         const pairs = n * top;
+         const ld = weights.moe_in_rows;
+         const I = config.expert_inner;
++        comptime std.debug.assert(config.shared_inner == I); // one SwiGLU launch serves both experts
+         try k.gemm(s, sc.normed, H, n, l.moe_in, ld, H, sc.moe_in, ld);
+         try k.topk(s, sc.moe_in + weights.router_col * 2, ld, sc.picks, sc.routed, n, top);
+         const plan: cuda.grouped.Plan = .{ .members = sc.members, .items = sc.items, .counts = sc.counts, .rank = sc.rank, .hist = sc.hist };
+@@ -468,7 +469,7 @@ pub const Model = struct {
+             .routed = null,
+             .y = sc.gu,
+         });
+-        try k.siluMul(s, sc.gu, weights.gu_rows, I, null, sc.hq, sc.hs, pairs);
++        try k.siluMul(s, sc.gu, weights.gu_rows, sc.hq, sc.hs, pairs, sc.moe_in, ld, sc.shared_h, n, I);
+         try k.expert(s, plan, pairs, .{
+             .a = sc.hq,
+             .a_div = 1,
+@@ -481,7 +482,6 @@ pub const Model = struct {
+             .routed = sc.routed,
+             .y = sc.down,
+         });
+-        try k.siluMul(s, sc.moe_in, ld, config.shared_inner, sc.shared_h, null, null, n);
+         try k.gemm(s, sc.shared_h, config.shared_inner, n, l.shared_down, H, config.shared_inner, sc.shared_out, H);
+         try k.combine(s, sc.down, top, sc.normed, l.shared_gate, sc.shared_out, sc.x, n, H);
+     }
+diff --git a/zig/src/families/drama/backbone_kernels.zig b/zig/src/families/drama/backbone_kernels.zig
+index 596e7582..f7aa40a7 100644
+--- a/zig/src/families/drama/backbone_kernels.zig
++++ b/zig/src/families/drama/backbone_kernels.zig
+@@ -325,17 +325,21 @@ pub const Kernels = struct {
+         try go(s, k.act_quant_fn, .{ rows, kdim / 512, 1 }, 128, &a);
+     }
+ 
+-    /// h = bf16(silu(gate) * up) into h_out, or its FP8 quantization into hq / hs.
+-    pub fn siluMul(k: *const Kernels, s: cuda.Stream, gu: u64, ld_gu: usize, inner: usize, h_out: ?u64, hq: ?u64, hs: ?u64, rows: usize) !void {
++    /// h = bf16(silu(gate) * up) in one launch: the routed rows of gu FP8-quantized into hq / hs, then the shared
++    /// expert's rows of shared_gu stored to h.
++    pub fn siluMul(k: *const Kernels, s: cuda.Stream, gu: u64, ld_gu: usize, hq: u64, hs: u64, routed: usize, shared_gu: u64, ld_shared: usize, h: u64, shared: usize, inner: usize) !void {
+         if (inner % 512 != 0) return error.DramaRowShape;
+         var a: cuda.Args = .{};
+         a.add(gu);
+         a.add(int(ld_gu));
++        a.add(int(routed));
++        a.add(hq);
++        a.add(hs);
++        a.add(shared_gu);
++        a.add(int(ld_shared));
++        a.add(h);
+         a.add(int(inner));
+-        a.add(h_out orelse 0);
+-        a.add(hq orelse 0);
+-        a.add(hs orelse 0);
+-        try go(s, k.silu_mul_fn, .{ rows, inner / 512, 1 }, 128, &a);
++        try go(s, k.silu_mul_fn, .{ routed + shared, inner / 512, 1 }, 128, &a);
+     }
+ 
+     pub fn combine(k: *const Kernels, s: cuda.Stream, down: u64, top: usize, x: u64, wg: u64, shared: u64, out: u64, rows: usize, width: usize) !void {
