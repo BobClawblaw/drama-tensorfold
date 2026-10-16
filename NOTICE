@@ -1,0 +1,81 @@
+Drama 3 on TensorFold: recipe and engine patches
+Copyright 2026 plotarmordev
+
+Licenses
+--------
+Two licenses apply to the contents of this repository:
+
+- Fish Audio Community License, Version 1.0 (LICENSES/FACL-1.0.md): these files, as created by the patches in
+  engine/patches/, which implement the Fish Audio Drama 3 codec:
+
+    zig/kernels/cuda/drama_codec.cu
+    zig/src/families/drama/codec.zig
+    zig/src/families/drama/codec_kernels.zig
+    zig/src/families/drama/codec_load.zig
+    zig/src/families/drama/codec_pth.zig
+    zig/tests/cuda/drama_codec_oracle.zig
+    zig/tests/cuda/drama_codec_rvq_replay.zig
+    zig/tests/cuda/drama_codec_stream_oracle.zig
+    zig/tests/cuda/drama_codec_trace.zig
+    zig/tests/cuda/drama_codec_weight_replay.zig
+
+- Apache License, Version 2.0 (LICENSE): everything else. That covers the recipe, scripts, benchmark and
+  qualification tools, results, documentation, and all other content of the engine patches.
+
+flash-linear-attention
+----------------------
+The Drama 3 backbone's chunked Gated DeltaNet prefill follows SGLang 0.5.21's chunk_gated_delta_rule
+(Apache License 2.0). Its fla/ kernels are adapted from flash-linear-attention
+(https://github.com/fla-org/flash-linear-attention), MIT License, Copyright (c) 2023-2025, Songlin Yang, Yu Zhang.
+The patches' zig/kernels/cuda/drama_gdn_chunk.cuh and zig/src/families/drama/backbone_gdn.zig mirror those
+kernels; each kernel names the source kernel it follows. The MIT license text is in
+LICENSES/MIT-flash-linear-attention.txt.
+
+TensorFold
+----------
+The engine patches apply to TensorFold (https://github.com/ashhart/TensorFold), which is licensed under the
+Apache License, Version 2.0. scripts/build-engine.sh clones TensorFold at the commit pinned in engine/UPSTREAM
+and applies the patches with `git am`.
+
+The patches modify TensorFold files. They add Drama 3 support for the native CUDA engine: new source files under
+zig/src/families/drama/, zig/src/server/ (the speech route, prompt and streaming), zig/src/native/drama_host.zig,
+zig/kernels/cuda/drama_*.cu and zig/tests/cuda/drama_*.zig. They also change existing TensorFold files in
+zig/build/, zig/src/core/, zig/src/cuda/, zig/src/native/ and zig/src/server/, plus CHANGELOG.md. Each patch's
+commit message and diff state what it changes. The patches keep TensorFold's existing file headers and notices
+unchanged.
+
+TensorFold's own NOTICE file reads:
+
+    TensorFold
+    Copyright 2026 TensorFold contributors
+    https://github.com/ashhart/TensorFold
+
+    TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
+    Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
+    MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
+    THIRD_PARTY_NOTICES.md.
+
+TensorFold's LICENSES/ and THIRD_PARTY_NOTICES.md are in the checkout that scripts/build-engine.sh creates.
+
+SGLang-Omni
+-----------
+The Drama 3 port follows the SGLang-Omni Drama 3 reference implementation
+(https://github.com/sgl-project/sglang-omni, sglang_omni/models/fishaudio_drama3, revision ab095ef9), whose
+files carry SPDX-License-Identifier: Apache-2.0. The qualification tools import the reference at run time to
+compare outputs; this repository does not include its source files.
+
+Fish Audio
+----------
+Built with Fish Audio.
+
+The codec files listed above are a Derivative Work of the Fish Audio Materials. They reimplement, in Zig and
+CUDA, Fish Speech's modded DAC: its quantizer decode (DownsampleResidualVectorQuantize.decode: RVQ codes, the
+window-limited transformer and the ConvNeXt upsampler) and its causal decoder. They follow the geometry of
+modded_dac.py and modded_dac_vq.yaml as vendored in SGLang-Omni. What changed from the original: the codec
+decodes only, never encodes. Its weights are weight-norm folded and cast to FP16, and it decodes as SGLang-Omni's
+FP16 ChannelsLastDecoder path does. codec_pth.zig reads codec.pth without Python.
+
+This repository contains no Fish Audio model weights, no codec checkpoint and no Fish Speech source code. The
+Drama 3 weights and codec are downloaded separately from Hugging Face (fishaudio/drama-3) under FACL v1.0.
+
+These Fish Audio Materials are licensed under the Fish Audio Community License, Version 1.0. Copyright © 39 AI, INC. All Rights Reserved.

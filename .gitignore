@@ -1,0 +1,30 @@
+# Model weights and checkpoints: download them, never commit them.
+*.safetensors
+*.pth
+*.pt
+*.bin
+*.gguf
+checkpoint/
+drama-3/
+drama3-checkpoint/
+
+# Engine checkout and build output from scripts/build-engine.sh
+build/
+.zig-cache/
+zig-out/
+
+# Python environments and caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Run evidence, audio and runtime caches
+runs/
+evidence/
+runtime/
+*.wav
+*.pcm
+*.f32
+*.bf16
+*.log
