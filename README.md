@@ -1,7 +1,7 @@
 # drama-tensorfold
 
 [![code: Apache-2.0](https://img.shields.io/badge/code-Apache--2.0-0969da?style=flat-square)](LICENSE)
-[![model: FACL v1.0](https://img.shields.io/badge/model-FACL_v1.0-8250df?style=flat-square)](LICENSES/FACL-1.0.md)
+[![model: FACL v1.0](https://img.shields.io/badge/model-FACL_v1.0-8250df?style=flat-square)](https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE)
 [![GPU: GB10 sm_121](https://img.shields.io/badge/GPU-GB10_sm__121-76b900?style=flat-square)](#quickstart)
 [![CUDA 13](https://img.shields.io/badge/CUDA-13-76b900?style=flat-square)](#quickstart)
 [![status: testing, not qualified](https://img.shields.io/badge/status-testing%2C_not_qualified-a16207?style=flat-square)](#status)
@@ -121,12 +121,13 @@ qualification. Every gate and result is in [`results/`](results/README.md).
 
 ## License
 
-**Built with Fish Audio.** Our code is [Apache-2.0](LICENSE), except the engine patches' codec files. Those
-reimplement Fish Speech's modded DAC and are under the [Fish Audio Community License v1.0](LICENSES/FACL-1.0.md);
-[NOTICE](NOTICE) lists them. The Drama 3 weights and codec are FACL v1.0 too, downloaded separately.
+**Built with Fish Audio.** All code here is [Apache-2.0](LICENSE), including the engine patches and their codec.
+The Drama 3 model weights and codec checkpoint are under the
+[Fish Audio Community License v1.0](https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE)
+and are downloaded separately; [NOTICE](NOTICE) has the attributions.
 
 <details>
-<summary>What FACL v1.0 allows (a summary, not legal advice: read the license)</summary>
+<summary>What FACL v1.0 allows for the weights (a summary, not legal advice: read the license)</summary>
 
 - **Research and non-commercial use is free** (II), including personal use and evaluation.
 - **Commercial use only while your Annual Revenue is under USD 500,000** (III(a)). Annual Revenue is the gross
@@ -166,4 +167,4 @@ reimplement Fish Speech's modded DAC and are under the [Fish Audio Community Lic
   A breach of IV(b) ends the license automatically (IV(f)).
 </details>
 
-[Recipe](recipe/README.md) · [Benchmarks](bench/README.md) · [Qualification](qualification/README.md) · [Results](results/README.md) · [NOTICE](NOTICE) · [Apache 2.0 license](LICENSE) · [FACL v1.0](LICENSES/FACL-1.0.md)
+[Recipe](recipe/README.md) · [Benchmarks](bench/README.md) · [Qualification](qualification/README.md) · [Results](results/README.md) · [NOTICE](NOTICE) · [Apache 2.0 license](LICENSE) · [Model license (FACL v1.0)](https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE)

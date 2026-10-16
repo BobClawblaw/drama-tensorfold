@@ -1,26 +1,11 @@
 Drama 3 on TensorFold: recipe and engine patches
 Copyright 2026 plotarmordev
 
-Licenses
---------
-Two licenses apply to the contents of this repository:
-
-- Fish Audio Community License, Version 1.0 (LICENSES/FACL-1.0.md): these files, as created by the patches in
-  engine/patches/, which implement the Fish Audio Drama 3 codec:
-
-    zig/kernels/cuda/drama_codec.cu
-    zig/src/families/drama/codec.zig
-    zig/src/families/drama/codec_kernels.zig
-    zig/src/families/drama/codec_load.zig
-    zig/src/families/drama/codec_pth.zig
-    zig/tests/cuda/drama_codec_oracle.zig
-    zig/tests/cuda/drama_codec_rvq_replay.zig
-    zig/tests/cuda/drama_codec_stream_oracle.zig
-    zig/tests/cuda/drama_codec_trace.zig
-    zig/tests/cuda/drama_codec_weight_replay.zig
-
-- Apache License, Version 2.0 (LICENSE): everything else. That covers the recipe, scripts, benchmark and
-  qualification tools, results, documentation, and all other content of the engine patches.
+License
+-------
+All code in this repository is licensed under the Apache License, Version 2.0 (LICENSE). That covers the recipe,
+scripts, benchmark and qualification tools, results, documentation and the engine patches in engine/patches/,
+including the codec files they create.
 
 flash-linear-attention
 ----------------------
@@ -68,14 +53,15 @@ Fish Audio
 ----------
 Built with Fish Audio.
 
-The codec files listed above are a Derivative Work of the Fish Audio Materials. They reimplement, in Zig and
-CUDA, Fish Speech's modded DAC: its quantizer decode (DownsampleResidualVectorQuantize.decode: RVQ codes, the
-window-limited transformer and the ConvNeXt upsampler) and its causal decoder. They follow the geometry of
-modded_dac.py and modded_dac_vq.yaml as vendored in SGLang-Omni. What changed from the original: the codec
-decodes only, never encodes. Its weights are weight-norm folded and cast to FP16, and it decodes as SGLang-Omni's
-FP16 ChannelsLastDecoder path does. codec_pth.zig reads codec.pth without Python.
+The engine's codec files (zig/kernels/cuda/drama_codec.cu, zig/src/families/drama/codec*.zig and the
+zig/tests/cuda/drama_codec_*.zig drivers) are an independent Zig/CUDA implementation of Fish Speech's published
+modded-DAC decoder design; no Fish Audio code is copied into them.
 
-This repository contains no Fish Audio model weights, no codec checkpoint and no Fish Speech source code. The
-Drama 3 weights and codec are downloaded separately from Hugging Face (fishaudio/drama-3) under FACL v1.0.
+This repository contains no Fish Audio model weights and no codec checkpoint. Users download the Drama 3 weights
+and codec checkpoint separately from Hugging Face (https://huggingface.co/fishaudio/drama-3). Those files are
+licensed under the Fish Audio Community License, Version 1.0
+(https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE), not under this
+repository's license. Anyone who redistributes them must keep this attribution notice with them, as that
+license's Section IV(a) requires:
 
-These Fish Audio Materials are licensed under the Fish Audio Community License, Version 1.0. Copyright © 39 AI, INC. All Rights Reserved.
+    These Fish Audio Materials are licensed under the Fish Audio Community License, Version 1.0. Copyright © 39 AI, INC. All Rights Reserved.
