@@ -41,7 +41,8 @@ The last row is one start per engine, not a median and not disk-cold. The refere
 conditions differed from native's, and that effect was not isolated. Evidence:
 [`results/before-after-02/`](results/before-after-02/README.md), and where each number comes from:
 [provenance](results/README.md#where-the-numbers-come-from). The speed work changed no audio: all 46 normal test
-replies stayed byte-identical across the 14 speed patches.
+replies stayed byte-identical across the 14 speed patches. These numbers predate patch 0040, which trades about 5%
+of this speed for accuracy (see [Status](#status)).
 
 ## Quickstart
 
@@ -132,11 +133,19 @@ corpus replies (23 texts, two passes) are byte-identical and streams pass 9 of 9
 
 > [!WARNING]
 > **Testing, not qualified.** Native is faster but does not meet these accuracy bars against the reference:
-> - backbone worst-row cosine 0.8006 (bar 0.8713, derived from the reference's own variance), all-row cosine
->   0.99233 (bar 0.999), last-row cosine 0.99670 (bar 0.999), hidden-state relative L2 0.124 (bar 0.05);
-> - semantic KL 0.024 (bar 0.01) and top-30 overlap 0.867 (bar 0.9);
+> - backbone all-row cosine 0.9986 (bar 0.999), last-row cosine 0.99809 (bar 0.999) and hidden-state relative L2
+>   0.0528 (bar 0.05);
 > - one-frame codec decode 33.1 dB (bar 40 dB);
 > - a 7-row tower top-1 that differs where the reference's logits tie.
+>
+> **Backbone attention** now runs the reference's 64-key softmax tiles (patch 0040). On the 182-token text fixture
+> that passes three bars it failed: worst-row cosine 0.8006 → 0.9169 (bar 0.8713, derived from the reference's own
+> variance), semantic KL 0.0243 → 0.0062 (bar 0.01) and top-30 overlap 0.867 → 0.933 (bar 0.9). On a
+> voice-reference prompt it gains nothing (relative L2 0.0552 → 0.0558, KL 0.0067 → 0.0087). It costs about 5%:
+> RTF 0.682 on the 48-request capture, against 0.642–0.650 for the previous engine in the same session, on our
+> GB10, our corpus. Replies that ended in silence went from 2 of 40 test replies (20 with expression cues) in one
+> test voice to 0 of 40, the same texts and voice; a small sample.
+> Evidence: [`results/backbone-attention-tiles.json`](results/backbone-attention-tiles.json).
 >
 > **Long text:** the model can stall in silence mid-reply: one test text recovered after 7.4 s, long-05 never
 > recovered within the 47.55 s cap. Native now ends a reply after 10 s of silence with `X-Finish-Reason: silence`.
