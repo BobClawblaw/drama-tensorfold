@@ -167,9 +167,9 @@ or IEEE float, channels averaged, resampled to 44.1 kHz) and adds `source`.
 
 On our GB10, our test voices, the native encoder's codes differ from the reference encoder's on 2.46–2.95% of
 semantic codes (three clips). Replies cloned from either encoding moved in speaker similarity to the clip by −0.0046
-to +0.0061 (ECAPA, three voices, one take each), against a spread of 0.023 across six takes of one voice
-([evidence](results/native-voice-encoder.json)). The gates, refusals and voice file format are in
-`docs/drama-voices.md` in the engine tree.
+to +0.0061 (ECAPA, three model-invented test voices, one take each), against a spread of 0.023 across six takes:
+the take noise of one model-invented voice ([evidence](results/native-voice-encoder.json)). The gates, refusals and
+voice file format are in `docs/drama-voices.md` in the engine tree.
 
 ## Status
 

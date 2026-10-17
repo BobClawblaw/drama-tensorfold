@@ -5,7 +5,7 @@
   "method": "The same clip through both encoders, one fresh process per clip; the share of codes that differ, per codebook. The reference gave identical codes on two runs of the same clip.",
   "clips": [
    {
-    "clip": "recorded test voice, 15.7 s",
+    "clip": "model-invented test voice 3, 15.7 s",
     "frames": 339,
     "semantic_differ_pct": 2.95,
     "residual_differ_pct": [
@@ -61,7 +61,7 @@
   "method": "Each voice encoded by both encoders from the same clip, then one reply to the same text rendered from each voice file (one take per side, an engine before patch 0040). Speaker similarity is the ECAPA cosine (speechbrain/spkrec-ecapa-voxceleb) of the reply to its own clip; WER is Whisper's.",
   "pairs": [
    {
-    "voice": "recorded test voice",
+    "voice": "model-invented test voice 3",
     "similarity": {
      "reference": 0.9097,
      "native": 0.9158
@@ -102,7 +102,7 @@
    0.0061
   ],
   "take_noise": {
-   "method": "Six earlier takes of the recorded test voice on the same text.",
+   "method": "Six earlier takes of model-invented test voice 3 on the same text: the take noise of one model-invented voice.",
    "similarity_range": [
     0.9028,
     0.9255
