@@ -51,3 +51,4 @@ c85eaf351f813c307a8f9e750187553e9b7e87c15cffb13fd602f16fbb827036  0049-drama-cli
 2ce25d4edbeb1e4894810fcc0450d5b891ff5ecba9f16684e6bb4ce6674afe82  0051-drama-tensorfold-native-voice-encode-writes-a-voice-.patch
 a681c33f23534eb7f0ce0b20edb039caab20c7de08817c652af9be671b8fcf70  0052-drama-voice-encode-checks-a-WAV-s-whole-container-an.patch
 cd8c2954fd73634406e0d398be501c22b3beabf216fd0698b7cf4ec5b9a56cf5  0053-drama-voice-docs-say-only-what-was-measured-of-the-e.patch
+f2358220d442d3a768260212bfbcf9ee4b612cff2f3c5a9bbf487e8bd2786ae1  0054-drama-clip-preparation-tells-two-speakers-apart-by-t.patch

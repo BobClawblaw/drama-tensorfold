@@ -1,0 +1,308 @@
+From 6eedbde9fb1ccf0fadd022742dae7e6e0e994d78 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:58:53 +0800
+Subject: [PATCH 54/54] drama: clip preparation tells two speakers apart by
+ timbre, not pitch
+
+Each stretch of speech between pauses gets its mean mel cepstra over 6 ms frames to 16 kHz; a short frame blurs the harmonics, so the cepstra follow the pitch less, though an octave jump still shows. The cepstra are whitened in the directions that vary by more than a millionth of the widest. A weighted two-means split, started from the stretch means' principal axis, puts the stretches in two groups, and the split sqrt(T^2 / rank), T^2 being the groups' two-sample Hotelling statistic over the rank whitened directions, is refused over 5.6. Groups that differ in a direction neither varies in, where the pooled covariance cannot measure the gap, are refused as two speakers rather than scored. The threshold is empirical, set on model-invented voices and synthetic mixes of them only, with margins of 0.73 and 0.80 on a small set. A take with fewer than two stretches of speech, or fewer than 12 measurable spectral directions (a repeated sound, for one), is refused instead of passed. Pitch spread is still reported but refuses nothing. Frame levels floor at -200 dB, so a take recorded quietly measures as a loud one does. The synthetic voices in the tests now have formants.
+---
+ CHANGELOG.md                       |   1 +
+ docs/drama-voices.md               |  13 +++-
+ tools/zig/drama_voice_clip.py      | 100 ++++++++++++++++++++++++++---
+ tools/zig/drama_voice_clip_test.py |  72 ++++++++++++++++++---
+ 4 files changed, 164 insertions(+), 22 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1f072299..41da8555 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
+ 
+ ## Unreleased
+ 
++- speech: `drama_voice_clip.py` tells two speakers apart by timbre instead of pitch, so an expressive single voice is no longer refused for its pitch range. A weighted two-means split puts its stretches of speech in two groups by their mel cepstra (6 ms frames to 16 kHz), and a split `sqrt(T² / rank)` over 5.6 is refused, T² being the groups' two-sample Hotelling statistic over the rank whitened directions; groups apart in a direction neither varies in are refused outright. The threshold is empirical, set on model-invented voices and synthetic mixes of them only: one voice measured up to 4.87 and two in a full-band take from 6.40, margins of 0.73 and 0.80 on a small set. A take with fewer than two stretches of speech, or a spectrum too degenerate to measure, is refused instead of passed. The report adds `speaker_split`; `pitch_spread_semitones` refuses nothing now ([docs](docs/drama-voices.md))
+ - speech: a voice file says whose voice it holds. `source` is `{kind: model-invented | owner | consented, note}`, the operator's attestation, and `--voices` refuses a file without one or with a blank note. `GET /v1/voices` lists the loaded voices (name, frames, seconds, source kind); there is no upload route. `tools/zig/drama_voice_clip.py` prepares a take: mono 44.1 kHz aimed at -20 dBFS speech level within -1 dBFS peaks, cut at a pause to a 10-30 s clip, refused when short, clipped, noisy (judged on the kept clip), over music or hum, or voiced by more than one speaker. Its transcript is either the take's, kept only when the cut leaves no loud frame out, or a local Whisper draft to correct; a confirmed transcript is never paired with a re-prepared clip. `drama_voice.py` encodes with `--reference` or `--native` when given, else with a `tensorfold-native` on `PATH` whose `--help` lists `voice encode` ([docs](docs/drama-voices.md))
+ - speech: `tensorfold-native voice encode CLIP.wav --model DIR --text T --name NAME --out NAME.json` writes a Drama 3 voice file with a native CUDA codec encoder (DAC encoder, pre_module and RVQ in BF16), no Python; on three of our test clips, 2.5 to 3 % of its semantic codes differ from the reference's ([docs](docs/drama-voices.md))
+ - speech: the Drama 3 backbone's full attention runs the reference's softmax schedule: one running max per 64-key tile, with the reference kernel's exp, division, gate sigmoid and fused multiply-adds. On our GB10, the attention operator now matches the reference on 98.1% and 96.2% of its outputs at layers 3 and 39 (was 70.4% and 57.5%), and on our 182-token text fixture the backbone's distance to the reference fell from 0.124 to 0.053 relative L2 (semantic KL 0.024 to 0.0062, worst row cosine 0.80 to 0.92). Rows keep their bits whatever the chunk size, and decode uses the same arithmetic.
+diff --git a/docs/drama-voices.md b/docs/drama-voices.md
+index f88f2222..4675791f 100644
+--- a/docs/drama-voices.md
++++ b/docs/drama-voices.md
+@@ -29,9 +29,18 @@ The tool reads WAV, FLAC, Ogg and MP3, and writes 16-bit mono 44.1 kHz.
+   - the kept clip, counted from its first loud frame to its last plus the 0.25 s edges, would be shorter than 10 s, or there is no pause to cut at. Pauses count toward that duration;
+   - its background is less than 30 dB under the speech, on the whole take and again on the kept clip;
+   - its pauses hold a steady tone, music or hum (an octave band from 100 Hz to 6.4 kHz with spectral flatness under 0.1);
+-  - the median pitch of its stretches of speech spreads more than 6 semitones between the 20th and 80th percentile.
++  - its stretches of speech fall into two groups too far apart to be one voice (the speaker split, below), or it has fewer than two stretches to compare, or its spectrum varies too little to be measured.
+ - **Limits.** The gates are cheap.
+-  - The speaker check hears pitch only. It misses two speakers of a similar pitch, and a speaker who moves between very different registers can trip it.
++  - **Speaker split.** An empirically thresholded heuristic, not a calibrated test.
++    - Each stretch between pauses with at least 0.3 s of loud frames gets the mean of 36 mel cepstra, over 6 ms frames from 80 Hz to 16 kHz. A frame that short blurs the harmonics, so the cepstra follow the pitch less than a longer frame would; a jump of an octave still shows.
++    - The cepstra are whitened over the clip, in the directions that vary by more than a millionth of the widest. A take with fewer than 12 such directions is refused as unmeasurable; a repeated sound is one cause. Bandwidth alone does not decide it: synthetic speech low-passed at 2 kHz kept 27 directions.
++    - A weighted two-means split, started from the stretch means' principal axis, puts the stretches in two groups. With T² the two groups' two-sample Hotelling statistic (their mean difference over their pooled covariance) and rank the number of whitened directions, the split is `sqrt(T² / rank)`. A split over 5.6 is refused as two speakers.
++    - When the groups differ in a direction in which neither varies inside itself, the pooled covariance cannot measure that gap, and the take is refused as two speakers rather than scored.
++    - The groups are chosen from the same frames they are measured on, and neighbouring frames are correlated, so the split has no fixed chance level, and it grows with the number of frames. 5.6 is set by measurement only.
++    - The report gives `speaker_split`; `pitch_spread_semitones` is reported for reference and refuses nothing.
++  - Calibration, offline, on model-invented voices and synthetic mixes of them only: 17 single-voice clips, each whole, cut to 10-16 s and low-passed at 8 kHz, measured up to 4.87. Two-voice takes from four of those voices (one after the other, 3 s turns, 6 s each, a 3 s interjection) measured from 6.40 at full band. The margins are thin, 0.73 under 5.6 and 0.80 over it, and the set is small; a real recording of two people, or a more expressive single speaker, may land on the wrong side.
++  - It misses two speakers whose timbre is close in a band-limited take: low-passed at 8 kHz, 2 of 12 two-voice takes stayed under 5.6. It also misses a second voice with no stretch of its own (under 0.3 s between pauses, or speakers who overlap or hand over without a 0.15 s pause).
++  - It can refuse one voice whose timbre changes between stretches: a change of microphone or room within the take, whispering then shouting, or (on synthetic speech) a jump of an octave between sentences.
+   - Music or noise more than 60 dB under the speech is not checked.
+   - The noise floor is read from the quietest tenth of the kept clip, so a clip with almost no pauses reads as noisy.
+ - **Transcript.** It must be the exact words of the clip as cut.
+diff --git a/tools/zig/drama_voice_clip.py b/tools/zig/drama_voice_clip.py
+index 4abb75d4..c06773b8 100644
+--- a/tools/zig/drama_voice_clip.py
++++ b/tools/zig/drama_voice_clip.py
+@@ -26,7 +26,19 @@ MIN_SNR_DB = 30.0
+ # Band flatness under this in the pauses is a tone, music or hum, not room noise; under AUDIBLE_DB nobody hears it.
+ MIN_FLATNESS = 0.1
+ AUDIBLE_DB = 60.0
+-MAX_SPREAD_ST = 6.0
++# Mel cepstra to 16 kHz follow the vocal tract, which one voice's pitch and loudness move far less than a second voice.
++CEPSTRA, MEL_BANDS, MEL_LOW, MEL_HIGH, SPECTRUM = 36, 80, 80.0, 16000.0, 2048
++# 6 ms: a short frame blurs the harmonics, so the cepstra follow the pitch less; an octave jump still shows.
++ENVELOPE_SAMPLES = 256
++STRETCH_FRAMES = 30
++# Speech's cepstra vary over at most 1e4 to one; a direction under a millionth of the widest is round-off or leakage.
++RANK_TOLERANCE = 1e-6
++# Fewer directions than this cannot tell voices apart: a repeated sound, for one.
++MIN_RANK = 12
++# Whitened, a direction that varies only between the groups opens a gap of at least 2; under this it is round-off.
++NULL_GAP = 1e-3
++# Empirical, on model-invented voices: one measured up to 4.9, two in one full-band take from 6.4.
++MAX_SPEAKER_SPLIT = 5.6
+ WINDOW = 4096
+ BANDS = (100, 200, 400, 800, 1600, 3200)
+ 
+@@ -55,7 +67,8 @@ def resample(x: np.ndarray, rate: int, to: int) -> np.ndarray:
+ 
+ def frame_db(x: np.ndarray) -> np.ndarray:
+     n = len(x) // HOP
+-    return 10 * np.log10(np.mean(x[: n * HOP].reshape(n, HOP) ** 2, axis=1) + 1e-10)
++    # -200 dB: only digital silence reaches the floor, so a quiet take measures as a loud one does
++    return 10 * np.log10(np.mean(x[: n * HOP].reshape(n, HOP) ** 2, axis=1) + 1e-20)
+ 
+ 
+ def speech_level(db: np.ndarray) -> float:
+@@ -123,16 +136,21 @@ def pitch(x: np.ndarray) -> np.ndarray:
+     return f0
+ 
+ 
++def stretches(db: np.ndarray, level: float) -> list[tuple[int, int]]:
++    """The [start, end) frames of speech between pauses."""
++    talk = np.ones(len(db), bool)
++    for start, end in pauses(db < level - QUIET_DB):
++        talk[start:end] = False
++    return runs(talk)
++
++
+ def pitch_spread(x: np.ndarray, db: np.ndarray, level: float) -> tuple[float, int]:
+     """Semitones between the 20th and 80th percentile, by voiced time, of each stretch of speech's median pitch."""
+     f0 = pitch(x)
+     centre = 2 * np.arange(len(f0)) + 2
+     heard = ~np.isnan(f0) & (db[centre] >= level - 15)
+-    talk = np.ones(len(db), bool)
+-    for start, end in pauses(db < level - QUIET_DB):
+-        talk[start:end] = False
+     medians, weights = [], []
+-    for start, end in runs(talk):
++    for start, end in stretches(db, level):
+         voiced = f0[heard & (centre >= start) & (centre < end)]
+         if len(voiced) >= 25:
+             medians.append(12 * np.log2(np.median(voiced) / 55))
+@@ -145,6 +163,66 @@ def pitch_spread(x: np.ndarray, db: np.ndarray, level: float) -> tuple[float, in
+     return float(sorted_medians[np.argmax(share >= 0.8)] - sorted_medians[np.argmax(share >= 0.2)]), len(medians)
+ 
+ 
++def mel_bank() -> np.ndarray:
++    """Triangular mel bands from MEL_LOW to MEL_HIGH over the bins of a SPECTRUM-point FFT."""
++    mel = 2595 * np.log10(1 + np.array([MEL_LOW, MEL_HIGH]) / 700)
++    edges = 700 * (10 ** (np.linspace(*mel, MEL_BANDS + 2) / 2595) - 1)
++    freqs = np.fft.rfftfreq(SPECTRUM, 1 / RATE)
++    low, centre, high = edges[:-2, None], edges[1:-1, None], edges[2:, None]
++    return np.clip(np.minimum((freqs - low) / (centre - low), (high - freqs) / (high - centre)), 0, None)
++
++
++def cepstra(x: np.ndarray, frames: np.ndarray) -> np.ndarray:
++    """Mel cepstra 1 to CEPSTRA of the 10 ms frames `frames`, each over the ENVELOPE_SAMPLES around its centre."""
++    at = np.clip(frames[:, None] * HOP + HOP // 2 - ENVELOPE_SAMPLES // 2 + np.arange(ENVELOPE_SAMPLES), 0, len(x) - 1)
++    power = np.abs(np.fft.rfft(x[at] * np.hanning(ENVELOPE_SAMPLES), SPECTRUM, axis=1)) ** 2
++    dct = np.cos(np.pi / MEL_BANDS * (np.arange(MEL_BANDS) + 0.5) * np.arange(1, CEPSTRA + 1)[:, None])
++    return np.log(power @ mel_bank().T + 1e-10) @ dct.T
++
++
++def two_groups(means: np.ndarray, weights: np.ndarray) -> np.ndarray:
++    """Weighted 2-means of `means`, started from the split along their main axis; True marks one group."""
++    centred = means - np.average(means, axis=0, weights=weights)
++    side = centred @ np.linalg.svd(centred * np.sqrt(weights)[:, None], full_matrices=False)[2][0] > 0
++    for _ in range(50):
++        if side.all() or not side.any():
++            break
++        near = [np.average(means[group], axis=0, weights=weights[group]) for group in (side, ~side)]
++        moved = ((means - near[0]) ** 2).sum(axis=1) < ((means - near[1]) ** 2).sum(axis=1)
++        if (moved == side).all():
++            break
++        side = moved
++    return side
++
++
++def speaker_split(x: np.ndarray, db: np.ndarray, level: float) -> float:
++    """sqrt(T² / rank): T² is Hotelling's two-sample statistic of the two groups a weighted two-means split gives."""
++    loud = np.flatnonzero(db >= level - 20)
++    groups = [group for start, end in stretches(db, level) if len(group := np.flatnonzero((loud >= start) & (loud < end))) >= STRETCH_FRAMES]
++    if len(groups) < 2:
++        raise SystemExit("fewer than two stretches of speech between pauses, so a second speaker cannot be ruled out: pause between sentences")
++    found = cepstra(x, loud)
++    spread, axes = np.linalg.eigh(np.cov(found.T))
++    kept = spread > spread[-1] * RANK_TOLERANCE
++    rank = int(kept.sum())
++    if rank < MIN_RANK:
++        raise SystemExit(f"the voice cannot be measured: its spectrum changes in {rank} of {CEPSTRA} directions (a repeated sound, for one)")
++    # whitened in the directions that vary, so the stretches group by each alike
++    z = (found - found.mean(axis=0)) @ axes[:, kept] / np.sqrt(spread[kept])
++    side = two_groups(np.array([z[group].mean(axis=0) for group in groups]), np.array([len(group) for group in groups], float))
++    if side.all() or not side.any():
++        # the stretches' means coincide: nothing sets one apart
++        return 0.0
++    a, b = (z[np.concatenate([group for group, s in zip(groups, side) if s == which])] for which in (True, False))
++    pooled = ((len(a) - 1) * np.cov(a.T) + (len(b) - 1) * np.cov(b.T)) / (len(a) + len(b) - 2)
++    within, along = np.linalg.eigh(pooled)
++    held = within > within[-1] * RANK_TOLERANCE
++    gap = (a.mean(axis=0) - b.mean(axis=0)) @ along
++    if np.any(np.abs(gap[~held]) > NULL_GAP):
++        raise SystemExit("the stretches fall into two groups that do not overlap at all in one direction: more than one speaker")
++    return float(np.sqrt(np.sum(gap[held] ** 2 / within[held]) / (rank * (1 / len(a) + 1 / len(b)))))
++
++
+ def noise(db: np.ndarray, level: float) -> float:
+     """Decibels from the speech level down to the quietest tenth of the frames; with too few pauses it reads low."""
+     snr = level - float(np.percentile(db, 10))
+@@ -174,9 +252,10 @@ def prepare(x: np.ndarray, rate: int) -> tuple[np.ndarray, dict]:
+     tonal = flatness(x, db, level)
+     if tonal is not None and tonal < MIN_FLATNESS:
+         raise SystemExit(f"the pauses hold a steady tone (band flatness {tonal:.3f}): music or hum under the voice")
+-    spread, stretches = pitch_spread(x, db, level)
+-    if spread > MAX_SPREAD_ST:
+-        raise SystemExit(f"the pitch moves {spread:.1f} semitones between stretches of speech: more than one speaker")
++    split = speaker_split(x, db, level)
++    if split > MAX_SPEAKER_SPLIT:
++        raise SystemExit(f"the voice changes between stretches of speech (split {split:.1f}, one voice under {MAX_SPEAKER_SPLIT}): more than one speaker")
++    spread, stretches_found = pitch_spread(x, db, level)
+     gain = min(LEVEL_DBFS - level, PEAK_DBFS - 20 * float(np.log10(np.max(np.abs(x)))))
+     report = {
+         "seconds": round(len(x) / RATE, 2),
+@@ -186,8 +265,9 @@ def prepare(x: np.ndarray, rate: int) -> tuple[np.ndarray, dict]:
+         "gain_db": round(gain, 2),
+         "snr_db": round(snr, 1),
+         "pause_flatness": None if tonal is None else round(tonal, 3),
++        "speaker_split": round(split, 2),
+         "pitch_spread_semitones": round(spread, 2),
+-        "speech_stretches": stretches,
++        "speech_stretches": stretches_found,
+     }
+     return x * 10 ** (gain / 20), report
+ 
+diff --git a/tools/zig/drama_voice_clip_test.py b/tools/zig/drama_voice_clip_test.py
+index e11704fb..c987638c 100644
+--- a/tools/zig/drama_voice_clip_test.py
++++ b/tools/zig/drama_voice_clip_test.py
+@@ -12,22 +12,31 @@ import soundfile as sf
+ import drama_voice_clip as clip
+ 
+ RATE = clip.RATE
++# Peterson and Barney's adult male averages for /a i u e o/: F1, F2, F3 in Hz.
++VOWELS = ((730, 1090, 2440), (270, 2290, 3010), (300, 870, 2240), (530, 1840, 2480), (570, 840, 2410))
+ 
+ 
+-def word(f0: float, seconds: float, rate: int) -> np.ndarray:
+-    """A voiced syllable: eight harmonics under a Hann envelope, with half a semitone of vibrato."""
++def word(f0: float, seconds: float, rate: int, tract: float, vowel: int) -> np.ndarray:
++    """A voiced syllable: harmonics to 16 kHz shaped by a vowel's formants scaled by `tract`, with vibrato."""
+     t = np.arange(int(seconds * rate)) / rate
+     phase = 2 * np.pi * np.cumsum(f0 * 2 ** (0.5 * np.sin(2 * np.pi * 4 * t) / 12)) / rate
+-    return np.hanning(len(t)) * sum(np.sin(k * phase) / k for k in range(1, 9))
++    k = np.arange(1, int(min(16000, rate / 2 - 500) / f0) + 1)
++    gain = 1 / k
++    for formant in (*VOWELS[vowel], 3500, 4500):
++        f, width = formant * tract, 60 + 0.06 * formant * tract
++        gain = gain / np.sqrt((1 - (k * f0 / f) ** 2) ** 2 + (k * f0 * width / f**2) ** 2)
++    sound = np.hanning(len(t)) * (gain[:, None] * np.sin(k[:, None] * phase)).sum(axis=0)
++    return sound / np.max(np.abs(sound))
+ 
+ 
+-def speech(f0s: list[float], rate: int = RATE, rests: tuple[float, ...] = (0.6,)) -> tuple[np.ndarray, list[tuple[float, float]]]:
+-    """A six-word sentence per f0 after 0.4 s of quiet, each followed by the next of `rests`; and those rests, in s."""
++def speech(f0s: list[float], rate: int = RATE, rests: tuple[float, ...] = (0.6,), tracts: tuple[float, ...] = (1.0,)) -> tuple[np.ndarray, list[tuple[float, float]]]:
++    """Six-word sentences after 0.4 s of quiet, one per f0, in turn by `tracts` and followed by `rests`."""
+     gap = 0.05
+     parts, quiet, at = [np.zeros(int(0.4 * rate))], [], 0.4
+     for i, f0 in enumerate(f0s):
+         rest = rests[i % len(rests)]
+-        sentence = np.concatenate([np.concatenate((word(f0, 0.25, rate), np.zeros(int(gap * rate)))) for _ in range(6)])
++        syllables = [word(f0, 0.25, rate, tracts[i % len(tracts)], (3 * i + j) % len(VOWELS)) for j in range(6)]
++        sentence = np.concatenate([np.concatenate((syllable, np.zeros(int(gap * rate)))) for syllable in syllables])
+         parts += [sentence, np.zeros(int(rest * rate))]
+         at += len(sentence) / rate
+         quiet.append((at - gap, at + rest))
+@@ -110,11 +119,54 @@ class PrepareTests(unittest.TestCase):
+         chord = sum(np.sin(2 * np.pi * f * t) for f in (220.0, 277.2, 329.6, 440.0))
+         self.assertIn("music or hum", self.refusal(x + 0.0015 * chord))
+ 
+-    def test_two_speakers_are_refused_and_one_speakers_intonation_is_not(self):
+-        self.assertIn("more than one speaker", self.refusal(speech([110.0, 220.0] * 4)[0]))
+-        _, report = clip.prepare(speech([110.0, 140.0, 125.0, 115.0, 135.0, 120.0])[0], RATE)
++    def test_one_voice_ranging_over_seven_semitones_is_one_speaker(self):
++        _, report = clip.prepare(speech([110.0, 190.0, 130.0, 175.0, 120.0, 185.0])[0], RATE)
++        # 6 semitones was the pitch-only check's limit
++        self.assertGreater(report["pitch_spread_semitones"], 6.0)
+         self.assertEqual(report["speech_stretches"], 6)
+-        self.assertLess(report["pitch_spread_semitones"], clip.MAX_SPREAD_ST)
++
++    def test_two_voices_at_one_pitch_are_refused_turn_by_turn_and_one_after_the_other(self):
++        # a vocal tract 15% shorter: about a man's against a woman's
++        for tracts in ((1.0, 1.15), (1.0,) * 4 + (1.15,) * 4):
++            self.assertIn("more than one speaker", self.refusal(speech([120.0] * 8, tracts=tracts)[0]))
++
++    def test_a_take_with_nothing_above_8_khz_is_still_one_speaker(self):
++        x, _ = speech([110.0, 190.0, 130.0, 175.0, 120.0, 185.0])
++        spectrum = np.fft.rfft(x)
++        spectrum[np.fft.rfftfreq(len(x), 1 / RATE) > 8000] = 0
++        _, report = clip.prepare(np.fft.irfft(spectrum, len(x)), RATE)
++        self.assertLess(report["speaker_split"], clip.MAX_SPEAKER_SPLIT)
++
++    def test_a_take_with_nothing_above_2_khz_is_measured_on_the_directions_it_has(self):
++        x, _ = speech([110.0, 190.0, 130.0, 175.0, 120.0, 185.0])
++        # digital silence in the pauses, so the hum check, which needs the 3.2-6.4 kHz band, has nothing to judge
++        spectrum = np.fft.rfft(np.where(np.abs(x) < 1e-3, 0.0, x))
++        spectrum[np.fft.rfftfreq(len(x), 1 / RATE) > 2000] = 0
++        _, report = clip.prepare(np.fft.irfft(spectrum, len(x)), RATE)
++        self.assertTrue(np.isfinite(report["speaker_split"]))
++        self.assertLess(report["speaker_split"], clip.MAX_SPEAKER_SPLIT)
++
++    def test_a_repeated_sound_is_refused_as_unmeasurable(self):
++        noise = 0.2 * np.random.default_rng(3).standard_normal(441)
++        parts = [np.zeros(RATE // 2)] + [part for _ in range(6) for part in (np.tile(noise, 400), np.zeros(int(0.6 * RATE)))]
++        self.assertIn("cannot be measured", self.refusal(np.concatenate(parts)))
++
++    def test_a_take_without_two_stretches_of_speech_is_refused_unchecked(self):
++        # 0.05 s rests are no pauses: twelve seconds of one stretch
++        self.assertIn("fewer than two stretches", self.refusal(speech([120.0] * 6, rests=(0.05,))[0]))
++
++    def test_groups_apart_in_a_direction_neither_varies_in_are_two_speakers(self):
++        x, _ = speech([120.0] * 8)
++        shared = np.random.default_rng(4).standard_normal((4000, clip.CEPSTRA - 1))
++
++        def cepstra(_, frames):
++            # the same within-group spread on both sides of the middle frame; only the last cepstrum tells them apart
++            first = np.arange(len(frames)) < len(frames) // 2
++            rows = np.where(first, np.arange(len(frames)), np.arange(len(frames)) - len(frames) // 2)
++            return np.column_stack((shared[rows], np.where(first, 10.0, -10.0)))
++
++        with patch.object(clip, "cepstra", cepstra):
++            self.assertIn("more than one speaker", self.refusal(x))
+ 
+     def test_too_short_uncuttable_and_mid_word_clips_are_refused(self):
+         self.assertIn("a voice needs 10 s", self.refusal(speech([120.0] * 3)[0]))
+-- 
+2.43.0
+

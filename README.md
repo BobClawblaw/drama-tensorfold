@@ -159,9 +159,11 @@ curl -sS http://127.0.0.1:18793/v1/voices
 ```
 
 The clip tool levels the take, cuts it at a pause and refuses clipped, short or noisy takes. Its other gates are
-cheap heuristics: a tonal check on the pauses for steady music or hum, and a pitch-spread check for a second
-speaker. They miss two speakers of a similar pitch and music more than 60 dB under the speech, and can refuse one
-speaker who moves between very different registers, so listen to the clip before encoding it. `--asr WHISPER_DIR`
+cheap heuristics: a tonal check on the pauses for steady music or hum, and a speaker check on timbre, a weighted
+two-means split of the stretches' mel cepstra with an empirical threshold set on model-invented voices
+([calibration](results/clip-speaker-check.json)). They miss two speakers of close timbre in
+a band-limited take, a second voice with no stretch of its own and music more than 60 dB under the speech, and can
+refuse one speaker whose timbre changes within the take, so listen to the clip before encoding it. `--asr WHISPER_DIR`
 instead of `--text` drafts a transcript to correct. The encoder runs `tensorfold-native voice encode` (WAV in PCM
 or IEEE float, channels averaged, resampled to 44.1 kHz) and adds `source`.
 
