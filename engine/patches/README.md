@@ -21,5 +21,6 @@ downloaded separately; see [`NOTICE`](../../NOTICE).
 | 0045–0053 | Voice cloning tools: a voice file says whose voice it is in `source`, which `--voices` requires; a clip preparation tool with heuristic gates; `GET /v1/voices`; and `tensorfold-native voice encode`, a native CUDA codec encoder ([results](../../results/native-voice-encoder.json)) |
 | 0054 | Clip preparation tells two speakers apart by timbre instead of pitch, with an empirical threshold set on model-invented voices ([results](../../results/clip-speaker-check.json)) |
 | 0055–0057 | The silence guard's floor is -40 dBFS, so a reply that collapses into a steady hum ends too ([results](../../results/silence-guard-floor.json)) |
+| 0058–0059 | A voice file can hold several reference passages, spoken in order (`drama3-voice/2`, `drama_voice.py combine`), building the prompt a request's references would |
 
 `SHA256SUMS` pins every patch.
