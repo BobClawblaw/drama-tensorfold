@@ -52,3 +52,6 @@ c85eaf351f813c307a8f9e750187553e9b7e87c15cffb13fd602f16fbb827036  0049-drama-cli
 a681c33f23534eb7f0ce0b20edb039caab20c7de08817c652af9be671b8fcf70  0052-drama-voice-encode-checks-a-WAV-s-whole-container-an.patch
 cd8c2954fd73634406e0d398be501c22b3beabf216fd0698b7cf4ec5b9a56cf5  0053-drama-voice-docs-say-only-what-was-measured-of-the-e.patch
 f2358220d442d3a768260212bfbcf9ee4b612cff2f3c5a9bbf487e8bd2786ae1  0054-drama-clip-preparation-tells-two-speakers-apart-by-t.patch
+16fb21d9710427ae4908b5eff1231d9f5cc1252320cc7a4dca2b79df0b69e359  0055-drama-the-silence-guard-also-ends-a-reply-that-colla.patch
+97e99934170a6b176c246ea72fcf28f876b271139bcc5ce2122e91f46ac9ebf0  0056-drama-a-test-pins-the-silence-guard-s-floor-at-40-dB.patch
+4779a964dc88db97b2b7068e48a7090fbd7214e72008ae367421e34009635761  0057-docs-the-silence-guard-s-floor-leaves-whispered-and-.patch

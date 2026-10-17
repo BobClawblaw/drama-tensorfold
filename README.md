@@ -103,12 +103,12 @@ loaded with `--voices`.
   ends with an `X-Finish-Reason` trailer.
 - **`length`:** the reply hit the frame cap (`--max-frames`, 1024 by default, 47.55 s) without an end of speech;
   the audio is clipped.
-- **`silence`:** the model stayed silent for 10 s; the reply ends at the frame that completes the 10 s and keeps
-  the audio before it. A stream hears each chunk before sending it, so it ends at the same sample as the whole
-  reply of the same generation. On a collapsing reply in a model-invented test voice, both now end at 16.579 s with
-  identical PCM; before, the stream ran 29.77 s against 17.09 s whole. The 46 normal corpus replies stayed
-  byte-identical and streams passed 9 of 9, on our GB10, our corpus
-  ([evidence](results/stream-silence-cut.json)).
+- **`silence`:** the model stayed below -40 dBFS for 10 s, which also catches a collapse into a steady hum; the reply
+  ends at the frame that completes the 10 s and keeps the audio before it. A stream hears each chunk before sending
+  it, so it ends at the same sample as the whole reply of the same generation. Measured with the previous -60 dBFS
+  floor (patches 0041-0043), on our GB10, our corpus: on a collapsing reply in a model-invented test voice, both ended
+  at 16.579 s with identical PCM, where before the stream ran 29.77 s against 17.09 s whole; the 46 normal corpus
+  replies stayed byte-identical and streams passed 9 of 9 ([evidence](results/stream-silence-cut.json)).
 - **Errors:** `400` for a refused request, `503` while the single engine slot is busy, `500` for a server fault.
 </details>
 
@@ -133,9 +133,10 @@ python3 recipe/pilot.py … -- --max-frames 4096 --long-form --long-form-chars 2
 - **Delivery:** if you re-encode replies to Opus, use `-application audio` at 64 kbps or more. `voip` at 48 kbps
   cut 4-8 kHz by up to 4.8 dB in our tests.
 
-Without these flags replies are unchanged except where the silence guard ends a stall: all 46 normal default-voice
-corpus replies (23 texts, two passes) are byte-identical and streams pass 9 of 9 checks; long-05 is cut at 20.2 s,
-10 s into its silent stall ([evidence](results/stream-silence-cut.json)).
+Without these flags replies are unchanged except where the silence guard ends a stall. Measured with the previous
+-60 dBFS floor: all 46 normal default-voice corpus replies (23 texts, two passes) are byte-identical and streams pass
+9 of 9 checks; long-05 is cut at 20.2 s, 10 s into its silent stall ([evidence](results/stream-silence-cut.json)).
+Replayed offline at -40 dBFS, long-05 is cut at the same 20.2 s ([evidence](results/silence-guard-floor.json)).
 
 ### Voice cloning (local)
 
@@ -192,7 +193,10 @@ voice file format are in `docs/drama-voices.md` in the engine tree.
 > Evidence: [`results/backbone-attention-tiles.json`](results/backbone-attention-tiles.json).
 >
 > **Long text:** the model can stall in silence mid-reply: one test text recovered after 7.4 s, long-05 never
-> recovered within the 47.55 s cap. Native now ends a reply after 10 s of silence with `X-Finish-Reason: silence`.
+> recovered within the 47.55 s cap. Native now ends a reply after 10 s below -40 dBFS with `X-Finish-Reason: silence`.
+> Replayed over 278 renders of the built-in and model-invented voices, that floor ends all 11 collapses, including one
+> hum the old -60 dBFS floor missed, and none of the other 267; whispered and soft test replies all ended `stop`, on our
+> GB10 ([evidence](results/silence-guard-floor.json)).
 
 One rater preferred native in 4 of 5 listening pairs; one pair was not blind. This does not change
 qualification. Every gate and result is in [`results/`](results/README.md).
