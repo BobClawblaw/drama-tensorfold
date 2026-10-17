@@ -19,5 +19,6 @@ downloaded separately; see [`NOTICE`](../../NOTICE).
 | 0040 | Backbone full attention runs the reference's 64-key softmax tiles and arithmetic: closer to the reference, about 5% slower on our GB10, our corpus ([results](../../results/backbone-attention-tiles.json)) |
 | 0041–0044 | A stream's silence guard hears each chunk before sending it, so a stream and a whole reply cut at the same frame ([results](../../results/stream-silence-cut.json)); long-form trailers formatted without allocating; the changelog scopes the 0040–0041 measurements |
 | 0045–0053 | Voice cloning tools: a voice file says whose voice it is in `source`, which `--voices` requires; a clip preparation tool with heuristic gates; `GET /v1/voices`; and `tensorfold-native voice encode`, a native CUDA codec encoder ([results](../../results/native-voice-encoder.json)) |
+| 0054 | Clip preparation tells two speakers apart by timbre instead of pitch, with an empirical threshold set on model-invented voices ([results](../../results/clip-speaker-check.json)) |
 
 `SHA256SUMS` pins every patch.

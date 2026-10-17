@@ -12,6 +12,7 @@ published; the JSON files keep the numbers exactly as measured.
 | [`backbone-attention-tiles.json`](backbone-attention-tiles.json) | The backbone against the reference before and after patch 0040's 64-key attention tiles, with its speed cost |
 | [`stream-silence-cut.json`](stream-silence-cut.json) | A collapsing reply streamed and whole before and after patches 0041–0043, and the default-voice corpus gate |
 | [`native-voice-encoder.json`](native-voice-encoder.json) | The native voice encoder's codes, memory and time against the reference encoder's, and clones made from each |
+| [`clip-speaker-check.json`](clip-speaker-check.json) | The clip speaker check's calibration on model-invented voices and mixes of them: every case's split and decision |
 
 ## Speed stages
 
@@ -93,6 +94,7 @@ recipe, and they are limits and budgets, not measurements.
 | Silence cut at 16.579 s streamed and whole (before 29.77 s / 17.09 s), 46 normal replies byte-identical, streams 9 of 9, long-05 at 20.2 s | measured | [`stream-silence-cut.json`](stream-silence-cut.json) |
 | Native encoder codes differ on 2.46–2.95% of semantic codes, speaker similarity −0.0046 to +0.0061 against a 0.023 take spread | measured | [`native-voice-encoder.json`](native-voice-encoder.json) |
 | Long-text cap behaviour | measured | [`long-text-tail.json`](long-text-tail.json) |
+| Speaker check threshold 5.6: one voice up to 4.87, full-band two voices from 6.40, 2 of 12 two-voice takes low-passed at 8 kHz kept | measured | [`clip-speaker-check.json`](clip-speaker-check.json) |
 | 4 of 5 listening pairs, one not blind | rating | [`qualification.json`](qualification.json) `listening_ab_01` |
 | 88 GiB `MemAvailable` at load, 54 GiB cap, 34 GiB abort floor | configuration | [`../recipe/pilot.py`](../recipe/pilot.py) constants; [`../recipe/README.md`](../recipe/README.md) |
 | About 39 GiB of disk | prerequisite: checkpoint storage only | `weight_and_codec_bytes` 41474674072 B (38.63 GiB) in [`../recipe/sources.json`](../recipe/sources.json). The engine checkout, build output and runtime caches need more; their size is not measured here. |
