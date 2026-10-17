@@ -1,0 +1,217 @@
+From 28c23a0e04ef5e68d08f12a1de835478710ca607 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 20:14:59 +0800
+Subject: [PATCH 47/53] drama: drama_voice.py runs only a tensorfold-native
+ that can voice encode, and an explicit encoder wins
+
+--native and --reference exclude each other. Without either, the tensorfold-native on PATH is used only when its --help lists voice encode; an older build is refused, not run. The seam tests drive stand-in binaries with and without voice encode.
+---
+ tools/zig/drama_voice.py      | 26 ++++++---
+ tools/zig/drama_voice_test.py | 99 ++++++++++++++++++++++++-----------
+ 2 files changed, 87 insertions(+), 38 deletions(-)
+
+diff --git a/tools/zig/drama_voice.py b/tools/zig/drama_voice.py
+index 21c128e6..be453bda 100644
+--- a/tools/zig/drama_voice.py
++++ b/tools/zig/drama_voice.py
+@@ -6,6 +6,7 @@ import hashlib
+ import json
+ import shutil
+ import subprocess
++import string
+ import sys
+ from pathlib import Path
+ 
+@@ -60,6 +61,12 @@ def encode(reference: Path, checkpoint: Path, audio: Path, device: str) -> tuple
+     return codes.tolist(), encoder
+ 
+ 
++def encodes_voices(binary: str) -> bool:
++    """Whether ``binary --help`` lists ``voice encode``: older tensorfold-native builds serve but cannot encode."""
++    shown = subprocess.run([binary, "--help"], capture_output=True, text=True)
++    return shown.returncode == 0 and "voice encode" in shown.stdout
++
++
+ def encode_native(binary: str, checkpoint: Path, audio: Path, transcript: str, out: Path) -> dict:
+     """``tensorfold-native voice encode`` writes the same voice file, minus its source."""
+     command = [binary, "voice", "encode", str(audio), "--model", str(checkpoint), "--text", transcript, "--name", out.stem, "--out", str(out)]
+@@ -84,8 +91,9 @@ def encode_reference(reference: Path, checkpoint: Path, audio: Path, transcript:
+ 
+ def main() -> int:
+     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+-    parser.add_argument("--native", default=shutil.which("tensorfold-native"), help="tensorfold-native; default: the one on PATH")
+-    parser.add_argument("--reference", type=Path, help="the pinned sglang-omni checkout, used without tensorfold-native")
++    encoder = parser.add_mutually_exclusive_group()
++    encoder.add_argument("--native", help="a tensorfold-native with voice encode; default: the one on PATH")
++    encoder.add_argument("--reference", type=Path, help="the pinned sglang-omni checkout: the reference's encoder")
+     parser.add_argument("--checkpoint", type=Path, required=True, help="the Drama 3 checkpoint holding codec.pth")
+     parser.add_argument("--audio", type=Path, required=True, help="the reference clip, at most 60 s (drama_voice_clip.py prepares one)")
+     parser.add_argument("--text", type=Path, required=True, help="the clip's exact transcript (UTF-8; outer white space dropped)")
+@@ -99,15 +107,19 @@ def main() -> int:
+     transcript = args.text.read_text(encoding="utf-8").strip()
+     if not transcript:
+         raise SystemExit(f"{args.text} holds no transcript")
+-    note = args.source_note.strip()
++    # the loader trims the same ASCII white space, so both refuse the same blank notes
++    note = args.source_note.strip(string.whitespace)
+     if not note:
+         raise SystemExit("--source-note must say where the voice comes from")
+-    if args.native:
+-        voice = encode_native(args.native, args.checkpoint, args.audio, transcript, args.out)
+-    elif args.reference:
++    if args.reference:
+         voice = encode_reference(args.reference, args.checkpoint, args.audio, transcript, args.device)
+     else:
+-        raise SystemExit("tensorfold-native is not on PATH: pass --native BINARY, or --reference for the reference's encoder")
++        binary = args.native or shutil.which("tensorfold-native")
++        if binary is None:
++            raise SystemExit("no tensorfold-native on PATH: pass --native BINARY, or --reference SGLANG_OMNI_CHECKOUT")
++        if not encodes_voices(binary):
++            raise SystemExit(f"{binary} has no `voice encode` (an older build): pass --native BINARY, or --reference SGLANG_OMNI_CHECKOUT")
++        voice = encode_native(binary, args.checkpoint, args.audio, transcript, args.out)
+     voice["source"] = {"kind": args.source_kind, "note": note}
+     args.out.write_text(json.dumps(voice, ensure_ascii=False) + "\n", encoding="utf-8")
+     print(json.dumps({key: value for key, value in voice.items() if key != "vq_codes"}, ensure_ascii=False))
+diff --git a/tools/zig/drama_voice_test.py b/tools/zig/drama_voice_test.py
+index 86769593..abb0a817 100644
+--- a/tools/zig/drama_voice_test.py
++++ b/tools/zig/drama_voice_test.py
+@@ -1,8 +1,10 @@
+-"""The encoder seam: tensorfold-native when present, else the reference's encoder; either way a sourced voice file."""
++"""The encoder seam: an explicit encoder wins, else a tensorfold-native that can voice encode; the file is sourced."""
+ import contextlib
+ import io
+ import json
++import os
+ import subprocess
++import sys
+ import tempfile
+ import unittest
+ from pathlib import Path
+@@ -11,6 +13,22 @@ from unittest.mock import patch
+ import drama_voice
+ 
+ ROWS = [[book * 7 + frame for frame in range(3)] for book in range(drama_voice.NUM_CODEBOOKS)]
++TOOL = Path(__file__).with_name("drama_voice.py")
++# A stand-in tensorfold-native: its --help, and for voice encode the file and summary the real one writes.
++FAKE = """#!{python}
++import json, sys
++from pathlib import Path
++args = sys.argv[1:]
++if args == ["--help"]:
++    print("usage: tensorfold-native --version | serve MODEL [flags]{voice}")
++    sys.exit(0)
++Path(sys.argv[0] + ".ran").write_text(json.dumps(args))
++if "{voice}" == "" or args[:2] != ["voice", "encode"]:
++    sys.exit(2)
++voice = {{"format": "drama3-voice/1", "text": args[args.index("--text") + 1], "codes_sha256": "c0de", "vq_codes": {rows}}}
++Path(args[args.index("--out") + 1]).write_text(json.dumps(voice))
++print(json.dumps({{key: value for key, value in voice.items() if key != "vq_codes"}}))
++"""
+ 
+ 
+ def no_reference_encoder(*_):
+@@ -24,51 +42,70 @@ class EncodeTests(unittest.TestCase):
+         self.audio.write_bytes(b"RIFF")
+         self.text.write_text(" Hello there. \n", encoding="utf-8")
+ 
+-    def run_main(self, *words: str, text: Path | None = None, native: str | None = None) -> dict:
+-        argv = ["drama_voice.py", "--checkpoint", "ckpt", "--audio", str(self.audio), "--text", str(text or self.text), "--out", str(self.out), *words]
+-        with patch("sys.argv", argv), patch.object(drama_voice.shutil, "which", lambda _: native), contextlib.redirect_stdout(io.StringIO()):
+-            drama_voice.main()
+-        return json.loads(self.out.read_text(encoding="utf-8"))
++    def native(self, encodes: bool) -> Path:
++        """A tensorfold-native on its own PATH directory, with or without voice encode."""
++        bin_dir = self.folder / ("new" if encodes else "old")
++        bin_dir.mkdir()
++        binary = bin_dir / "tensorfold-native"
++        binary.write_text(FAKE.format(python=sys.executable, voice=" | voice encode CLIP.wav [flags]" if encodes else "", rows=ROWS))
++        binary.chmod(0o755)
++        return binary
+ 
+-    def test_native_cli_encodes_when_present_and_the_tool_adds_the_source(self):
+-        ran = []
++    def argv(self, *words: str, text: Path | None = None) -> list[str]:
++        return ["--checkpoint", "ckpt", "--audio", str(self.audio), "--text", str(text or self.text), "--out", str(self.out), *words]
+ 
+-        def native(command, stdout=None):
+-            self.assertEqual(stdout, subprocess.DEVNULL)
+-            ran.append(command)
+-            voice = {"format": drama_voice.FORMAT, "text": "Hello there.", "codes_sha256": "c0de", "vq_codes": ROWS}
+-            Path(command[command.index("--out") + 1]).write_text(json.dumps(voice), encoding="utf-8")
+-            return subprocess.CompletedProcess(command, 0)
++    def run_main(self, *words: str, text: Path | None = None, path: str = "") -> dict:
++        with patch("sys.argv", ["drama_voice.py", *self.argv(*words, text=text)]), patch.dict(os.environ, {"PATH": path}):
++            with contextlib.redirect_stdout(io.StringIO()):
++                drama_voice.main()
++        return json.loads(self.out.read_text(encoding="utf-8"))
+ 
+-        with patch.object(drama_voice.subprocess, "run", native), patch.object(drama_voice, "encode", no_reference_encoder):
+-            voice = self.run_main("--source-kind", "owner", "--source-note", " my own voice ", native="/opt/tf/tensorfold-native")
+-        command = ["/opt/tf/tensorfold-native", "voice", "encode", str(self.audio), "--model", "ckpt", "--text", "Hello there.", "--name", "me", "--out", str(self.out)]
+-        self.assertEqual(ran, [command])
+-        self.assertEqual(voice["codes_sha256"], "c0de")
+-        self.assertEqual(voice["source"], {"kind": "owner", "note": "my own voice"})
++    def test_a_native_on_path_that_can_voice_encode_is_used_and_prints_one_summary(self):
++        binary = self.native(encodes=True)
++        command = [sys.executable, str(TOOL), *self.argv("--source-kind", "owner", "--source-note", " my own voice ")]
++        done = subprocess.run(command, capture_output=True, text=True, env={**os.environ, "PATH": str(binary.parent)})
++        self.assertEqual(done.returncode, 0, done.stderr)
++        self.assertEqual(json.loads(done.stdout)["source"], {"kind": "owner", "note": "my own voice"})
++        ran = json.loads(Path(str(binary) + ".ran").read_text())
++        self.assertEqual(ran, ["voice", "encode", str(self.audio), "--model", "ckpt", "--text", "Hello there.", "--name", "me", "--out", str(self.out)])
++        voice = json.loads(self.out.read_text(encoding="utf-8"))
++        self.assertEqual((voice["codes_sha256"], voice["source"]["kind"]), ("c0de", "owner"))
+ 
+-    def test_reference_encoder_without_native_writes_the_digest_the_loader_checks(self):
++    def test_an_explicit_reference_wins_over_a_native_on_path(self):
++        binary = self.native(encodes=True)
+         with patch.object(drama_voice, "encode", lambda *_: (ROWS, {"device": "cpu"})):
+-            voice = self.run_main("--reference", "sglang-omni", "--source-kind", "model-invented", "--source-note", "the model's built-in voice")
+-        self.assertEqual(voice["text"], "Hello there.")
++            voice = self.run_main("--reference", "sglang-omni", "--source-kind", "model-invented", "--source-note", "the model's own", path=str(binary.parent))
++        self.assertFalse(Path(str(binary) + ".ran").exists())
+         self.assertEqual(voice["frames"], 3)
+         self.assertEqual(voice["codes_sha256"], drama_voice.codes_sha256(ROWS))
+         self.assertEqual(voice["audio_sha256"], drama_voice.sha256(b"RIFF"))
+-        self.assertEqual(voice["source"], {"kind": "model-invented", "note": "the model's built-in voice"})
++        self.assertEqual(voice["source"], {"kind": "model-invented", "note": "the model's own"})
++
++    def test_a_native_without_voice_encode_is_refused_and_never_run(self):
++        binary = self.native(encodes=False)
++        with patch.object(drama_voice, "encode", no_reference_encoder):
++            for words, path in ((("--source-kind", "owner", "--source-note", "mine"), str(binary.parent)),
++                                (("--native", str(binary), "--source-kind", "owner", "--source-note", "mine"), "")):
++                with self.assertRaisesRegex(SystemExit, "has no `voice encode`"):
++                    self.run_main(*words, path=path)
++            with self.assertRaisesRegex(SystemExit, "no tensorfold-native on PATH"):
++                self.run_main("--source-kind", "owner", "--source-note", "mine")
++        self.assertFalse(Path(str(binary) + ".ran").exists())
++        self.assertFalse(self.out.exists())
+ 
+-    def test_drafts_missing_consent_and_missing_encoders_are_refused_before_encoding(self):
++    def test_drafts_missing_consent_and_two_encoders_are_refused_before_encoding(self):
+         draft = self.folder / "me.draft.txt"
+         draft.write_text("Hello there.\n", encoding="utf-8")
+         with patch.object(drama_voice, "encode", no_reference_encoder):
+             with self.assertRaisesRegex(SystemExit, "Whisper draft: correct it against the clip and save it as me.txt"):
+                 self.run_main("--reference", "r", "--source-kind", "owner", "--source-note", "mine", text=draft)
+-            with self.assertRaisesRegex(SystemExit, "--source-note must say"):
+-                self.run_main("--reference", "r", "--source-kind", "owner", "--source-note", "  ")
+-            with self.assertRaisesRegex(SystemExit, "tensorfold-native is not on PATH"):
+-                self.run_main("--source-kind", "owner", "--source-note", "mine")
+-            for consent in (["--source-kind", "celebrity", "--source-note", "a film"], ["--source-note", "mine"]):
++            for blank in ("  ", "\t\n"):
++                with self.assertRaisesRegex(SystemExit, "--source-note must say"):
++                    self.run_main("--reference", "r", "--source-kind", "owner", "--source-note", blank)
++            for words in (["--source-kind", "celebrity", "--source-note", "a film"], ["--source-note", "mine"],
++                          ["--native", "tf", "--source-kind", "owner", "--source-note", "mine"]):
+                 with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+-                    self.run_main("--reference", "r", *consent)
++                    self.run_main("--reference", "r", *words)
+         self.assertFalse(self.out.exists())
+ 
+ 
+-- 
+2.43.0
+

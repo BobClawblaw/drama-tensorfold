@@ -42,3 +42,12 @@ b68639202cc50953852bd593b5e40a32c1a2cdfca7190121128ad36d4d7d5afb  0025-drama-the
 9449b87d92de7d9d5874cc81a563ebbefb077fe7f670e23cbf4cd0e157737f32  0042-drama-a-long-form-reply-s-trailers-are-formatted-wit.patch
 949efa174c5ab0ccc0c27b4daca986eda042ef08cdd6c2d36a6ddacb51d303bc  0043-docs-a-relative-voices-directory-resolves-from-the-s.patch
 1377291c3b774a3b8f8963aec348078da910657ee46f9c37b27f6d193665dcf5  0044-docs-the-changelog-says-where-the-backbone-and-strea.patch
+8107576e84ecab0c1dde42ba9fced7ec2025a1afe54b4c7644eaea197b0b3605  0045-drama-voices-say-whose-they-are-takes-are-prepared-a.patch
+c40a0149966269abcd49102a49f80d0f5f492ae387fa475b17b4ce8b71d27dc9  0046-drama-drama_voice.py-prints-one-summary-when-tensorf.patch
+dbdcee13ba26ede64afac559fe257d73f26ea07b662d8de1d731ad7ab335d898  0047-drama-drama_voice.py-runs-only-a-tensorfold-native-t.patch
+20bf6c8129c7faa234c1e90130fdaa6e110d247e4e2cb349f3ab41fcc2572b11  0048-drama-the-voice-loader-refuses-a-source-note-of-whit.patch
+c85eaf351f813c307a8f9e750187553e9b7e87c15cffb13fd602f16fbb827036  0049-drama-clip-preparation-judges-noise-on-the-kept-clip.patch
+54852e18f0af5c48caa3e70031aa5b34296e734d6d7ae604838448a9b6a9dc07  0050-docs-drama-voices-say-what-clip-preparation-measures.patch
+2ce25d4edbeb1e4894810fcc0450d5b891ff5ecba9f16684e6bb4ce6674afe82  0051-drama-tensorfold-native-voice-encode-writes-a-voice-.patch
+a681c33f23534eb7f0ce0b20edb039caab20c7de08817c652af9be671b8fcf70  0052-drama-voice-encode-checks-a-WAV-s-whole-container-an.patch
+cd8c2954fd73634406e0d398be501c22b3beabf216fd0698b7cf4ec5b9a56cf5  0053-drama-voice-docs-say-only-what-was-measured-of-the-e.patch

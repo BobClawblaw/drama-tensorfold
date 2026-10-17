@@ -1,0 +1,156 @@
+From 9a9b40f916c3c2eeb7bf5fe62c64ca22adab93d5 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 20:15:00 +0800
+Subject: [PATCH 49/53] drama: clip preparation judges noise on the kept clip,
+ refuses short takes and keeps transcripts paired
+
+The noise gate runs on the whole take and again on what is kept, so quiet that is cut away no longer passes a noisy clip. A take shorter than 10 s, empty or not, is refused before it is measured. --asr refuses to replace a clip whose NAME.txt exists, and --text removes a draft of an earlier take.
+---
+ tools/zig/drama_voice_clip.py      | 30 ++++++++++++++++++++++--------
+ tools/zig/drama_voice_clip_test.py | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 52 insertions(+), 8 deletions(-)
+
+diff --git a/tools/zig/drama_voice_clip.py b/tools/zig/drama_voice_clip.py
+index a3b422eb..4abb75d4 100644
+--- a/tools/zig/drama_voice_clip.py
++++ b/tools/zig/drama_voice_clip.py
+@@ -69,7 +69,7 @@ def pauses(quiet: np.ndarray) -> list[tuple[int, int]]:
+ 
+ 
+ def cut(db: np.ndarray, level: float) -> tuple[int, int, int]:
+-    """Frames [start, end) from just before the first word to a pause 10-30 s on, and the speech frames left out."""
++    """Frames [start, end) from just before the first sound to a pause 10-30 s on, and the loud frames left out."""
+     quiet = db < level - QUIET_DB
+     n = len(db)
+     if not quiet[:BOUNDARY_FRAMES].all():
+@@ -77,13 +77,13 @@ def cut(db: np.ndarray, level: float) -> tuple[int, int, int]:
+     first = int(np.argmin(quiet))
+     start, whole = max(0, first - EDGE_FRAMES), min(n, n - int(np.argmin(quiet[::-1])) + EDGE_FRAMES)
+     if (whole - start) / 100 < MIN_SECONDS:
+-        raise SystemExit(f"the clip holds {(whole - start) / 100:.1f} s of speech; a voice needs {MIN_SECONDS:.0f} s")
++        raise SystemExit(f"the clip is {(whole - start) / 100:.1f} s from its first sound to its last; a voice needs {MIN_SECONDS:.0f} s")
+     if quiet[-BOUNDARY_FRAMES:].all() and (whole - start) / 100 <= MAX_SECONDS:
+         return start, whole, 0
+     ends = [(e - s >= SENTENCE_FRAMES, s + min(EDGE_FRAMES, (e - s) // 2)) for s, e in pauses(quiet) if first < s and e < n]
+     ends = [end for end in ends if MIN_SECONDS <= (end[1] - start) / 100 <= MAX_SECONDS]
+     if not ends:
+-        raise SystemExit(f"no pause between {MIN_SECONDS:.0f} and {MAX_SECONDS:.0f} s after the first word to cut at")
++        raise SystemExit(f"no pause between {MIN_SECONDS:.0f} and {MAX_SECONDS:.0f} s after the first sound to cut at")
+     end = max(ends)[1]
+     return start, end, int(np.count_nonzero(~quiet[end:]))
+ 
+@@ -145,8 +145,18 @@ def pitch_spread(x: np.ndarray, db: np.ndarray, level: float) -> tuple[float, in
+     return float(sorted_medians[np.argmax(share >= 0.8)] - sorted_medians[np.argmax(share >= 0.2)]), len(medians)
+ 
+ 
++def noise(db: np.ndarray, level: float) -> float:
++    """Decibels from the speech level down to the quietest tenth of the frames; with too few pauses it reads low."""
++    snr = level - float(np.percentile(db, 10))
++    if snr < MIN_SNR_DB:
++        raise SystemExit(f"the background is {snr:.1f} dB under the speech; a voice needs {MIN_SNR_DB:.0f} dB: record somewhere quieter")
++    return snr
++
++
+ def prepare(x: np.ndarray, rate: int) -> tuple[np.ndarray, dict]:
+     """The clip ready to encode and what was measured, or SystemExit saying why it cannot make a voice."""
++    if len(x) < MIN_SECONDS * rate:
++        raise SystemExit(f"the clip is {len(x) / rate:.2f} s long; a voice needs {MIN_SECONDS:.0f} s")
+     if np.max(np.abs(x)) < 1e-4:
+         raise SystemExit("the clip is silent")
+     channels = x.reshape(len(x), -1).T
+@@ -155,13 +165,12 @@ def prepare(x: np.ndarray, rate: int) -> tuple[np.ndarray, dict]:
+     x = resample(channels.mean(axis=0), rate, RATE)
+     db = frame_db(x)
+     level = speech_level(db)
+-    # before the cut, which needs pauses well under the speech to find words
+-    snr = level - float(np.percentile(db, 10))
+-    if snr < MIN_SNR_DB:
+-        raise SystemExit(f"the background is {snr:.1f} dB under the speech; a voice needs {MIN_SNR_DB:.0f} dB: record somewhere quieter")
++    # first on the whole take, as noise hides the pauses the cut looks for; then on what is kept
++    noise(db, level)
+     start, end, dropped = cut(db, level)
+     x, db = x[start * HOP : end * HOP], db[start:end]
+     level = speech_level(db)
++    snr = noise(db, level)
+     tonal = flatness(x, db, level)
+     if tonal is not None and tonal < MIN_FLATNESS:
+         raise SystemExit(f"the pauses hold a steady tone (band flatness {tonal:.3f}): music or hum under the voice")
+@@ -198,6 +207,9 @@ def main() -> int:
+     words.add_argument("--text", type=Path, help="the clip's exact transcript (UTF-8); refused when the cut leaves speech out")
+     words.add_argument("--asr", type=Path, help="a local Whisper model directory: writes NAME.draft.txt to correct and save as NAME.txt")
+     args = parser.parse_args()
++    confirmed = args.out.with_suffix(".txt")
++    if args.asr and confirmed.exists():
++        raise SystemExit(f"{confirmed} holds a confirmed transcript of an earlier clip: remove it, or prepare this take under another name")
+     x, rate = sf.read(args.clip, always_2d=False)
+     audio, report = prepare(x, rate)
+     if args.text:
+@@ -206,7 +218,9 @@ def main() -> int:
+             raise SystemExit(f"{args.text} holds no transcript")
+         if report["speech_left_out_seconds"]:
+             raise SystemExit(f"the cut at {report['source_seconds'][1]} s leaves speech out, so {args.text} no longer matches: use --asr")
+-        transcript_path = args.out.with_suffix(".txt")
++        transcript_path = confirmed
++        # a draft of an earlier take would sit next to this transcript
++        args.out.with_suffix(".draft.txt").unlink(missing_ok=True)
+     else:
+         transcript = transcribe(audio, args.asr)
+         transcript_path = args.out.with_suffix(".draft.txt")
+diff --git a/tools/zig/drama_voice_clip_test.py b/tools/zig/drama_voice_clip_test.py
+index 2d33e5cb..e11704fb 100644
+--- a/tools/zig/drama_voice_clip_test.py
++++ b/tools/zig/drama_voice_clip_test.py
+@@ -93,6 +93,17 @@ class PrepareTests(unittest.TestCase):
+         noisy = x + 0.03 * np.random.default_rng(2).standard_normal(len(x))
+         self.assertIn("background", self.refusal(noisy))
+ 
++    def test_noise_is_judged_on_the_kept_clip_not_on_quiet_that_is_cut_away(self):
++        x, _ = speech([120.0] * 6)
++        noise = 0.01 * np.random.default_rng(10).standard_normal(len(x))
++        noise[: int(0.4 * RATE)] = 0
++        tail = 1e-5 * np.random.default_rng(11).standard_normal(20 * RATE)
++        self.assertIn("background", self.refusal(x + noise))
++        self.assertIn("background", self.refusal(np.concatenate((x + noise, tail))))
++        _, clean = clip.prepare(x, RATE)
++        _, padded = clip.prepare(np.concatenate((x, tail)), RATE)
++        self.assertAlmostEqual(padded["snr_db"], clean["snr_db"], delta=0.5)
++
+     def test_music_under_the_voice_is_refused_though_it_is_quiet(self):
+         x, _ = speech([120.0] * 6)
+         t = np.arange(len(x)) / RATE
+@@ -110,6 +121,8 @@ class PrepareTests(unittest.TestCase):
+         self.assertIn("no pause", self.refusal(speech([120.0] * 20, rests=(0.05,))[0]))
+         x, _ = speech([120.0] * 6)
+         self.assertIn("starts inside speech", self.refusal(x[int(0.5 * RATE) :]))
++        for empty in (np.zeros(0), np.full(100, 0.01), np.zeros((0, 2))):
++            self.assertIn("a voice needs 10 s", self.refusal(empty))
+ 
+ 
+ class TranscriptTests(unittest.TestCase):
+@@ -139,6 +152,23 @@ class TranscriptTests(unittest.TestCase):
+             self.assertFalse((folder / "me.txt").exists())
+             self.assertEqual(len(heard[0]), sf.info(folder / "me.wav").frames)
+ 
++    def test_whisper_never_replaces_a_clip_whose_transcript_was_confirmed(self):
++        with tempfile.TemporaryDirectory() as name, patch.object(clip, "transcribe", lambda *_: "new words"):
++            folder = Path(name)
++            (folder / "me.txt").write_text("Old words.\n", encoding="utf-8")
++            with self.assertRaisesRegex(SystemExit, "me.txt holds a confirmed transcript"):
++                self.run_main(folder, speech([120.0] * 6)[0], "--asr", "whisper")
++            self.assertFalse((folder / "me.wav").exists() or (folder / "me.draft.txt").exists())
++            self.assertEqual((folder / "me.txt").read_text(encoding="utf-8"), "Old words.\n")
++
++    def test_a_recording_too_short_to_measure_writes_nothing(self):
++        with tempfile.TemporaryDirectory() as name:
++            folder = Path(name)
++            (folder / "take.txt").write_text("Hi.\n", encoding="utf-8")
++            with self.assertRaisesRegex(SystemExit, "a voice needs 10 s"):
++                self.run_main(folder, np.full(100, 0.01), "--text", str(folder / "take.txt"))
++            self.assertEqual(sorted(path.name for path in folder.iterdir()), ["take.txt", "take.wav"])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+

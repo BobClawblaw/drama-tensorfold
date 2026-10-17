@@ -95,7 +95,8 @@ the license's Section III(c), which needs a separate license from Fish Audio.
 
 `POST /v1/audio/speech` takes `model` (`fishaudio/drama-3`), `input` (at most 4096 characters), `voice`
 (`default`, or a name loaded with `--voices`), `references` (transcript plus `vq_codes`), `response_format`
-(`wav` or `pcm`) and `stream` (`true` needs `pcm`). Anything else is refused.
+(`wav` or `pcm`) and `stream` (`true` needs `pcm`). Anything else is refused. `GET /v1/voices` lists the voices
+loaded with `--voices`.
 
 - **Whole reply:** `Content-Length` framing and an `X-Finish-Reason` header: `stop`, `length` or `silence`.
 - **Streamed reply:** chunked mono 16-bit 44.1 kHz PCM, sent as whole frames. A reply that did not end in `stop`
@@ -126,7 +127,7 @@ python3 recipe/pilot.py … -- --max-frames 4096 --long-form --long-form-chars 2
   each conditioned on the previous segment's text and codes, joined with room-tone pauses sized by punctuation.
   A new segment still restarts its prosody (measured +2 to +5 semitones at a join), so prefer one generation.
 - **`--voices DIR --default-voice NAME`:** serve voice files (a reference clip's transcript and codes) and make
-  one of them the voice `default` names. Make a clip's codes with `tools/zig/drama_voice.py` in the engine tree.
+  one of them the voice `default` names. Make them as in [Voice cloning](#voice-cloning-local).
   A relative `DIR` resolves from the server's working directory, which `recipe/pilot.py` sets to `--runtime-dir`,
   so pass an absolute path.
 - **Delivery:** if you re-encode replies to Opus, use `-application audio` at 64 kbps or more. `voip` at 48 kbps
@@ -135,6 +136,40 @@ python3 recipe/pilot.py … -- --max-frames 4096 --long-form --long-form-chars 2
 Without these flags replies are unchanged except where the silence guard ends a stall: all 46 normal default-voice
 corpus replies (23 texts, two passes) are byte-identical and streams pass 9 of 9 checks; long-05 is cut at 20.2 s,
 10 s into its silent stall ([evidence](results/stream-silence-cut.json)).
+
+### Voice cloning (local)
+
+Clone only a voice the model invented, your own, or one whose owner has consented on record, as the model license
+requires ([License](#license), IV(b)). Each voice file says which in `source` (`model-invented`, `owner` or
+`consented`, with a note), and `--voices` refuses a file without it. `source` is your attestation: nothing checks
+the consent behind it. Clips and voice files hold a person's voice; `clips/` and `voices/` are git-ignored here.
+
+Prepare a take as a 10–30 s clip (needs `numpy` and `soundfile`), encode it on the GPU under your GPU lock, and
+serve it:
+
+```sh
+mkdir -p clips voices
+python3 build/tensorfold/tools/zig/drama_voice_clip.py take.wav --out clips/NAME.wav --text take.txt
+flock "$GPU_LOCK" python3 build/tensorfold/tools/zig/drama_voice.py \
+  --native build/tensorfold/zig-out/native/bin/tensorfold-native --checkpoint drama-3 \
+  --audio clips/NAME.wav --text clips/NAME.txt --out voices/NAME.json \
+  --source-kind owner --source-note "my own voice, recorded 2026-10-17"
+python3 recipe/pilot.py … -- --voices "$PWD/voices" --default-voice NAME
+curl -sS http://127.0.0.1:18793/v1/voices
+```
+
+The clip tool levels the take, cuts it at a pause and refuses clipped, short or noisy takes. Its other gates are
+cheap heuristics: a tonal check on the pauses for steady music or hum, and a pitch-spread check for a second
+speaker. They miss two speakers of a similar pitch and music more than 60 dB under the speech, and can refuse one
+speaker who moves between very different registers, so listen to the clip before encoding it. `--asr WHISPER_DIR`
+instead of `--text` drafts a transcript to correct. The encoder runs `tensorfold-native voice encode` (WAV in PCM
+or IEEE float, channels averaged, resampled to 44.1 kHz) and adds `source`.
+
+On our GB10, our test voices, the native encoder's codes differ from the reference encoder's on 2.46–2.95% of
+semantic codes (three clips). Replies cloned from either encoding moved in speaker similarity to the clip by −0.0046
+to +0.0061 (ECAPA, three model-invented test voices, one take each), against a spread of 0.023 across six takes:
+the take noise of one model-invented voice ([evidence](results/native-voice-encoder.json)). The gates, refusals and
+voice file format are in `docs/drama-voices.md` in the engine tree.
 
 ## Status
 
