@@ -9,6 +9,7 @@ published; the JSON files keep the numbers exactly as measured.
 | [`speed-stages.json`](speed-stages.json) | Warm RTF and load time through the five speed stages, with the audio-identity gate |
 | [`qualification.json`](qualification.json) | Numerical gate status, the reference self-control, the revised worst-row bar, clipped replies and the listening test |
 | [`long-text-tail.json`](long-text-tail.json) | The silent tails of replies that reach the 1024-frame cap, on both engines |
+| [`backbone-attention-tiles.json`](backbone-attention-tiles.json) | The backbone against the reference before and after patch 0040's 64-key attention tiles, with its speed cost |
 
 ## Speed stages
 
@@ -24,8 +25,9 @@ reviewed clipped capture, and `bench/stream_check.py` passed 9/9.
 | 04 | tower one-row GEMV reproducing the cuBLASLt summation, checked per projection at init (fail-closed) | 0.678 |
 | 05 | backbone programmatic dependent launch (only when both kernel images carry the `drama_pdl` marker) | 0.655 |
 
-On the final binary the warm RTF is 0.636, first audio arrives at 0.132 s and a 4.18 s utterance completes in
-2.86 s. Stage 01 (the staged backbone GEMM) has no separate RTF entry.
+On the final binary of the speed work, before patch 0040, the warm RTF is 0.636, first audio arrives at 0.132 s and
+a 4.18 s utterance completes in 2.86 s. Stage 01 (the staged backbone GEMM) has no separate RTF entry. Patch 0040
+costs about 5% on our GB10, our corpus: [`backbone-attention-tiles.json`](backbone-attention-tiles.json).
 
 ## Qualification status: not achieved
 
@@ -33,12 +35,12 @@ On the final binary the warm RTF is 0.636, first audio arrives at 0.132 s and a 
 |---|---|---:|---|
 | Codec, 1 frame | SNR ≥ 40 dB | 33.086 dB | fail (known limitation) |
 | Codec, 2 / 7 / 128 / 1024 frames | SNR ≥ 40 dB, exact prefixes | pass | pass |
-| Backbone hidden relative L2 | ≤ 0.05 | 0.124 | fail |
-| Backbone worst-row cosine | ≥ 0.8712518909203973 (revised from 0.995) | 0.8006 | fail |
-| Backbone all-row cosine | ≥ 0.999 | 0.99233 | fail |
-| Backbone last-row cosine | ≥ 0.999 | 0.99670 | fail |
-| Backbone semantic KL | ≤ 0.01 | 0.0243 | fail |
-| Backbone semantic top-30 overlap | ≥ 0.9 | 0.867 | fail |
+| Backbone hidden relative L2 | ≤ 0.05 | 0.0528 | fail |
+| Backbone worst-row cosine | ≥ 0.8712518909203973 (revised from 0.995) | 0.9169 | pass |
+| Backbone all-row cosine | ≥ 0.999 | 0.99860 | fail |
+| Backbone last-row cosine | ≥ 0.999 | 0.99809 | fail |
+| Backbone semantic KL | ≤ 0.01 | 0.0062 | pass |
+| Backbone semantic top-30 overlap | ≥ 0.9 | 0.933 | pass |
 | Backbone semantic top-1, cosine, relative L2 | equal / ≥ 0.999 / ≤ 0.03 | — | pass |
 | Tower, 7-row streaming head top-1 | equal | 600 vs 463 | fail (the reference logits tie) |
 | Tower real-input and teacher-forced replays | component gates | — | pass |
@@ -50,8 +52,11 @@ On the final binary the warm RTF is 0.636, first audio arrives at 0.132 s and a 
   default, the reference's worst-row cosine against its solo output is 0.871–0.982 in every tested view. The
   revised bar is the lowest of those minima, set from reference data alone and registered before native was
   re-scored ([method](../qualification/README.md#how-the-worst-row-bar-was-set)).
-- **Native is still outside that envelope.** Relative L2 is 0.124 against the reference's own maximum of 0.045,
-  and KL 0.024 against 0.0049.
+- **Native is still outside that envelope.** Relative L2 is 0.0528 against the reference's own maximum of 0.045,
+  and KL 0.0062 against 0.0049.
+- **The backbone rows are after patch 0040.** Before it they read relative L2 0.124, worst row 0.8006, all-row
+  0.99233, last row 0.99670, KL 0.0243 and top-30 0.867, all failing. The codec, tower and long-05 rows were
+  measured before it.
 
 ## Long text
 
@@ -81,7 +86,8 @@ recipe, and they are limits and budgets, not measurements.
 | Speedups (1.48x, 1.62x, 3.7x, 39x, 1.35x/1.62x/1.57x) | derived | reference value / native value from the two files above |
 | Character ranges 19–47, 114–144, 283–313 | corpus property | [`../bench/corpus/drama-bench-en-v1.jsonl`](../bench/corpus/drama-bench-en-v1.jsonl) |
 | 46 normal replies byte-identical, 14 speed patches, warm RTF 1.087 → 0.636–0.655 | measured (retained summary) | [`speed-stages.json`](speed-stages.json); the patches are in [`../engine/patches/`](../engine/patches/README.md) |
-| Accuracy bars and native values | measured | [`qualification.json`](qualification.json) `qualification_01`, `backbone_worst_row_bar_revision.rescore` |
+| Accuracy bars and native values before patch 0040 | measured | [`qualification.json`](qualification.json) `qualification_01`, `backbone_worst_row_bar_revision.rescore` |
+| Backbone values after patch 0040, voice-prompt values, RTF 0.642–0.650 → 0.682, silence finishes 2 → 0 of 40 | measured | [`backbone-attention-tiles.json`](backbone-attention-tiles.json) `text_fixture_182_tokens`, `voice_prompt_449_rows`, `serving` |
 | Long-text cap behaviour | measured | [`long-text-tail.json`](long-text-tail.json) |
 | 4 of 5 listening pairs, one not blind | rating | [`qualification.json`](qualification.json) `listening_ab_01` |
 | 88 GiB `MemAvailable` at load, 54 GiB cap, 34 GiB abort floor | configuration | [`../recipe/pilot.py`](../recipe/pilot.py) constants; [`../recipe/README.md`](../recipe/README.md) |

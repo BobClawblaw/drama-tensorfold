@@ -16,5 +16,6 @@ downloaded separately; see [`NOTICE`](../../NOTICE).
 | 0031–0034 | Voice references: `references` with `vq_codes`, `--voices DIR` / `--default-voice NAME`, a prefill oracle for voice-reference rows, and the generated codes a request can keep |
 | 0035–0037 | `--long-form`: long inputs in balanced segments at sentence ends, each hearing the one before, joined with room-tone pauses sized by punctuation |
 | 0038–0039 | `--max-frames N` for one synthesis of up to about 190 s, and `X-Finish-Reason: silence` after 10 s of silence |
+| 0040 | Backbone full attention runs the reference's 64-key softmax tiles and arithmetic: closer to the reference, about 5% slower on our GB10, our corpus ([results](../../results/backbone-attention-tiles.json)) |
 
 `SHA256SUMS` pins every patch.
