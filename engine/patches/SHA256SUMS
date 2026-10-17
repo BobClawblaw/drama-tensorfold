@@ -38,3 +38,7 @@ b68639202cc50953852bd593b5e40a32c1a2cdfca7190121128ad36d4d7d5afb  0025-drama-the
 19c5fb60232a991fed4ad7e650e7e530064d4183823fe250c5d12fd685b4fbcd  0038-drama-max-frames-lets-one-synthesis-speak-a-whole-lo.patch
 24e53dc4f392f8ae0b90c74e96d5725368ec42fb375d2142c779ab13e897636d  0039-drama-a-synthesis-that-stays-silent-for-10-s-ends-th.patch
 97645687534db45f6af21562abef831f56d50db4af9911b8107c7e90cae1f593  0040-drama-backbone-attention-runs-the-reference-s-64-key.patch
+030a996e4d0cedd48c42ae2dbd8aa67cbe5f22ce5034ce47f858cda4cf00c596  0041-drama-a-stream-s-silence-guard-hears-each-chunk-befo.patch
+9449b87d92de7d9d5874cc81a563ebbefb077fe7f670e23cbf4cd0e157737f32  0042-drama-a-long-form-reply-s-trailers-are-formatted-wit.patch
+949efa174c5ab0ccc0c27b4daca986eda042ef08cdd6c2d36a6ddacb51d303bc  0043-docs-a-relative-voices-directory-resolves-from-the-s.patch
+1377291c3b774a3b8f8963aec348078da910657ee46f9c37b27f6d193665dcf5  0044-docs-the-changelog-says-where-the-backbone-and-strea.patch

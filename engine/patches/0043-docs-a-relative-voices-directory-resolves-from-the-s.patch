@@ -1,0 +1,26 @@
+From 5036982b50b088bdd81ca175a954af4d19930e49 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:13:11 +0800
+Subject: [PATCH 43/44] docs: a relative --voices directory resolves from the
+ server's working directory
+
+---
+ docs/drama-voices.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/docs/drama-voices.md b/docs/drama-voices.md
+index 13dc8beb..fca54d3e 100644
+--- a/docs/drama-voices.md
++++ b/docs/drama-voices.md
+@@ -30,7 +30,7 @@ Voice files hold a person's voice: keep them out of source control.
+ tensorfold serve DRAMA3_DIR --voices voices/ --default-voice NAME
+ ```
+ 
+-- `--voices DIR` reads every regular `NAME.json` file in `DIR` once, at startup.
++- `--voices DIR` reads every regular `NAME.json` file in `DIR` once, at startup. A relative `DIR` is resolved from the server's working directory, not from the model's directory, so a launcher that starts the server elsewhere should pass an absolute path.
+   - Names are 1 to 64 characters of `A-Z a-z 0-9 . _ -` and start with a letter or digit. `default` is reserved.
+   - Hidden files, other extensions, directories and symbolic links are skipped.
+   - A file with a bad name, an unknown format, a transcript the reference would refuse, or codes that do not match `codes_sha256` stops the server from starting.
+-- 
+2.43.0
+

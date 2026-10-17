@@ -1,0 +1,29 @@
+From 8b3f3ac168789fad69a32e880c102e48252e83d0 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:10:25 +0800
+Subject: [PATCH 44/44] docs: the changelog says where the backbone and stream
+ measurements were taken
+
+The attention operator and text fixture numbers, and the 12.7 s a collapsing stream ran past its whole reply, were measured on our GB10 with our fixture and a test reply.
+---
+ CHANGELOG.md | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f0e2e64d..1bc149f7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,8 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
+ 
+ ## Unreleased
+ 
+-- speech: the Drama 3 backbone's full attention runs the reference's softmax schedule: one running max per 64-key tile, with the reference kernel's exp, division, gate sigmoid and fused multiply-adds. The attention operator now matches the reference on 98.1% and 96.2% of its outputs at layers 3 and 39 (was 70.4% and 57.5%). On the 182-token text fixture the backbone's distance to the reference fell from 0.124 to 0.053 relative L2 (semantic KL 0.024 to 0.0062, worst row cosine 0.80 to 0.92). Rows keep their bits whatever the chunk size, and decode uses the same arithmetic.
+-- speech: a streamed Drama 3 reply that collapses into silence now ends at the same frame as the whole reply of the same generation: the frame that completes 10 s of silence. Before, the stream ended up to 12.7 s later in one measured case, because the silence guard read each chunk after the stream's client had begun converting it to PCM16 in place. The guard now hears each chunk before it is handed over ([docs](docs/drama-voices.md#silence-guard))
++- speech: the Drama 3 backbone's full attention runs the reference's softmax schedule: one running max per 64-key tile, with the reference kernel's exp, division, gate sigmoid and fused multiply-adds. On our GB10, the attention operator now matches the reference on 98.1% and 96.2% of its outputs at layers 3 and 39 (was 70.4% and 57.5%), and on our 182-token text fixture the backbone's distance to the reference fell from 0.124 to 0.053 relative L2 (semantic KL 0.024 to 0.0062, worst row cosine 0.80 to 0.92). Rows keep their bits whatever the chunk size, and decode uses the same arithmetic.
++- speech: a streamed Drama 3 reply that collapses into silence now ends at the same frame as the whole reply of the same generation: the frame that completes 10 s of silence. Before, on our GB10 with a test reply, the stream ended 12.7 s later, because the silence guard read each chunk after the stream's client had begun converting it to PCM16 in place. The guard now hears each chunk before it is handed over ([docs](docs/drama-voices.md#silence-guard))
+ - speech: a Drama 3 synthesis that stays silent (below -60 dBFS) for 10 s ends there with `X-Finish-Reason: silence` and keeps its audio. Before, a collapsed reply generated up to a minute of near-digital silence before its end of speech or the frame limit. A stall that recovers sooner (one measured stall lasted 7.4 s) is kept untouched. Silence reached in the last frames still counts, ahead of the end of speech and the frame limit. With `--long-form`, such a segment ends the reply. To hear the audio while generating, a whole reply now decodes every 16 frames, with the incremental decode streams already use. On the 48-request default-voice capture, all 46 normal replies were byte-identical to the previous build, and the reply that stayed silent for 37 s was cut 10 s into its stall, a byte-identical prefix ([docs](docs/drama-voices.md#silence-guard))
+ - speech: `--max-frames N` (CUDA, 1 to 8191; default 1024) lets one Drama 3 synthesis generate up to N frames, so a reply of 190 s at N = 4096 is spoken in one pass with no joins. The context holds the prompt and the frames: prompts may take `min(4096, context - N)` rows, and `--context` must exceed N. The codec's decode buffers take about 1.19 MiB a frame (4.75 GiB at 4096). Text models refuse the flag. Without it, every limit and buffer is as before ([docs](docs/drama-voices.md#frame-limit))
+ - speech: `--long-form` speaks a long Drama 3 input in the fewest segments of up to `--long-form-chars` (default 500), balanced in length and cut where the text turns (a question, or a sentence opening with So, Okay, Now, Anyway, Here's, …), with a 0.60 s pause at such a cut. Each segment hears the earlier segments' text and generated codes as references (`--long-form-history`, default 1), which keeps the speaker the same across a join; a new segment still restarts its prosody. At each join only the pause the punctuation asks for and the model left out is added, as room tone (0.42 s after `.` and `!`, up to 0.70 s for a paragraph), and a segment off the earlier segments' speech level gets one gain of at most 3 dB. A reply has at most 12 segments and 6000 frames. `X-Long-Form-Segments` gives where each segment starts, and streams send the segments in order. With the flag off, or an input that fits in one segment, replies are unchanged ([docs](docs/drama-voices.md#long-form-replies))
+-- 
+2.43.0
+
