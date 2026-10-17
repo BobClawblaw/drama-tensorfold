@@ -168,6 +168,12 @@ refuse one speaker whose timbre changes within the take, so listen to the clip b
 instead of `--text` drafts a transcript to correct. The encoder runs `tensorfold-native voice encode` (WAV in PCM
 or IEEE float, channels averaged, resampled to 44.1 kHz) and adds `source`.
 
+Voice files of one source kind can be joined into one voice that speaks several reference passages in order:
+`python3 build/tensorfold/tools/zig/drama_voice.py combine voices/A.json voices/B.json voices/C.json --out
+voices/NAME.json --source-note "…"` writes a `drama3-voice/2` file. It builds the same prompt rows as a request
+that sends A and B as `references` for a voice holding C (an engine test asserts this), and `GET /v1/voices` reports
+each voice's reference count.
+
 On our GB10, our test voices, the native encoder's codes differ from the reference encoder's on 2.46–2.95% of
 semantic codes (three clips). Replies cloned from either encoding moved in speaker similarity to the clip by −0.0046
 to +0.0061 (ECAPA, three model-invented test voices, one take each), against a spread of 0.023 across six takes:
