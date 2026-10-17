@@ -28,3 +28,7 @@ runtime/
 *.f32
 *.bf16
 *.log
+
+# Voice clips, transcripts and voice files: they hold a person's voice
+clips/
+voices/

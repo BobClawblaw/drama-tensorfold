@@ -1,0 +1,42 @@
+From 0ca6b1dfcc185252658de58284c6cef62fd52641 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 20:05:46 +0800
+Subject: [PATCH 46/53] drama: drama_voice.py prints one summary when
+ tensorfold-native encodes
+
+---
+ tools/zig/drama_voice.py      | 3 ++-
+ tools/zig/drama_voice_test.py | 3 ++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/tools/zig/drama_voice.py b/tools/zig/drama_voice.py
+index 6762fd2a..21c128e6 100644
+--- a/tools/zig/drama_voice.py
++++ b/tools/zig/drama_voice.py
+@@ -63,7 +63,8 @@ def encode(reference: Path, checkpoint: Path, audio: Path, device: str) -> tuple
+ def encode_native(binary: str, checkpoint: Path, audio: Path, transcript: str, out: Path) -> dict:
+     """``tensorfold-native voice encode`` writes the same voice file, minus its source."""
+     command = [binary, "voice", "encode", str(audio), "--model", str(checkpoint), "--text", transcript, "--name", out.stem, "--out", str(out)]
+-    if subprocess.run(command).returncode != 0:
++    # its summary lacks the source; the one printed after it is the file's
++    if subprocess.run(command, stdout=subprocess.DEVNULL).returncode != 0:
+         raise SystemExit(f"{binary} voice encode failed")
+     return json.loads(out.read_text(encoding="utf-8"))
+ 
+diff --git a/tools/zig/drama_voice_test.py b/tools/zig/drama_voice_test.py
+index 85a1d3ea..86769593 100644
+--- a/tools/zig/drama_voice_test.py
++++ b/tools/zig/drama_voice_test.py
+@@ -33,7 +33,8 @@ class EncodeTests(unittest.TestCase):
+     def test_native_cli_encodes_when_present_and_the_tool_adds_the_source(self):
+         ran = []
+ 
+-        def native(command):
++        def native(command, stdout=None):
++            self.assertEqual(stdout, subprocess.DEVNULL)
+             ran.append(command)
+             voice = {"format": drama_voice.FORMAT, "text": "Hello there.", "codes_sha256": "c0de", "vq_codes": ROWS}
+             Path(command[command.index("--out") + 1]).write_text(json.dumps(voice), encoding="utf-8")
+-- 
+2.43.0
+

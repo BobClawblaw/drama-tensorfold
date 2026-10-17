@@ -1,0 +1,66 @@
+From 1507830f55dc7e909e3ac3daefb9deb383f23ee0 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:09:34 +0800
+Subject: [PATCH 53/53] drama: voice docs say only what was measured of the
+ encoders, and the consent test names a neutral fixture
+
+The encoders' memory, time and code differences were measured on our GB10 with three of our test clips; the docs and changelog now say so and give the measured peaks and times. The loader test's consented voice is release.json with consent/example.pdf; its assertions are unchanged.
+---
+ CHANGELOG.md                        | 2 +-
+ docs/drama-voices.md                | 6 +++---
+ zig/src/server/drama_voice_test.zig | 2 +-
+ 3 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f2a6e582..1f072299 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,7 +5,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
+ ## Unreleased
+ 
+ - speech: a voice file says whose voice it holds. `source` is `{kind: model-invented | owner | consented, note}`, the operator's attestation, and `--voices` refuses a file without one or with a blank note. `GET /v1/voices` lists the loaded voices (name, frames, seconds, source kind); there is no upload route. `tools/zig/drama_voice_clip.py` prepares a take: mono 44.1 kHz aimed at -20 dBFS speech level within -1 dBFS peaks, cut at a pause to a 10-30 s clip, refused when short, clipped, noisy (judged on the kept clip), over music or hum, or voiced by more than one speaker. Its transcript is either the take's, kept only when the cut leaves no loud frame out, or a local Whisper draft to correct; a confirmed transcript is never paired with a re-prepared clip. `drama_voice.py` encodes with `--reference` or `--native` when given, else with a `tensorfold-native` on `PATH` whose `--help` lists `voice encode` ([docs](docs/drama-voices.md))
+-- speech: `tensorfold-native voice encode CLIP.wav --model DIR --text T --name NAME --out NAME.json` writes a Drama 3 voice file with a native CUDA codec encoder (DAC encoder, pre_module and RVQ in BF16), no Python; 2.5 to 3 % of its semantic codes differ from the reference's ([docs](docs/drama-voices.md))
++- speech: `tensorfold-native voice encode CLIP.wav --model DIR --text T --name NAME --out NAME.json` writes a Drama 3 voice file with a native CUDA codec encoder (DAC encoder, pre_module and RVQ in BF16), no Python; on three of our test clips, 2.5 to 3 % of its semantic codes differ from the reference's ([docs](docs/drama-voices.md))
+ - speech: the Drama 3 backbone's full attention runs the reference's softmax schedule: one running max per 64-key tile, with the reference kernel's exp, division, gate sigmoid and fused multiply-adds. On our GB10, the attention operator now matches the reference on 98.1% and 96.2% of its outputs at layers 3 and 39 (was 70.4% and 57.5%), and on our 182-token text fixture the backbone's distance to the reference fell from 0.124 to 0.053 relative L2 (semantic KL 0.024 to 0.0062, worst row cosine 0.80 to 0.92). Rows keep their bits whatever the chunk size, and decode uses the same arithmetic.
+ - speech: a streamed Drama 3 reply that collapses into silence now ends at the same frame as the whole reply of the same generation: the frame that completes 10 s of silence. Before, on our GB10 with a test reply, the stream ended 12.7 s later, because the silence guard read each chunk after the stream's client had begun converting it to PCM16 in place. The guard now hears each chunk before it is handed over ([docs](docs/drama-voices.md#silence-guard))
+ - speech: a Drama 3 synthesis that stays silent (below -60 dBFS) for 10 s ends there with `X-Finish-Reason: silence` and keeps its audio. Before, a collapsed reply generated up to a minute of near-digital silence before its end of speech or the frame limit. A stall that recovers sooner (one measured stall lasted 7.4 s) is kept untouched. Silence reached in the last frames still counts, ahead of the end of speech and the frame limit. With `--long-form`, such a segment ends the reply. To hear the audio while generating, a whole reply now decodes every 16 frames, with the incremental decode streams already use. On the 48-request default-voice capture, all 46 normal replies were byte-identical to the previous build, and the reply that stayed silent for 37 s was cut 10 s into its stall, a byte-identical prefix ([docs](docs/drama-voices.md#silence-guard))
+diff --git a/docs/drama-voices.md b/docs/drama-voices.md
+index a704b2e5..f88f2222 100644
+--- a/docs/drama-voices.md
++++ b/docs/drama-voices.md
+@@ -50,7 +50,7 @@ python3 tools/zig/drama_voice.py --checkpoint DRAMA3_DIR --audio clips/NAME.wav
+ - The encoder:
+   - `--reference SGLANG_OMNI_CHECKOUT` or `--native BINARY` chooses it; the two exclude each other.
+   - Without either, the tool uses the `tensorfold-native` on `PATH`, if its `--help` lists `voice encode`. Older builds serve speech but cannot encode, and the tool refuses them rather than run them.
+-- `--reference` runs the reference server's own encode for a `references[].audio_path`: `load_audio` at the codec's 44.1 kHz in mono, then `FishReferenceEncodeHook` under bfloat16 autocast on CUDA (the reference's default `reference_encode_dtype`). With `--device cpu` it encodes in float32. A 15.7 s clip takes about 2.6 GB of device memory and 10 to 20 s, most of it loading `codec.pth`.
++- `--reference` runs the reference server's own encode for a `references[].audio_path`: `load_audio` at the codec's 44.1 kHz in mono, then `FishReferenceEncodeHook` under bfloat16 autocast on CUDA (the reference's default `reference_encode_dtype`). With `--device cpu` it encodes in float32. On our GB10, a 15.7 s clip peaked at 2.6 GB of device memory, and the encode alone took about 1.5 s.
+ - Clips longer than 60 s are refused, as the reference refuses them. Leading and trailing white space in the transcript is dropped.
+ 
+ Without Python, the native binary encodes a WAV clip (PCM or IEEE float, channels averaged) on CUDA:
+@@ -59,8 +59,8 @@ Without Python, the native binary encodes a WAV clip (PCM or IEEE float, channel
+ tensorfold-native voice encode clip.wav --model DRAMA3_DIR --text "the clip's exact words" --name NAME --out voices/NAME.json
+ ```
+ 
+-It runs the same encode in BF16 with the reference's roundings, in under 1 GB of device memory and about 4.5 s for a 50 s clip.
+-Its codes are not yet identical to the reference's: on three clips 2.5 to 3 % of semantic codes and 3 to 14 % of residual codes differ.
++It runs the same encode in BF16 with the reference's roundings. On our GB10 it peaked at 685 MB of device memory for a 15.7 s clip and about 1.3 GB for a 49-53 s clip, and took about 4.5 s wall time for a 50 s clip.
++Its codes are not yet identical to the reference's: on three of our test clips, 2.5 to 3 % of semantic codes and 3 to 14 % of residual codes differ.
+ It resamples any common rate up to 384 kHz to 44.1 kHz.
+ It refuses a rate whose resampling filter would pass 2048 taps or 2^20 coefficients (44056 Hz, for one), a truncated file or chunk, a partial sample frame and a malformed WAVE_FORMAT_EXTENSIBLE header.
+ Run alone it writes no `source`, so `--voices` refuses the file; `drama_voice.py --native BINARY` runs it and adds one.
+diff --git a/zig/src/server/drama_voice_test.zig b/zig/src/server/drama_voice_test.zig
+index 7cd3b96d..b4df270a 100644
+--- a/zig/src/server/drama_voice_test.zig
++++ b/zig/src/server/drama_voice_test.zig
+@@ -187,7 +187,7 @@ test "voice files: regular NAME.json files only, names, consent and digests chec
+     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+     try tmp.dir.writeFile(io, .{ .sub_path = "me.json", .data = try voiceFile(a, "Hello there.", owner, true) });
+     try tmp.dir.writeFile(io, .{ .sub_path = "alto.json", .data = try voiceFile(a, "Invented.", "{\"kind\": \"model-invented\", \"note\": \"a model's own voice\"}", true) });
+-    try tmp.dir.writeFile(io, .{ .sub_path = "vera.json", .data = try voiceFile(a, "Agreed.", "{\"kind\": \"consented\", \"note\": \" signed release, consent/vera.pdf \"}", true) });
++    try tmp.dir.writeFile(io, .{ .sub_path = "release.json", .data = try voiceFile(a, "Agreed.", "{\"kind\": \"consented\", \"note\": \" signed release, consent/example.pdf \"}", true) });
+     try tmp.dir.writeFile(io, .{ .sub_path = ".hidden.json", .data = "not read" });
+     try tmp.dir.writeFile(io, .{ .sub_path = "notes.txt", .data = "not read" });
+     try tmp.dir.createDir(io, "folder.json", .default_dir);
+-- 
+2.43.0
+
