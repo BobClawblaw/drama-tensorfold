@@ -10,6 +10,7 @@ published; the JSON files keep the numbers exactly as measured.
 | [`qualification.json`](qualification.json) | Numerical gate status, the reference self-control, the revised worst-row bar, clipped replies and the listening test |
 | [`long-text-tail.json`](long-text-tail.json) | The silent tails of replies that reach the 1024-frame cap, on both engines |
 | [`backbone-attention-tiles.json`](backbone-attention-tiles.json) | The backbone against the reference before and after patch 0040's 64-key attention tiles, with its speed cost |
+| [`stream-silence-cut.json`](stream-silence-cut.json) | A collapsing reply streamed and whole before and after patches 0041–0043, and the default-voice corpus gate |
 
 ## Speed stages
 
@@ -88,6 +89,7 @@ recipe, and they are limits and budgets, not measurements.
 | 46 normal replies byte-identical, 14 speed patches, warm RTF 1.087 → 0.636–0.655 | measured (retained summary) | [`speed-stages.json`](speed-stages.json); the patches are in [`../engine/patches/`](../engine/patches/README.md) |
 | Accuracy bars and native values before patch 0040 | measured | [`qualification.json`](qualification.json) `qualification_01`, `backbone_worst_row_bar_revision.rescore` |
 | Backbone values after patch 0040, voice-prompt values, RTF 0.642–0.650 → 0.682, silence finishes 2 → 0 of 40 | measured | [`backbone-attention-tiles.json`](backbone-attention-tiles.json) `text_fixture_182_tokens`, `voice_prompt_449_rows`, `serving` |
+| Silence cut at 16.579 s streamed and whole (before 29.77 s / 17.09 s), 46 normal replies byte-identical, streams 9 of 9, long-05 at 20.2 s | measured | [`stream-silence-cut.json`](stream-silence-cut.json) |
 | Long-text cap behaviour | measured | [`long-text-tail.json`](long-text-tail.json) |
 | 4 of 5 listening pairs, one not blind | rating | [`qualification.json`](qualification.json) `listening_ab_01` |
 | 88 GiB `MemAvailable` at load, 54 GiB cap, 34 GiB abort floor | configuration | [`../recipe/pilot.py`](../recipe/pilot.py) constants; [`../recipe/README.md`](../recipe/README.md) |

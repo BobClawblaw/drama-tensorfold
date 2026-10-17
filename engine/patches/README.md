@@ -17,5 +17,6 @@ downloaded separately; see [`NOTICE`](../../NOTICE).
 | 0035–0037 | `--long-form`: long inputs in balanced segments at sentence ends, each hearing the one before, joined with room-tone pauses sized by punctuation |
 | 0038–0039 | `--max-frames N` for one synthesis of up to about 190 s, and `X-Finish-Reason: silence` after 10 s of silence |
 | 0040 | Backbone full attention runs the reference's 64-key softmax tiles and arithmetic: closer to the reference, about 5% slower on our GB10, our corpus ([results](../../results/backbone-attention-tiles.json)) |
+| 0041–0044 | A stream's silence guard hears each chunk before sending it, so a stream and a whole reply cut at the same frame ([results](../../results/stream-silence-cut.json)); long-form trailers formatted without allocating; the changelog scopes the 0040–0041 measurements |
 
 `SHA256SUMS` pins every patch.
