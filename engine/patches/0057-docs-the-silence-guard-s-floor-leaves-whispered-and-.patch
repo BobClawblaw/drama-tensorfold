@@ -4,7 +4,7 @@ Date: Sat, 17 Oct 2026 14:40:05 +0800
 Subject: [PATCH 57/57] docs: the silence guard's floor leaves whispered and
  soft speech alone, measured
 
-Eleven renders in fr2-cut and the built-in voice (whisper, soft, a quietly prefix, sighs, a bedtime story, speech
+Eleven renders in a cloned voice and the built-in voice (whisper, soft, a quietly prefix, sighs, a bedtime story, speech
 turning into a whisper) all ended stop: the longest run below -40 dBFS inside speech was 2.51 s, and every 10 s held a
 frame at -34.8 dBFS or louder. The one trip, the built-in voice asked to speak quietly, was a collapse into a hum:
 cut at 10.63 s after one word, where the live build hummed on for 97.85 s.
@@ -43,7 +43,7 @@ index 76d67d02..989d9186 100644
  - **The -40 dBFS floor** was chosen on 278 renders of the default voice and model-invented voices, replayed offline:
    - Each of the 11 collapses has 10 s with no frame above -51.7 dBFS. Each of the other 267 renders has a frame at -18.5 dBFS or louder in every 10 s, and none has a run below -40 dBFS longer than the recovering stall (7.5 s at this floor).
    - A -60 dBFS floor missed one collapse into a hum, whose frames kept rising above -60 dBFS and restarting the run, and ended another only 15.4 s late, once its hum had sunk below -60 dBFS for good. At -40 dBFS each ends 10 s after it began.
-+  - Whispered and soft speech stays clear of it. Eleven renders in fr2-cut and the built-in voice, of `<whisper>`, `<soft>`, `[quietly, almost whispering]`, `[sighs]`, a bedtime story and speech turning into a whisper, each 17-35 s, all ended `stop`. Some whispered words peak below -40 dBFS (the quietest at -50.8), but louder words follow within 2.5 s at most, and every 10 s holds a frame at -34.8 dBFS or louder.
++  - Whispered and soft speech stays clear of it. Eleven renders in a cloned voice and the built-in voice, of `<whisper>`, `<soft>`, `[quietly, almost whispering]`, `[sighs]`, a bedtime story and speech turning into a whisper, each 17-35 s, all ended `stop`. Some whispered words peak below -40 dBFS (the quietest at -50.8), but louder words follow within 2.5 s at most, and every 10 s holds a frame at -34.8 dBFS or louder.
    - Speech quieter than -40 dBFS for 10 s is taken for a collapse.
  
  ## Long-form replies
