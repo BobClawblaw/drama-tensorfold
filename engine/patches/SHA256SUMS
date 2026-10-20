@@ -54,6 +54,6 @@ cd8c2954fd73634406e0d398be501c22b3beabf216fd0698b7cf4ec5b9a56cf5  0053-drama-voi
 f2358220d442d3a768260212bfbcf9ee4b612cff2f3c5a9bbf487e8bd2786ae1  0054-drama-clip-preparation-tells-two-speakers-apart-by-t.patch
 16fb21d9710427ae4908b5eff1231d9f5cc1252320cc7a4dca2b79df0b69e359  0055-drama-the-silence-guard-also-ends-a-reply-that-colla.patch
 97e99934170a6b176c246ea72fcf28f876b271139bcc5ce2122e91f46ac9ebf0  0056-drama-a-test-pins-the-silence-guard-s-floor-at-40-dB.patch
-4779a964dc88db97b2b7068e48a7090fbd7214e72008ae367421e34009635761  0057-docs-the-silence-guard-s-floor-leaves-whispered-and-.patch
+b96e989785f0776c03ae5f7f46c6b06a4379c2b5153a63c1eb91af6faf7d7e0e  0057-docs-the-silence-guard-s-floor-leaves-whispered-and-.patch
 3a570ba344b07d36c7df126fec18c5acf6607f3f6f78dde16cc049fafc571960  0058-drama-a-voice-file-can-hold-several-references-spoke.patch
 c0496f21a2f4ef80d5e023d30b07f1985c59c01830e62e9171d3ffd48d132f7c  0059-drama-drama_voice.py-combine-refuses-an-input-the-vo.patch
