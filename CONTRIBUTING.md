@@ -148,7 +148,7 @@ Install `grill-perf` [v0.11.0](https://github.com/plotarmordev/thegrill/releases
 [INSTALL.md](https://github.com/plotarmordev/thegrill/blob/v0.11.0/docs/performance/INSTALL.md#obtain-verify-unpack)
 shows, with `VERSION=0.11.0` and
 `ARTIFACT_BASE_URL=https://github.com/plotarmordev/thegrill/releases/download/v0.11.0`: it verifies the checksum
-before unpacking and sets `GRILL_PERF`, which the second shell below needs too.
+before unpacking and sets `GRILL_PERF`, which the second terminal below needs too.
 
 Then, from `$ROOT/base`, write the runner and the workload every run shares, after the Grill's
 [speech servers](https://github.com/plotarmordev/thegrill/blob/v0.11.0/docs/performance/MEDIA.md#speech-servers)
