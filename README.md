@@ -1,48 +1,23 @@
 # drama-tensorfold
 
+> [!IMPORTANT]
+> **Pending the cutover A/B result.** This branch moves the recipe from the old patched engine to upstream
+> TensorFold plus opt-in patches. Do not merge it until the live-voice A/B of the cutover build passes.
+
 [![code: Apache-2.0](https://img.shields.io/badge/code-Apache--2.0-0969da?style=flat-square)](LICENSE)
 [![model: FACL v1.0](https://img.shields.io/badge/model-FACL_v1.0-8250df?style=flat-square)](https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE)
 [![GPU: GB10 sm_121](https://img.shields.io/badge/GPU-GB10_sm__121-76b900?style=flat-square)](#quickstart)
 [![CUDA 13](https://img.shields.io/badge/CUDA-13-76b900?style=flat-square)](#quickstart)
-[![status: testing, not qualified](https://img.shields.io/badge/status-testing%2C_not_qualified-a16207?style=flat-square)](#status)
+[![status: pending cutover A/B](https://img.shields.io/badge/status-pending_cutover_A%2FB-a16207?style=flat-square)](#the-patches)
 
-**Fish Audio's Drama 3 text-to-speech, about 1.5x faster on an NVIDIA GB10, on TensorFold's native Zig/CUDA engine.**
+**Fish Audio's Drama 3 text-to-speech on an NVIDIA GB10, on TensorFold's native Zig/CUDA engine.**
 
-This repository patches [TensorFold](https://github.com/ashhart/TensorFold) to run Drama 3. It builds the engine
-and starts a local speech server with an OpenAI-style `/v1/audio/speech` route, whole or streamed. It also holds
-every benchmark and accuracy check behind the numbers below.
+[TensorFold](https://github.com/ashhart/TensorFold) runs Drama 3 natively since v1.1.0. This repository pins
+upstream TensorFold and adds a small series of opt-in patches. It builds the engine and starts a local speech
+server with an OpenAI-style `/v1/audio/speech` route, whole or streamed.
 
 **Built with Fish Audio.** The model weights are not in this repository; you download them from
 [Hugging Face](https://huggingface.co/fishaudio/drama-3) under Fish Audio's own [license](#license).
-
-| I want to... | Use | What you get |
-|---|---|---|
-| Run Drama 3 on my GB10 | [Quickstart](#quickstart) ![Ready to try](https://img.shields.io/badge/ready_to_try-0969da?style=flat-square) | A local speech server, first audio in about 0.14 s |
-| Check the speed claims | [`bench/`](bench/README.md) ![Benchmark tools](https://img.shields.io/badge/benchmark_tools-1a7f37?style=flat-square) | Run the comparison on your machine |
-| Check the accuracy | [`qualification/`](qualification/README.md) ![Not qualified](https://img.shields.io/badge/not_qualified-a16207?style=flat-square) | Every gate against the reference, with its honest result |
-
-## Reference vs native
-
-On the same GB10 host (DGX Spark class, CUDA 13 libraries), one engine at a time: the stock
-[sglang-omni](https://github.com/sgl-project/sglang-omni) reference against the final native build. Each engine
-read 24 English texts 3 times, with no failures on either. The results were independently reviewed.
-
-| Warm, p50 | sglang-omni reference | TensorFold native | Speedup |
-|---|---:|---:|---:|
-| Real-time factor (lower is faster) | 0.939 | 0.634 | **1.48x** |
-| Typical clip (about 8 s of audio), whole reply | 7.93 s | 4.89 s | **1.62x** |
-| First audio, streaming | 0.521 s | 0.141 s | **3.7x** |
-| Short texts (19–47 characters) | 2.50 s | 1.86 s | **1.35x** |
-| Medium texts (114–144 characters) | 7.93 s | 4.89 s | **1.62x** |
-| Long texts (283–313 characters) | 20.22 s | 12.90 s | **1.57x** |
-| Process start to ready (single start, reused caches) | 254 s | 6.4 s | **39x** |
-
-The last row is one start per engine, not a median and not disk-cold. The reference's admission and page-cache
-conditions differed from native's, and that effect was not isolated. Evidence:
-[`results/before-after-02/`](results/before-after-02/README.md), and where each number comes from:
-[provenance](results/README.md#where-the-numbers-come-from). The speed work changed no audio: all 46 normal test
-replies stayed byte-identical across the 14 speed patches. These numbers predate patch 0040, which trades about 5%
-of this speed for accuracy (see [Status](#status)).
 
 ## Quickstart
 
@@ -62,6 +37,9 @@ GPU_LOCK=/path/to/your/shared/gpu.lock && mkdir -p runtime
 python3 recipe/pilot.py --native-bin build/tensorfold/zig-out/native/bin/tensorfold-native \
   --checkpoint drama-3 --runtime-dir runtime --gpu-lock "$GPU_LOCK" --evidence-dir runs/pilot-01
 ```
+
+`scripts/build-engine.sh` checks out the commit pinned in [`engine/UPSTREAM`](engine/UPSTREAM), applies
+[`engine/patches`](engine/patches) in order and builds `tensorfold-native` and `drama3-generate`.
 
 When it prints `DRAMA_PILOT_READY`, synthesize from another terminal. The second command streams and plays as
 it arrives:
@@ -94,122 +72,65 @@ the license's Section III(c), which needs a separate license from Fish Audio.
 <summary>HTTP contract</summary>
 
 `POST /v1/audio/speech` takes `model` (`fishaudio/drama-3`), `input` (at most 4096 characters), `voice`
-(`default`, or a name loaded with `--voices`), `references` (transcript plus `vq_codes`), `response_format`
-(`wav` or `pcm`) and `stream` (`true` needs `pcm`). Anything else is refused. `GET /v1/voices` lists the voices
-loaded with `--voices`.
+(`default`, or a name loaded with `--voices`), `response_format` (`wav` or `pcm`) and `stream` (`true` needs
+`pcm`). Request-supplied references and other synthesis modifiers are refused. `GET /v1/voices` lists the voices.
 
-- **Whole reply:** `Content-Length` framing and an `X-Finish-Reason` header: `stop`, `length` or `silence`.
-- **Streamed reply:** chunked mono 16-bit 44.1 kHz PCM, sent as whole frames. A reply that did not end in `stop`
-  ends with an `X-Finish-Reason` trailer.
-- **`length`:** the reply hit the frame cap (`--max-frames`, 1024 by default, 47.55 s) without an end of speech;
-  the audio is clipped.
-- **`silence`:** the model stayed below -40 dBFS for 10 s, which also catches a collapse into a steady hum; the reply
-  ends at the frame that completes the 10 s and keeps the audio before it. A stream hears each chunk before sending
-  it, so it ends at the same sample as the whole reply of the same generation. Measured with the previous -60 dBFS
-  floor (patches 0041-0043), on our GB10, our corpus: on a collapsing reply in a model-invented test voice, both ended
-  at 16.579 s with identical PCM, where before the stream ran 29.77 s against 17.09 s whole; the 46 normal corpus
-  replies stayed byte-identical and streams passed 9 of 9 ([evidence](results/stream-silence-cut.json)).
-- **Errors:** `400` for a refused request, `503` while the single engine slot is busy, `500` for a server fault.
+- **Whole reply:** `Content-Length` framing and an `X-Finish-Reason` header: `stop`, `length` or, with the silence
+  guard on, `silence`.
+- **Streamed reply:** chunked mono 16-bit 44.1 kHz PCM. A reply that ends in `length` or `silence` ends with an
+  `X-Finish-Reason` trailer.
+- **`length`:** the reply hit the frame cap (1024 frames, 47.55 s, unless `--max-frames` sets another) without an
+  end of speech; the audio is clipped.
+- **Errors:** `400` for a refused request, `503` while the engine is busy, `500` for a server fault.
 </details>
 
-### Long replies
+## The patches
 
-Pass serve flags to the launcher after `--`:
+Upstream TensorFold already serves Drama 3. Each patch below adds one feature that stays off until you pass its
+flag, so a server started without them answers as upstream does. The exceptions are the first two: batched
+prefill is on by default (`TF_DRAMA_PREFILL_ROWS=1` restores upstream's single-row prefill) and the replay fix is
+a bug fix. The patches stack and apply in order; each one's notes are in the engine tree's `CHANGELOG.md` or
+`docs/`.
 
-```sh
-python3 recipe/pilot.py … -- --max-frames 4096 --long-form --long-form-chars 2400
-```
+| Patch | Adds | Opt in with | Upstream |
+|---|---|---|---|
+| 0001 (K0) | CUDA prompt prefill in bounded row chunks | on by default; `TF_DRAMA_PREFILL_ROWS` | [#1120](https://github.com/ashhart/TensorFold/pull/1120) |
+| 0002 | Replay waits for poison fills before buffers are reused | always on | [#1119](https://github.com/ashhart/TensorFold/pull/1119) |
+| 0003 (K1) | A configurable frame budget | `--max-frames N` | [#1134](https://github.com/ashhart/TensorFold/pull/1134) |
+| 0004 (K7) | An allowlist for bracketed speech controls | `--allowed-controls LIST` | to be proposed |
+| 0005 (K9) | Attested voice catalogs and `GET /v1/voices` | `--voices DIR`, `--default-voice NAME` | [#1135](https://github.com/ashhart/TensorFold/pull/1135) |
+| 0006 (K2) | A sustained-silence guard that ends a reply as `silence` | `--silence-floor-dbfs`, `--silence-seconds` | to be proposed |
+| 0007 (K3) | The guard's onset rule: silence before enough voiced audio | `--silence-onset-s`, `--silence-onset-voiced-s` | to be proposed |
+| 0008 (K4) | The guard's mid rule: an ending lost in a long silence | `--silence-mid-s`, `--silence-mid-min-voiced-s` | to be proposed |
+| 0009 (K5) | Whole replies the guard ended are drawn again | `--silence-redraws N`, `--silence-redraw-budget-s`, `--silence-redraw-controls` | to be proposed |
+| 0010 (K6) | Whole replies that stopped short of their text are drawn again | `--short-reply-ratio`, `--short-reply-chars-per-s` | to be proposed |
+| 0011 (K8) | A whole reply is drawn once more when a phrase opens far above the others | `--register-redraw-st`, `--register-redraw-high`, `--register-high-hz` | to be proposed |
 
-- **`--max-frames 4096`:** one synthesis speaks up to about 190 s, so a typical spoken reply is one generation
-  with no joins. Measured: 52 s, 49 s and 92.5 s replies each in one request, all ending in `stop`, Whisper WER
-  2.0-2.5%, rendered at RTF about 0.68.
-- **`--long-form`:** an input longer than `--long-form-chars` is spoken in balanced segments cut at sentence ends,
-  each conditioned on the previous segment's text and codes, joined with room-tone pauses sized by punctuation.
-  A new segment still restarts its prosody (measured +2 to +5 semitones at a join), so prefer one generation.
-- **`--voices DIR --default-voice NAME`:** serve voice files (a reference clip's transcript and codes) and make
-  one of them the voice `default` names. Make them as in [Voice cloning](#voice-cloning-local).
-  A relative `DIR` resolves from the server's working directory, which `recipe/pilot.py` sets to `--runtime-dir`,
-  so pass an absolute path.
-- **Delivery:** if you re-encode replies to Opus, use `-application audio` at 64 kbps or more. `voip` at 48 kbps
-  cut 4-8 kHz by up to 4.8 dB in our tests.
-
-Without these flags replies are unchanged except where the silence guard ends a stall. Measured with the previous
--60 dBFS floor: all 46 normal default-voice corpus replies (23 texts, two passes) are byte-identical and streams pass
-9 of 9 checks; long-05 is cut at 20.2 s, 10 s into its silent stall ([evidence](results/stream-silence-cut.json)).
-Replayed offline at -40 dBFS, long-05 is cut at the same 20.2 s ([evidence](results/silence-guard-floor.json)).
-
-### Voice cloning (local)
-
-Clone only a voice the model invented, your own, or one whose owner has consented on record, as the model license
-requires ([License](#license), IV(b)). Each voice file says which in `source` (`model-invented`, `owner` or
-`consented`, with a note), and `--voices` refuses a file without it. `source` is your attestation: nothing checks
-the consent behind it. Clips and voice files hold a person's voice; `clips/` and `voices/` are git-ignored here.
-
-Prepare a take as a 10–30 s clip (needs `numpy` and `soundfile`), encode it on the GPU under your GPU lock, and
-serve it:
+Pass serve flags to the launcher after `--`. An illustrative launch with the frame budget, the silence guard and
+one redraw; the numbers are examples, not tuned values, so calibrate thresholds on your own voice:
 
 ```sh
-mkdir -p clips voices
-python3 build/tensorfold/tools/zig/drama_voice_clip.py take.wav --out clips/NAME.wav --text take.txt
-flock "$GPU_LOCK" python3 build/tensorfold/tools/zig/drama_voice.py \
-  --native build/tensorfold/zig-out/native/bin/tensorfold-native --checkpoint drama-3 \
-  --audio clips/NAME.wav --text clips/NAME.txt --out voices/NAME.json \
-  --source-kind owner --source-note "my own voice, recorded 2026-10-17"
-python3 recipe/pilot.py … -- --voices "$PWD/voices" --default-voice NAME
-curl -sS http://127.0.0.1:18793/v1/voices
+python3 recipe/pilot.py … -- --max-frames 2048 --silence-floor-dbfs -50 --silence-seconds 6 --silence-redraws 1
 ```
 
-The clip tool levels the take, cuts it at a pause and refuses clipped, short or noisy takes. Its other gates are
-cheap heuristics: a tonal check on the pauses for steady music or hum, and a speaker check on timbre, a weighted
-two-means split of the stretches' mel cepstra with an empirical threshold set on model-invented voices
-([calibration](results/clip-speaker-check.json)). They miss two speakers of close timbre in
-a band-limited take, a second voice with no stretch of its own and music more than 60 dB under the speech, and can
-refuse one speaker whose timbre changes within the take, so listen to the clip before encoding it. `--asr WHISPER_DIR`
-instead of `--text` drafts a transcript to correct. The encoder runs `tensorfold-native voice encode` (WAV in PCM
-or IEEE float, channels averaged, resampled to 44.1 kHz) and adds `source`.
+A voice catalog is a directory of `drama3-http-voice/1` files, each with a `source` attestation (`synthetic`,
+`self` or `consented`); the format is in `docs/drama-http-voices.md` in the engine tree. Clone only a voice the
+model invented, your own, or one whose owner has consented on record, as the model license requires
+([License](#license), IV(b)). `clips/` and `voices/` are git-ignored here. `recipe/pilot.py` runs the server in
+`--runtime-dir`, so pass `--voices` an absolute path.
 
-Voice files of one source kind can be joined into one voice that speaks several reference passages in order:
-`python3 build/tensorfold/tools/zig/drama_voice.py combine voices/A.json voices/B.json voices/C.json --out
-voices/NAME.json --source-note "…"` writes a `drama3-voice/2` file. It builds the same prompt rows as a request
-that sends A and B as `references` for a voice holding C (an engine test asserts this), and `GET /v1/voices` reports
-each voice's reference count.
+## Legacy: the patched engine
 
-On our GB10, our test voices, the native encoder's codes differ from the reference encoder's on 2.46–2.95% of
-semantic codes (three clips). Replies cloned from either encoding moved in speaker similarity to the clip by −0.0046
-to +0.0061 (ECAPA, three model-invented test voices, one take each), against a spread of 0.023 across six takes:
-the take noise of one model-invented voice ([evidence](results/native-voice-encoder.json)). The gates, refusals and
-voice file format are in `docs/drama-voices.md` in the engine tree.
-
-## Status
-
-> [!WARNING]
-> **Testing, not qualified.** Native is faster but does not meet these accuracy bars against the reference:
-> - backbone all-row cosine 0.9986 (bar 0.999), last-row cosine 0.99809 (bar 0.999) and hidden-state relative L2
->   0.0528 (bar 0.05);
-> - one-frame codec decode 33.1 dB (bar 40 dB);
-> - a 7-row tower top-1 that differs where the reference's logits tie.
->
-> **Backbone attention** now runs the reference's 64-key softmax tiles (patch 0040). On the 182-token text fixture
-> that passes three bars it failed: worst-row cosine 0.8006 → 0.9169 (bar 0.8713, derived from the reference's own
-> variance), semantic KL 0.0243 → 0.0062 (bar 0.01) and top-30 overlap 0.867 → 0.933 (bar 0.9). On a
-> voice-reference prompt it gains nothing (relative L2 0.0552 → 0.0558, KL 0.0067 → 0.0087). It costs about 5%:
-> RTF 0.682 on the 48-request capture, against 0.642–0.650 for the previous engine in the same session, on our
-> GB10, our corpus. Replies that ended in silence went from 2 of 40 test replies (20 with expression cues) in one
-> test voice to 0 of 40, the same texts and voice; a small sample.
-> Evidence: [`results/backbone-attention-tiles.json`](results/backbone-attention-tiles.json).
->
-> **Long text:** the model can stall in silence mid-reply: one test text recovered after 7.4 s, long-05 never
-> recovered within the 47.55 s cap. Native now ends a reply after 10 s below -40 dBFS with `X-Finish-Reason: silence`.
-> Replayed over 278 renders of the built-in and model-invented voices, that floor ends all 11 collapses, including one
-> hum the old -60 dBFS floor missed, and none of the other 267; whispered and soft test replies all ended `stop`, on our
-> GB10 ([evidence](results/silence-guard-floor.json)).
-
-One rater preferred native in 4 of 5 listening pairs; one pair was not blind. This does not change
-qualification. Every gate and result is in [`results/`](results/README.md).
+Before upstream shipped Drama 3, this recipe built its own port: 59 patches on TensorFold `c7137bb3`, last at
+commit [`0f54000`](https://github.com/plotarmordev/drama-tensorfold/tree/0f54000374831db1023791a5c4b9f0b98e9cff18).
+That engine's speed comparison against the sglang-omni reference, its accuracy gates, `--long-form` and its voice
+cloning tools (`drama_voice_clip.py`, `drama_voice.py`, `tensorfold-native voice encode`) are not in the new base.
+[`qualification/`](qualification/README.md) and [`results/`](results/README.md) measure that engine; check out
+`0f54000` to rebuild it.
 
 ## License
 
-**Built with Fish Audio.** All code here is [Apache-2.0](LICENSE), including the engine patches and their codec.
+**Built with Fish Audio.** All code here is [Apache-2.0](LICENSE), including the engine patches.
 The Drama 3 model weights and codec checkpoint are under the
 [Fish Audio Community License v1.0](https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE)
 and are downloaded separately; [NOTICE](NOTICE) has the attributions.
