@@ -55,8 +55,8 @@ Export before you rerun `scripts/build-engine.sh`: it checks out the pinned comm
 
 ## Tests
 
-Every behaviour change carries a test in the same patch, and the test fails without the change: patch 0056's
-test, for example, fails with the silence floor 0.2 dB either side of -40 dBFS. In `build/tensorfold`:
+Every behaviour change carries a test in the same patch, and the test fails without the change: a threshold test,
+for example, fails just above and just below the threshold it pins. In `build/tensorfold`:
 
 ```sh
 /path/to/zig-0.17.0/zig build test -Dnvcc=/usr/local/cuda/bin/nvcc   # host-side unit tests, no GPU
