@@ -17,6 +17,10 @@ Read the [README](README.md), [`recipe/README.md`](recipe/README.md) and
 Moving `engine/UPSTREAM` to another TensorFold commit is a pull request of its own, with the whole series
 re-applied and every check below rerun.
 
+Every patch in `engine/patches/` is also proposed upstream: the README's patch table links its TensorFold pull
+request. The recipe may ship a patch before TensorFold merges it; a patch without an upstream pull request does not
+belong in the series.
+
 ## Setup
 
 You need what the README's [Quickstart](README.md#quickstart) lists: CUDA 13, Zig 0.17.0, user systemd and the
@@ -29,7 +33,7 @@ ZIG=/path/to/zig-0.17.0/zig NVCC=/usr/local/cuda/bin/nvcc scripts/build-engine.s
 ```
 
 `scripts/build-engine.sh` checks TensorFold out at the pinned commit in `build/tensorfold`, applies every patch
-with `git am` (one commit per patch), builds `tensorfold-native` and the oracle tools, and prints
+with `git am` (one commit per patch), builds `tensorfold-native` and `drama3-generate`, and prints
 `engine: <upstream> + N patches = <engine HEAD>`. The same series gives the same engine HEAD on every machine.
 `recipe/pilot.py` serves the build as the Quickstart shows. The qualification gates also need the reference
 runtime directory: see [`qualification/README.md`](qualification/README.md#requirements).
@@ -41,7 +45,7 @@ series and check that the whole series still applies and builds from a clean che
 
 ```sh
 cd build/tensorfold
-git format-patch --start-number 60 -o ../../engine/patches HEAD~2   # two new commits; 0060 is the next free number
+git format-patch --start-number 12 -o ../../engine/patches HEAD~2   # two new commits; 0012 is the next free number
 cd ../../engine/patches && sha256sum -- *.patch > SHA256SUMS
 cd ../.. && ZIG=/path/to/zig-0.17.0/zig NVCC=/usr/local/cuda/bin/nvcc scripts/build-engine.sh
 ```
@@ -56,8 +60,8 @@ test, for example, fails with the silence floor 0.2 dB either side of -40 dBFS. 
 
 ```sh
 /path/to/zig-0.17.0/zig build test -Dnvcc=/usr/local/cuda/bin/nvcc   # host-side unit tests, no GPU
-python3 tools/zig/drama_voice_test.py                                 # these two need numpy and soundfile
-python3 tools/zig/drama_voice_clip_test.py
+python3 tools/zig/test_speech_flags.py                                # needs a built tensorfold-native
+python3 tools/zig/test_drama_prefill_compare.py
 ```
 
 A change to `bench/` keeps `python3 bench/stream_check.py --self-test` passing. GPU checks are the oracle tools
