@@ -4,7 +4,7 @@ Date: Wed, 21 Oct 2026 00:18:27 +0800
 Subject: [PATCH 04/11] feat(server): filter speech controls with an opt-in
  allowlist
 
-K7: net diff of pr/allowed-controls 8cf0ae2e (5 commits).
+K7: net diff of pr/allowed-controls aa6bdaaa (6 commits).
 ---
  CHANGELOG.md                               |   1 +
  docs/speech-controls.md                    |  46 +++++
@@ -401,7 +401,7 @@ index 00000000..401e23a0
 +}
 diff --git a/zig/src/server/drama_allow_golden_test.zig b/zig/src/server/drama_allow_golden_test.zig
 new file mode 100644
-index 00000000..a85c6e8d
+index 00000000..bdbfcaf3
 --- /dev/null
 +++ b/zig/src/server/drama_allow_golden_test.zig
 @@ -0,0 +1,43 @@
@@ -412,15 +412,15 @@ index 00000000..a85c6e8d
 +    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 +    defer arena.deinit();
 +    const a = arena.allocator();
-+    const policy = try controls.parse("warmly,small laugh");
++    const policy = try controls.parse("sad,whispering");
 +    // Expected strings come from running the filter on synthetic text.
 +    const cases = [_][2][]const u8{
 +        .{ "", "" },
 +        .{ "[Pleased!] It works.", "[Pleased!] It works." },
 +        .{ "It [PLEASED] works.", "It [PLEASED] works." },
-+        .{ "It [ softly,\twhispering ] works.", "It works." },
-+        .{ "[Warmly] Hi [ small   LAUGH! ] there.", "[warmly] Hi [small laugh] there." },
-+        .{ "[sad][whispering] I miss you [a] lot.", "I miss you [a] lot." },
++        .{ "It [ softly,\tsighing ] works.", "It works." },
++        .{ "[Sad] Hi [ WHISPERING! ] there.", "[sad] Hi [whispering] there." },
++        .{ "[nervous][sighing] I miss you [a] lot.", "I miss you [a] lot." },
 +        .{ "<WHISPER>Go on</Whisper> <soft>now</soft>.", "Go on now." },
 +        .{ "Meet [someone] on [Tuesday].", "Meet [someone] on [Tuesday]." },
 +        .{ "As [see note 3] says.", "As [see note 3] says." },
@@ -430,7 +430,7 @@ index 00000000..a85c6e8d
 +        .{ "A [softly and unclosed", "A [softly and unclosed" },
 +        .{ "Two  spaces [1]\n\nstay.", "Two  spaces [1]\n\nstay." },
 +        .{ "[note <SOFT>quietly</SOFT>] stays.", "[note quietly] stays." },
-+        .{ "[<soft>Warmly</soft>] Hi.", "[warmly] Hi." },
++        .{ "[<soft>Whispering</soft>] Hi.", "[whispering] Hi." },
 +        .{ "[see [sighs] <fast>now</fast>] ok", "[see [sighs] now] ok" },
 +        .{ "[see [note] [sighs] <soft>x</soft>] stays. [sighs] Go.", "[see [note] [sighs] x] stays. Go." },
 +        .{ "[see [note] [sighs] Go.", "[see [note] Go." },
@@ -438,13 +438,13 @@ index 00000000..a85c6e8d
 +        .{ "Hi\n[sighs]\nthere word [sighs].", "Hi\nthere word ." },
 +        .{ " \t [sighs] Hi", "Hi" },
 +        .{ "你好[sighs]世界", "你好[sighs]世界" },
-+        .{ "[WARMly\u{a0}!] café", "[warmly] café" },
++        .{ "[WHISpering\u{a0}!] café", "[whispering] café" },
 +        .{ "end [sighs]", "end " },
-+        .{ "[unknown] [small laugh][sighs][warmly]", "[unknown] [small laugh][warmly]" },
++        .{ "[unknown] [whispering][sighs][sad]", "[unknown] [whispering][sad]" },
 +        .{ "a]b>c[unfinished", "a]b>c[unfinished" },
 +        .{ "<unknown>text</unknown>", "<unknown>text</unknown>" },
 +        .{ "[sighs [laughs] tail", "[sighs [laughs] tail" },
-+        .{ "[very very very very very very very very very very very very very very very very very very very very very very very very sad] text", "[very very very very very very very very very very very very very very very very very very very very very very very very sad] text" },
++        .{ "[very very very very very very very very very very very very very very very very very very very very very very very very calm] text", "[very very very very very very very very very very very very very very very very very very very very very very very very calm] text" },
 +    };
 +    for (cases) |c| try std.testing.expectEqualStrings(c[1], try controls.filter(a, policy, c[0]));
 +}
