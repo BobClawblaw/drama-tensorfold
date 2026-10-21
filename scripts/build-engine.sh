@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
-# Builds the patched TensorFold native engine and the Drama 3 oracle tools.
+# Builds upstream TensorFold with the opt-in patches in engine/patches: the native server and drama3-generate.
 #
 # Usage: scripts/build-engine.sh [BUILD_DIR]        (default: build/tensorfold in this repo)
 #
 # Environment:
 #   ZIG          Zig 0.17.0 executable (default: zig on PATH)
 #   NVCC         CUDA 13 nvcc (default: nvcc on PATH)
-#   DRAMA_TOOLS  oracle build steps (default: the ones qualification/ uses)
 #   JOBS         parallel build jobs (default: Zig's choice)
 #
 # Every run checks out the pinned upstream commit and re-applies the whole series, so the result does not depend
 # on what an earlier run left behind. Output: BUILD_DIR/zig-out/native/bin/tensorfold-native and
-# BUILD_DIR/zig-out/oracle/bin/tf-drama-*.
+# BUILD_DIR/zig-out/bin/drama3-generate.
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 build=${1:-$repo/build/tensorfold}
 zig=${ZIG:-zig}
 nvcc=${NVCC:-nvcc}
-tools=${DRAMA_TOOLS:-drama-codec-oracle drama-codec-stream-oracle drama-backbone-oracle drama-tower-oracle drama-tower-context-oracle}
 
 die() {
   echo "build-engine: $*" >&2
@@ -57,8 +55,7 @@ have=$("$zig" version)
 [[ $have == "$want" ]] || die "Zig $have found; the engine pins $want"
 
 cd "$build"
-# shellcheck disable=SC2086 # DRAMA_TOOLS is a list of build steps
-"$zig" build native $tools -Dnvcc="$nvcc" --summary all ${JOBS:+-j"$JOBS"}
+"$zig" build native drama3-generate -Dnvcc="$nvcc" --summary all ${JOBS:+-j"$JOBS"}
 
 echo "engine: $TENSORFOLD_COMMIT + ${#patches[@]} patches = $(git rev-parse HEAD)"
-sha256sum zig-out/native/bin/tensorfold-native zig-out/oracle/bin/*
+sha256sum zig-out/native/bin/tensorfold-native zig-out/bin/drama3-generate

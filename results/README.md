@@ -1,5 +1,8 @@
 # Results
 
+> **Legacy:** these numbers measure the old patched engine (commit `0f54000`, 59 patches on TensorFold
+> `c7137bb3`), not the upstream base with opt-in patches.
+
 Summaries of the measurements behind this recipe, all on GB10. Raw audio, request bodies and weights are not
 published; the JSON files keep the numbers exactly as measured.
 

@@ -1,5 +1,8 @@
 # Qualification tools
 
+> **Legacy:** these gates qualify the old patched engine (commit `0f54000`, 59 patches on TensorFold `c7137bb3`),
+> whose oracle build steps the upstream base does not have. Check out `0f54000` to rerun them.
+
 The numerical gates that compare the native engine with the pinned SGLang-Omni reference
 (`ab095ef9`, checkpoint `e0a9218a`). Their current results are in [`../results/`](../results/); this directory
 lets you rerun them.

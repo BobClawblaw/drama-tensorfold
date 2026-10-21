@@ -44,7 +44,7 @@ def main() -> int:
     parser.add_argument('--port', type=int, default=18793)
     parser.add_argument('--ready-timeout', type=float, default=900)
     parser.add_argument('serve_args', nargs='*', metavar='SERVE_ARG',
-                        help='Extra tensorfold-native serve flags, after --, e.g. -- --max-frames 4096 --long-form')
+                        help='Extra tensorfold-native serve flags, after --, e.g. -- --max-frames 2048')
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error('Port must be between 1 and 65535')
