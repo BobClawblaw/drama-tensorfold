@@ -97,14 +97,17 @@ a bug fix. The patches stack and apply in order; each one's notes are in the eng
 | 0001 (K0) | CUDA prompt prefill in bounded row chunks | on by default; `TF_DRAMA_PREFILL_ROWS` | [#1120](https://github.com/ashhart/TensorFold/pull/1120) |
 | 0002 | Replay waits for poison fills before buffers are reused | always on | [#1119](https://github.com/ashhart/TensorFold/pull/1119) |
 | 0003 (K1) | A configurable frame budget | `--max-frames N` | [#1134](https://github.com/ashhart/TensorFold/pull/1134) |
-| 0004 (K7) | An allowlist for bracketed speech controls | `--allowed-controls LIST` | to be proposed |
+| 0004 (K7) | An allowlist for bracketed speech controls | `--allowed-controls LIST` | [#1152](https://github.com/ashhart/TensorFold/pull/1152) |
 | 0005 (K9) | Attested voice catalogs and `GET /v1/voices` | `--voices DIR`, `--default-voice NAME` | [#1135](https://github.com/ashhart/TensorFold/pull/1135) |
-| 0006 (K2) | A sustained-silence guard that ends a reply as `silence` | `--silence-floor-dbfs`, `--silence-seconds` | to be proposed |
-| 0007 (K3) | The guard's onset rule: silence before enough voiced audio | `--silence-onset-s`, `--silence-onset-voiced-s` | to be proposed |
-| 0008 (K4) | The guard's mid rule: an ending lost in a long silence | `--silence-mid-s`, `--silence-mid-min-voiced-s` | to be proposed |
-| 0009 (K5) | Whole replies the guard ended are drawn again | `--silence-redraws N`, `--silence-redraw-budget-s`, `--silence-redraw-controls` | to be proposed |
-| 0010 (K6) | Whole replies that stopped short of their text are drawn again | `--short-reply-ratio`, `--short-reply-chars-per-s` | to be proposed |
-| 0011 (K8) | A whole reply is drawn once more when a phrase opens far above the others | `--register-redraw-st`, `--register-redraw-high`, `--register-high-hz` | to be proposed |
+| 0006 (K2) | A sustained-silence guard that ends a reply as `silence` | `--silence-floor-dbfs`, `--silence-seconds` | [#1157](https://github.com/ashhart/TensorFold/pull/1157) |
+| 0007 (K3) | The guard's onset rule: silence before enough voiced audio | `--silence-onset-s`, `--silence-onset-voiced-s` | [#1158](https://github.com/ashhart/TensorFold/pull/1158) |
+| 0008 (K4) | The guard's mid rule: an ending lost in a long silence | `--silence-mid-s`, `--silence-mid-min-voiced-s` | [#1159](https://github.com/ashhart/TensorFold/pull/1159) |
+| 0009 (K5) | Whole replies the guard ended are drawn again | `--silence-redraws N`, `--silence-redraw-budget-s`, `--silence-redraw-controls` | [#1160](https://github.com/ashhart/TensorFold/pull/1160) |
+| 0010 (K6) | Whole replies that stopped short of their text are drawn again | `--short-reply-ratio`, `--short-reply-chars-per-s` | [#1161](https://github.com/ashhart/TensorFold/pull/1161) |
+| 0011 (K8) | A whole reply is drawn once more when a phrase opens far above the others | `--register-redraw-st`, `--register-redraw-high`, `--register-high-hz` | [#1162](https://github.com/ashhart/TensorFold/pull/1162) |
+
+`drama3-voice`, a tool that writes attested voice files for `--voices`, is proposed upstream in
+[#1153](https://github.com/ashhart/TensorFold/pull/1153); it is not part of this series.
 
 Pass serve flags to the launcher after `--`. An illustrative launch with the frame budget, the silence guard and
 one redraw; the numbers are examples, not tuned values, so calibrate thresholds on your own voice:
