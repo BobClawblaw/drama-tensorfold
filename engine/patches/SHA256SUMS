@@ -6,6 +6,6 @@ b438ddbc899ed1aea6a493bece3f8194ef3ffaab422f57157012e7008ff8b792  0005-feat-serv
 ce66052a66f3a5a96959948742faaf60275053e91027672ae8e76bc384b4bb5f  0006-feat-speech-add-opt-in-sustained-silence-guard.patch
 38da31d044b6beb7b9d905bf07ca76735e74e5596a1bd22e1f3bc7e3fe440e9d  0007-feat-speech-add-opt-in-silence-onset-rule-to-the-sil.patch
 a1289601a1aeccd57354320f55d6563108d40a5a048596760f8498b0cc375773  0008-feat-speech-add-opt-in-silence-mid-s-lost-ending-tri.patch
-36a41b114e2e8fd39ddee712bb373f281ae10be9f8db4e8b12852f5943ac16ae  0009-feat-speech-redraw-whole-replies-the-silence-guard-e.patch
+53234cfe2699f9962c800dc9e60fd162a681599b8b9bf2b4762016c209cd037e  0009-feat-speech-redraw-whole-replies-the-silence-guard-e.patch
 db1a8e4bdf817ab7d92e4635453075d8ea31a0d40537dcda8ccc9bec456a69cf  0010-feat-speech-redraw-whole-replies-that-stopped-short-.patch
 0bb2318e54fe7df3355b981b08c4098b3185c58a955366dccf530f93e21a11a8  0011-feat-speech-redraw-a-whole-reply-once-when-a-phrase-.patch
