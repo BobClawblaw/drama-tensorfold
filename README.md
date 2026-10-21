@@ -1,14 +1,14 @@
 # drama-tensorfold
 
 > [!IMPORTANT]
-> **Pending the cutover A/B result.** This branch moves the recipe from the old patched engine to upstream
-> TensorFold plus opt-in patches. Do not merge it until the live-voice A/B of the cutover build passes.
+> **Being tested.** The recipe now builds upstream TensorFold plus opt-in patches instead of the old patched engine.
+> An end-to-end comparison against the previous engine is running; this note goes once it completes.
 
 [![code: Apache-2.0](https://img.shields.io/badge/code-Apache--2.0-0969da?style=flat-square)](LICENSE)
 [![model: FACL v1.0](https://img.shields.io/badge/model-FACL_v1.0-8250df?style=flat-square)](https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE)
 [![GPU: GB10 sm_121](https://img.shields.io/badge/GPU-GB10_sm__121-76b900?style=flat-square)](#quickstart)
 [![CUDA 13](https://img.shields.io/badge/CUDA-13-76b900?style=flat-square)](#quickstart)
-[![status: pending cutover A/B](https://img.shields.io/badge/status-pending_cutover_A%2FB-a16207?style=flat-square)](#the-patches)
+[![status: being tested](https://img.shields.io/badge/status-being_tested-a16207?style=flat-square)](#the-patches)
 
 **Fish Audio's Drama 3 text-to-speech on an NVIDIA GB10, on TensorFold's native Zig/CUDA engine.**
 
