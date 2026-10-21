@@ -130,6 +130,11 @@ cloning tools (`drama_voice_clip.py`, `drama_voice.py`, `tensorfold-native voice
 [`qualification/`](qualification/README.md) and [`results/`](results/README.md) measure that engine; check out
 `0f54000` to rebuild it.
 
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md). Every speed or quality claim carries
+[before/after evidence measured against the recipe baseline](CONTRIBUTING.md#performance-and-quality-claims).
+
 ## License
 
 **Built with Fish Audio.** All code here is [Apache-2.0](LICENSE), including the engine patches.
@@ -178,4 +183,4 @@ and are downloaded separately; [NOTICE](NOTICE) has the attributions.
   A breach of IV(b) ends the license automatically (IV(f)).
 </details>
 
-[Recipe](recipe/README.md) · [Benchmarks](bench/README.md) · [Qualification](qualification/README.md) · [Results](results/README.md) · [NOTICE](NOTICE) · [Apache 2.0 license](LICENSE) · [Model license (FACL v1.0)](https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE)
+[Recipe](recipe/README.md) · [Benchmarks](bench/README.md) · [Qualification](qualification/README.md) · [Results](results/README.md) · [Contributing](CONTRIBUTING.md) · [NOTICE](NOTICE) · [Apache 2.0 license](LICENSE) · [Model license (FACL v1.0)](https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE)
