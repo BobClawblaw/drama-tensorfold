@@ -62,6 +62,9 @@ None.
       with the exact commands
 - [ ] First-audio time, total time and RTF as warm all-attempts p50 and p95, B against A and A2, with each run's
       failures and `server_process_unchanged`
+- [ ] For a speed claim, Grill v0.11.0 speech captures of A, B and A2 and `grill-perf media compare` reporting
+      `PASS` on first-audio time (and total time when claimed) with the duration-ratio gate, the compare JSON and
+      the three capture directories attached
 - [ ] `gate-A2.json` identical; WER, speaker cosine and duration ratio where audio changes, with the ASR and
       speaker-embedding models, their revisions and the commands
 - [ ] Every attempt archived unedited, failed ones included, and the privacy check prints nothing; attempts withheld
