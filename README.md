@@ -207,6 +207,11 @@ voice file format are in `docs/drama-voices.md` in the engine tree.
 One rater preferred native in 4 of 5 listening pairs; one pair was not blind. This does not change
 qualification. Every gate and result is in [`results/`](results/README.md).
 
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md). Every speed or quality claim carries
+[before/after evidence measured against the recipe baseline](CONTRIBUTING.md#performance-and-quality-claims).
+
 ## License
 
 **Built with Fish Audio.** All code here is [Apache-2.0](LICENSE), including the engine patches and their codec.
@@ -255,4 +260,4 @@ and are downloaded separately; [NOTICE](NOTICE) has the attributions.
   A breach of IV(b) ends the license automatically (IV(f)).
 </details>
 
-[Recipe](recipe/README.md) · [Benchmarks](bench/README.md) · [Qualification](qualification/README.md) · [Results](results/README.md) · [NOTICE](NOTICE) · [Apache 2.0 license](LICENSE) · [Model license (FACL v1.0)](https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE)
+[Recipe](recipe/README.md) · [Benchmarks](bench/README.md) · [Qualification](qualification/README.md) · [Results](results/README.md) · [Contributing](CONTRIBUTING.md) · [NOTICE](NOTICE) · [Apache 2.0 license](LICENSE) · [Model license (FACL v1.0)](https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE)
