@@ -4,7 +4,7 @@ Date: Wed, 21 Oct 2026 08:05:43 +0800
 Subject: [PATCH 09/11] feat(speech): redraw whole replies the silence guard
  ended
 
-K5: net diff of pr/silence-redraws 0ac946de over K2-K4 and K7.
+K5: net diff of pr/silence-redraws 2e6d4858 over K2-K4 and K7.
 ---
  CHANGELOG.md                          |   2 +
  README.md                             |   3 +
@@ -802,7 +802,7 @@ index 00000000..0f2448d3
 +}
 diff --git a/zig/src/server/speech_plain_test.zig b/zig/src/server/speech_plain_test.zig
 new file mode 100644
-index 00000000..c25cd21b
+index 00000000..4a7e30d0
 --- /dev/null
 +++ b/zig/src/server/speech_plain_test.zig
 @@ -0,0 +1,26 @@
@@ -822,7 +822,7 @@ index 00000000..c25cd21b
 +        .{ "<WHISPER>text</WHISPER> [sighs]", "<WHISPER>text</WHISPER>" },
 +        .{ "<soft>text</soft>.", "text ." },
 +        .{ "\t[sighs]a\n\n b\u{3000}c ", "a b c" },
-+        .{ "Direction: warm, then [slower]\nLine: [warmly] Hello <soft>there</soft>.", "Hello there ." },
++        .{ "Direction: warm, then [slower]\nLine: [sighs] Hello <soft>there</soft>.", "Hello there ." },
 +        .{ " Direction: note\nNotLine: text", " Direction: note\nNotLine: text" },
 +        .{ "x[pause] [sighs](url) `[sad]`", "x (url) ` `" },
 +        .{ "你好[unknown]世界", "你好 世界" },
