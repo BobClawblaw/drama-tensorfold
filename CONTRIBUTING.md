@@ -64,8 +64,8 @@ python3 tools/zig/test_speech_flags.py                                # needs a 
 python3 tools/zig/test_drama_prefill_compare.py
 ```
 
-A change to `bench/` keeps `python3 bench/stream_check.py --self-test` passing. GPU checks are the oracle tools
-and the gates below, not unit tests.
+A change to `bench/` keeps `python3 bench/stream_check.py --self-test` passing. GPU checks are the gates below,
+not unit tests.
 
 ## Qualification gates
 
