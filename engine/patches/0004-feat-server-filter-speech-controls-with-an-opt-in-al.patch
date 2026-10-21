@@ -4,21 +4,21 @@ Date: Wed, 21 Oct 2026 00:18:27 +0800
 Subject: [PATCH 04/11] feat(server): filter speech controls with an opt-in
  allowlist
 
-K7: net diff of pr/allowed-controls 506ef593 (4 commits).
+K7: net diff of pr/allowed-controls 8cf0ae2e (5 commits).
 ---
  CHANGELOG.md                               |   1 +
- docs/speech-controls.md                    |  44 ++++
+ docs/speech-controls.md                    |  46 +++++
  zig/src/core/template/template.zig         |   1 +
  zig/src/core/tokenizer/tokenizer.zig       |   2 +-
  zig/src/server/cli.zig                     |   9 +-
  zig/src/server/cli_test.zig                |  19 ++
- zig/src/server/drama_allow.zig             | 213 +++++++++++++++++++
- zig/src/server/drama_allow_golden_test.zig |  43 ++++
- zig/src/server/drama_cues.txt              | 232 +++++++++++++++++++++
+ zig/src/server/drama_allow.zig             | 213 +++++++++++++++++++++
+ zig/src/server/drama_allow_golden_test.zig |  43 +++++
+ zig/src/server/drama_cues.txt              | 109 +++++++++++
  zig/src/server/serve.zig                   |   1 +
  zig/src/server/server.zig                  |   1 +
- zig/src/server/speech.zig                  |  23 +-
- 12 files changed, 586 insertions(+), 3 deletions(-)
+ zig/src/server/speech.zig                  |  23 ++-
+ 12 files changed, 465 insertions(+), 3 deletions(-)
  create mode 100644 docs/speech-controls.md
  create mode 100644 zig/src/server/drama_allow.zig
  create mode 100644 zig/src/server/drama_allow_golden_test.zig
@@ -38,10 +38,10 @@ index 26542a87..b7372176 100644
  
 diff --git a/docs/speech-controls.md b/docs/speech-controls.md
 new file mode 100644
-index 00000000..e3c26b8e
+index 00000000..2d93ccf9
 --- /dev/null
 +++ b/docs/speech-controls.md
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,46 @@
 +# Speech control allowlist
 +
 +`tensorfold serve MODEL --allowed-controls 'sighs,laughs'` filters the `input` of
@@ -66,7 +66,9 @@ index 00000000..e3c26b8e
 +| `sighs`, `laughs` | [Drama model card, Point tags](https://huggingface.co/fishaudio/drama-3#point-tags) |
 +| `laughing`, `whisper`, `angry`, `excited`, `pause` | [vLLM-Omni recipe, Event and emotion tags](https://recipes.vllm.ai/fishaudio/drama-3) |
 +
-+No private cue vocabulary is used. These examples are not an exhaustive list.
++`drama_cues.txt` lists only words used in tags in Fish Audio's public Drama 3
++and Emotion Control docs, the Drama 3 model card and the Drama 3 technical
++report. These examples are not an exhaustive list.
 +
 +## Stripping rules
 +
@@ -399,23 +401,23 @@ index 00000000..401e23a0
 +}
 diff --git a/zig/src/server/drama_allow_golden_test.zig b/zig/src/server/drama_allow_golden_test.zig
 new file mode 100644
-index 00000000..d8c66078
+index 00000000..a85c6e8d
 --- /dev/null
 +++ b/zig/src/server/drama_allow_golden_test.zig
 @@ -0,0 +1,43 @@
 +const std = @import("std");
 +const controls = @import("drama_allow.zig");
 +
-+test "delivery controls match reference behaviour synthetic goldens" {
++test "delivery controls match synthetic goldens" {
 +    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 +    defer arena.deinit();
 +    const a = arena.allocator();
 +    const policy = try controls.parse("warmly,small laugh");
-+    // Expected strings were produced by executing the reference behaviour on synthetic text.
++    // Expected strings come from running the filter on synthetic text.
 +    const cases = [_][2][]const u8{
 +        .{ "", "" },
-+        .{ "[Pleased!] It works.", "It works." },
-+        .{ "It [PLEASED] works.", "It works." },
++        .{ "[Pleased!] It works.", "[Pleased!] It works." },
++        .{ "It [PLEASED] works.", "It [PLEASED] works." },
 +        .{ "It [ softly,\twhispering ] works.", "It works." },
 +        .{ "[Warmly] Hi [ small   LAUGH! ] there.", "[warmly] Hi [small laugh] there." },
 +        .{ "[sad][whispering] I miss you [a] lot.", "I miss you [a] lot." },
@@ -432,7 +434,7 @@ index 00000000..d8c66078
 +        .{ "[see [sighs] <fast>now</fast>] ok", "[see [sighs] now] ok" },
 +        .{ "[see [note] [sighs] <soft>x</soft>] stays. [sighs] Go.", "[see [note] [sighs] x] stays. Go." },
 +        .{ "[see [note] [sighs] Go.", "[see [note] Go." },
-+        .{ "Hi [sighs] there, [pleased]\n\nnext. ¶ [sighs] On.", "Hi there,\n\nnext. ¶ On." },
++        .{ "Hi [sighs] there, [pleased]\n\nnext. ¶ [sighs] On.", "Hi there, [pleased]\n\nnext. ¶ On." },
 +        .{ "Hi\n[sighs]\nthere word [sighs].", "Hi\nthere word ." },
 +        .{ " \t [sighs] Hi", "Hi" },
 +        .{ "你好[sighs]世界", "你好[sighs]世界" },
@@ -448,12 +450,13 @@ index 00000000..d8c66078
 +}
 diff --git a/zig/src/server/drama_cues.txt b/zig/src/server/drama_cues.txt
 new file mode 100644
-index 00000000..df91d179
+index 00000000..cb09be46
 --- /dev/null
 +++ b/zig/src/server/drama_cues.txt
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,109 @@
 +# A bracket is a control only when every word is listed and at least one is a cue.
 +# Words are split on spaces, commas and hyphens after normalization.
++# Sources: tags in Fish Audio's Drama 3 and Emotion Control docs (docs.fish.audio), the Drama 3 model card and the Drama 3 technical report (arXiv:2610.18010).
 +## cues
 +happy
 +sad
@@ -504,180 +507,56 @@ index 00000000..df91d179
 +compassionate
 +determined
 +resigned
-+pleased
-+concerned
-+relieved
-+friendly
-+enthusiastic
-+encouraging
-+urgent
-+serious
-+mysterious
-+cheerful
-+playful
-+amused
-+thoughtful
-+apologetic
-+gentle
-+tender
-+tired
-+weary
-+solemn
-+sincere
-+wry
-+teasing
-+annoyed
-+shocked
-+afraid
-+fearful
-+joyful
-+eager
-+deflated
-+icy
-+sadness
-+excitement
-+happiness
-+joy
-+relief
-+warmth
-+warm
-+warmer
-+softer
 +sighs
-+sigh
 +sighing
 +laughs
 +laugh
 +laughing
 +laughter
-+chuckles
-+chuckle
 +chuckling
-+giggles
-+giggling
 +gasps
-+gasp
 +gasping
 +pause
-+pauses
-+beat
 +break
 +breath
-+breathes
-+breathing
-+inhales
-+exhales
 +hesitates
-+hesitating
-+hesitation
 +coughs
-+cough
-+coughing
 +throat
-+groans
 +groaning
 +panting
-+yawns
 +yawning
-+sobs
 +sobbing
-+cries
 +crying
-+sniffles
 +snoring
 +smile
-+smiles
-+smiling
-+grins
-+grinning
-+scoffs
-+snorts
-+hums
-+humming
-+whispers
 +whispering
 +whisper
-+whispered
-+shouts
 +shouting
-+screams
 +screaming
-+mumbles
-+mumbling
-+murmurs
 +softly
 +soft
-+quietly
 +quiet
 +loudly
-+loud
-+slowly
 +slow
-+quickly
 +fast
-+gently
-+warmly
-+coldly
-+calmly
-+firmly
-+brightly
-+cheerfully
-+sadly
-+happily
-+angrily
-+nervously
-+sarcastically
-+emphatically
 +emphasis
-+stressed
 +forceful
-+forcefully
-+playfully
-+sincerely
-+seriously
-+tenderly
-+dryly
-+wryly
-+flatly
-+hurriedly
 +hurry
-+rushed
-+deadpan
-+monotone
-+breathy
-+hushed
-+sternly
-+excitedly
-+thoughtfully
-+hesitantly
-+reluctantly
 +## modifiers
 +a
-+an
 +and
 +as
-+bit
-+little
 +slightly
 +very
 +extremely
-+almost
-+quite
-+somewhat
-+more
 +with
 +in
-+of
 +tone
 +voice
 +small
 +long
-+short
-+deep
 +heavy
-+light
 +shaky
-+takes
 +clears
 +clear
 +audience

@@ -113,6 +113,8 @@ one redraw; the numbers are examples, not tuned values, so calibrate thresholds 
 python3 recipe/pilot.py … -- --max-frames 2048 --silence-floor-dbfs -50 --silence-seconds 6 --silence-redraws 1
 ```
 
+Patch 0004's cue list holds only words from Fish Audio's public tags; deployments may extend the cue list locally.
+
 A voice catalog is a directory of `drama3-http-voice/1` files, each with a `source` attestation (`synthetic`,
 `self` or `consented`); the format is in `docs/drama-http-voices.md` in the engine tree. Clone only a voice the
 model invented, your own, or one whose owner has consented on record, as the model license requires

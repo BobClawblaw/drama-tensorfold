@@ -1,7 +1,7 @@
 cd0f6b14d7b50eb1a336bc00a9b879caf4fca56f3df1082f3ff2bebfc1284402  0001-feat-drama3-batch-CUDA-prompt-prefill-in-bounded-rou.patch
 1ab86a5ca409374a3096e36b0ef6e24a092d14ab15d027fff4d7adc4ab6bc915  0002-fix-drama3-complete-replay-poison-before-resetting-s.patch
 1f9bc1708d34e75885e84be466b87e7a7f381694cd74ac2463197b99717217fa  0003-feat-speech-configure-the-Drama-frame-budget.patch
-d1e607623cb49f90c9e2302147e4e2ff3f00e209481b24c5665a9f9b93ee88fa  0004-feat-server-filter-speech-controls-with-an-opt-in-al.patch
+d57b45081372e4c0f0c64fa522db6bd8f833d12ff501ec44a451d017638db86d  0004-feat-server-filter-speech-controls-with-an-opt-in-al.patch
 b438ddbc899ed1aea6a493bece3f8194ef3ffaab422f57157012e7008ff8b792  0005-feat-server-serve-attested-Drama-voice-catalogs.patch
 ce66052a66f3a5a96959948742faaf60275053e91027672ae8e76bc384b4bb5f  0006-feat-speech-add-opt-in-sustained-silence-guard.patch
 38da31d044b6beb7b9d905bf07ca76735e74e5596a1bd22e1f3bc7e3fe440e9d  0007-feat-speech-add-opt-in-silence-onset-rule-to-the-sil.patch
