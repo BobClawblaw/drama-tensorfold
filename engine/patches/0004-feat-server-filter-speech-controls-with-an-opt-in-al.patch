@@ -4,7 +4,7 @@ Date: Wed, 21 Oct 2026 00:18:27 +0800
 Subject: [PATCH 04/11] feat(server): filter speech controls with an opt-in
  allowlist
 
-K7: net diff of feat/allowed-controls 506ef593 (4 commits).
+K7: net diff of pr/allowed-controls 506ef593 (4 commits).
 ---
  CHANGELOG.md                               |   1 +
  docs/speech-controls.md                    |  44 ++++

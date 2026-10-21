@@ -4,7 +4,7 @@ Date: Wed, 21 Oct 2026 08:05:42 +0800
 Subject: [PATCH 08/11] feat(speech): add opt-in --silence-mid-s lost-ending
  trip
 
-K4: net diff of pr/silence-mid a08d58b1 over K2 and K3.
+K4: net diff of pr/silence-mid 245d9ad2 over K2 and K3.
 ---
  CHANGELOG.md                          |   2 +
  README.md                             |   2 +

@@ -4,7 +4,7 @@ Date: Wed, 21 Oct 2026 08:17:38 +0800
 Subject: [PATCH 10/11] feat(speech): redraw whole replies that stopped short
  of their input
 
-K6: net diff of pr/short-reply 313a6a23 over K5.
+K6: net diff of pr/short-reply ea98155b over K5.
 ---
  CHANGELOG.md                          |  1 +
  README.md                             |  2 +

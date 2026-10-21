@@ -4,7 +4,7 @@ Date: Wed, 21 Oct 2026 08:17:38 +0800
 Subject: [PATCH 11/11] feat(speech): redraw a whole reply once when a phrase
  opens far above the others
 
-K8: net diff of pr/register-guard f2f35113 over K6, with the cutover integration's resolutions (ca60e9c8).
+K8: net diff of pr/register-guard 5933a1d4 over K6, with the cutover integration's resolutions (ca60e9c8).
 ---
  CHANGELOG.md                              |   6 +-
  README.md                                 |   7 +-

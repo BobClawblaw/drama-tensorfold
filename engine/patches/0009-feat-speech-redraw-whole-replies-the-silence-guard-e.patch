@@ -4,7 +4,7 @@ Date: Wed, 21 Oct 2026 08:05:43 +0800
 Subject: [PATCH 09/11] feat(speech): redraw whole replies the silence guard
  ended
 
-K5: net diff of pr/silence-redraws 37079ece over K2-K4 and K7.
+K5: net diff of pr/silence-redraws 0ac946de over K2-K4 and K7.
 ---
  CHANGELOG.md                          |   2 +
  README.md                             |   3 +
