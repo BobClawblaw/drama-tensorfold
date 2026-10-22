@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Tables, neutral raw records and charts for results/full-vs-quant-01 from a scored run.py run.
 
-Reads RUN_DIR (preflight.json, ARM/sSALT/{whole,stream,pilot,health.jsonl}, scores.jsonl, pairs.jsonl) and writes
-OUT_DIR/tables.json, OUT_DIR/tables.md, OUT_DIR/raw/*.jsonl and OUT_DIR/charts/*.png. Raw records keep numbers,
-item ids and body hashes only: no audio, transcripts of private material, host paths or process identities.
+Reads RUN_DIR (preflight.json, resume-*-preflight.json and their pin files, ARM/sSALT/{whole,stream,pilot,
+health.jsonl,server.sh}, scores.jsonl, pairs.jsonl) and writes OUT_DIR/tables.json, OUT_DIR/tables.md,
+OUT_DIR/card-section.md (a model-card section), OUT_DIR/raw/*.jsonl and OUT_DIR/charts/*.{png,svg}. Raw records keep
+numbers, item ids and body hashes only: no audio, transcripts of private material, host paths or process identities.
 
 Usage: report.py RUN_DIR OUT_DIR
 """
+import ast
+import hashlib
 import json
 import math
 import random
 import re
 import sys
+import textwrap
+from datetime import datetime
 from pathlib import Path
 from statistics import mean, median
 
@@ -19,6 +24,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt  # noqa: E402
 
+REPO = Path(__file__).resolve().parents[2]
 GIB = 2 ** 30
 RATE, FRAME = 44100, 2048
 LABELS = {'F': 'Full FP8', 'Q': 'Quant NVFP4, γ 1.5', 'FG': 'Full FP8, γ 1.5',
@@ -51,6 +57,28 @@ def engine_lines(log):
     return synth, speech, float(loaded.group(1)) if loaded else None
 
 
+def engine_banner(log):
+    """What the engine reports about the loaded model in its start-up line."""
+    text = Path(log).read_text(errors='replace')
+    line = next(x for x in text.splitlines() if x.startswith('[tensorfold] Drama 3 on CUDA'))
+    held = re.search(r'routed experts held (\d+) of (\d+)', line)
+    nvfp4 = re.search(r'routed experts NVFP4 in (\d+) of (\d+) layers', line)
+    sampling = re.search(r'sampling: (\w+)', text)
+    return {'models_gib': float(re.search(r'models ([0-9.]+) GiB', line).group(1)),
+            'routed_experts_held': [int(held.group(1)), int(held.group(2))] if held else None,
+            'nvfp4_layers': [int(nvfp4.group(1)), int(nvfp4.group(2))] if nvfp4 else None,
+            'guidance_on': 'guidance on' in line, 'sampling': sampling.group(1) if sampling else None}
+
+
+def pins(path):
+    """sha256sum pin file as {relative path: digest}, with the ./ and ./model/ prefixes dropped."""
+    out = {}
+    for line in Path(path).read_text().splitlines():
+        digest, name = line.split(None, 1)
+        out[re.sub(r'^(\./)?(model/)?', '', name.strip())] = digest
+    return out
+
+
 def bootstrap_mean_ci(by_item, n=10000, seed=20261022):
     """95 % percentile interval of the mean of per-item values, resampling items."""
     items = list(by_item)
@@ -67,12 +95,27 @@ def mcnemar_exact(b, c):
     return min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n)
 
 
+def serve_args(sd):
+    """One start's engine arguments, without the checkpoint path, address, served name and voice directory."""
+    cmd = json.loads((sd / 'pilot' / 'session.json').read_text())['server_command'][1:]
+    wrapper = (sd / 'server.sh').read_text().split('"$@"', 1)[1].split()
+    out, skip = [], False
+    for a in cmd[:1] + cmd[2:] + wrapper:
+        if skip:
+            skip = False
+        elif a in ('--host', '--port', '--name', '--voices', '--default-voice'):
+            skip = True
+        else:
+            out.append(a)
+    return out
+
+
 def arm_record(run, arm, preflight):
     salts = sorted(run.joinpath(arm).glob('s*'))
     s0 = run / arm / 's0'
     whole = json.loads((s0 / 'whole' / 'summary.json').read_text())
     stream = json.loads((s0 / 'stream' / 'summary.json').read_text())
-    loads, engine_loads, peaks, host_drop, raw, engine_raw = [], [], [], [], [], []
+    loads, engine_loads, peaks, host_drop, raw, engine_raw, starts = [], [], [], [], [], [], {}
     prefill_rate, decode_rate, first_frame = [], [], []
     for sd in salts:
         salt = int(sd.name[1:])
@@ -96,18 +139,26 @@ def arm_record(run, arm, preflight):
         if mem:
             host_drop.append(mem[0]['memavailable_bytes'] - min(m['memavailable_bytes'] for m in mem))
         samples = {k: jl(sd / k / 'samples.jsonl') for k in ('whole', 'stream') if (sd / k / 'samples.jsonl').exists()}
+        epochs = [s['started_at_epoch'] for rows in samples.values() for s in rows]
+        starts[salt] = [min(epochs), max(epochs)]
         by_format = {'wav': [s for s in speech if s.get('format') == 'wav'],
                      'pcm': [s for s in speech if s.get('format') == 'pcm']}
         for kind, rows in samples.items():
             lines = by_format['wav' if kind == 'whole' else 'pcm']
-            matched = len(lines) == len(rows)
+            # The log carries no request id the client sees: pair by order, and only when every reply's sample count
+            # matches the engine line's.
+            matched = len(lines) == len(rows) and all(
+                not s.get('audio') or abs(line['samples'] / RATE - s['audio']['duration_s']) < 1e-3
+                for s, line in zip(rows, lines))
             for i, s in enumerate(rows):
                 audio_s = s['audio']['duration_s'] if s.get('audio') else None
+                line = lines[i] if matched else {}
                 rec = {'arm': arm, 'salt': salt, 'run': kind, 'phase': s['phase'], 'round': s['round'],
                        'item': s['item'], 'outcome': s['outcome'], 'total_s': s['total_s'],
                        'first_frame_s': s.get('first_frame_s'), 'audio_s': audio_s, 'rtf': s.get('rtf'),
                        'body_sha256': s.get('body_sha256'),
-                       'prompt_tokens': int(lines[i]['prompt']) if matched else None}
+                       'prompt_tokens': int(line['prompt']) if 'prompt' in line else None,
+                       'finish': line.get('finish'), 'engine_seconds': line.get('seconds')}
                 raw.append(rec)
                 if kind == 'stream' and s['phase'] == 'warm' and s['outcome'] == 'ok' and s.get('first_frame_s'):
                     frames = audio_s * RATE / FRAME
@@ -115,9 +166,10 @@ def arm_record(run, arm, preflight):
                     decode_rate.append((frames - 1) / (s['total_s'] - s['first_frame_s']))
                     if matched:
                         prefill_rate.append(int(lines[i]['prompt']) / s['first_frame_s'])
+        for i, line in enumerate(speech):
+            engine_raw.append({'arm': arm, 'salt': salt, 'seq': i, 'line': 'speech', **line})
         for i, line in enumerate(synth):
-            engine_raw.append({'arm': arm, 'salt': salt, 'seq': i, **{k: v for k, v in line.items()
-                                                                       if k not in ('speech',)}})
+            engine_raw.append({'arm': arm, 'salt': salt, 'seq': i, 'line': 'synthesis', **line})
     gauges = [h['live'] for sd in salts for h in (x['health'] for x in jl(sd / 'health.jsonl') if 'health' in x)
               if 'live' in h]
     ckpt = preflight['arms'][arm]['checkpoint']
@@ -126,6 +178,14 @@ def arm_record(run, arm, preflight):
     rec = {
         'label': LABELS[arm], 'checkpoint': ckpt, 'flags': preflight['arms'][arm]['flags'],
         'reference_voice': preflight['arms'][arm]['reference_voice'],
+        'serve_args': serve_args(s0),
+        'request_epoch_span_per_salt': starts,
+        'whole_warm_passes_per_salt': {s: len({r['round'] for r in raw if r['salt'] == s and r['run'] == 'whole'
+                                               and r['phase'] == 'warm'}) for s in sorted(starts)},
+        'streamed_salts': sorted({r['salt'] for r in raw if r['run'] == 'stream'}),
+        'cfg_gamma_logged': sorted({line['cfg_gamma'] for line in engine_raw if line['line'] == 'synthesis'}),
+        'precision': preflight['arms'][arm]['precision'],
+        'engine': engine_banner(s0 / 'pilot' / 'server.log'),
         'weights_and_codec_bytes': size['weights_and_codec_bytes'], 'checkpoint_total_bytes': size['total_bytes'],
         'device_peak_bytes': {'max': max(peaks), 'per_start': peaks},
         'host_memavailable_drop_bytes': {'max': max(host_drop) if host_drop else None, 'per_start': host_drop},
@@ -139,6 +199,10 @@ def arm_record(run, arm, preflight):
                        'rtf_mean': warm['realtime_factor']['ok_only']['mean'],
                        'audio_s_total': warm['audio_s']['total']},
         'whole_cold_first_request_s': whole['phases']['cold']['end_to_end_s']['ok_only'].get('p50'),
+        'whole_warm_rtf_p50_per_salt': {
+            s: median(r['rtf'] for r in raw if r['salt'] == s and r['run'] == 'whole' and r['phase'] == 'warm'
+                      and r['round'] == 0 and r['outcome'] == 'ok')
+            for s in sorted({r['salt'] for r in raw})},
         'stream_warm': {'attempted': swarm['attempted'], 'succeeded': swarm['succeeded'],
                         'first_frame_s_p50': swarm['first_frame_s']['ok_only']['p50'],
                         'first_frame_s_p95': swarm['first_frame_s']['ok_only']['p95'],
@@ -152,7 +216,7 @@ def arm_record(run, arm, preflight):
     return rec, raw, engine_raw
 
 
-def quality(scores, pairs, arms):
+def quality(scores, pairs, arms, finishes):
     out = {}
     for arm in arms:
         rows = [r for r in scores if r['arm'] == arm]
@@ -161,12 +225,21 @@ def quality(scores, pairs, arms):
         for r in ok:
             by_item.setdefault(r['item'], []).append(r['wer'])
         sims = [p['cosine'] for p in pairs if p['kind'] == 'arm_vs_full' and p['arm'] == arm]
+        per_salt = {}
+        for s in sorted({r['salt'] for r in rows}):
+            srows = [r for r in rows if r['salt'] == s]
+            sok = [r for r in srows if not r.get('missing')]
+            per_salt[s] = {'takes': len(srows), 'failed': sum(bool(r['failed']) for r in srows),
+                           'wer_mean': mean(r['wer'] for r in sok) if sok else None}
+        finish = [finishes.get((arm, r['salt'], r['item'])) for r in rows]
         out[arm] = {'takes': len(rows), 'missing': len(rows) - len(ok),
                     'failed': sum(bool(r['failed']) for r in rows), 'capped': sum(bool(r.get('capped')) for r in ok),
                     'collapsed': sum(bool(r.get('collapsed')) for r in ok),
+                    'engine_finish': {f: finish.count(f) for f in sorted(set(finish), key=str)},
                     'wer_mean': mean(r['wer'] for r in ok), 'wer_mean_ci95': bootstrap_mean_ci(by_item),
                     'wer_pooled': sum(r['wer'] * r['ref_words'] for r in ok) / sum(r['ref_words'] for r in ok),
                     'wer_median': median(r['wer'] for r in ok),
+                    'per_salt': per_salt,
                     'quiet_run_s_max': max(r['quiet_run_s'] for r in ok),
                     'audio_s_mean': mean(r['audio_s'] for r in ok),
                     'speaker_cosine_vs_full_mean': mean(sims) if sims else None}
@@ -202,18 +275,25 @@ def charts(tables, out):
     A = tables['arms']
     Qy = tables['quality']
 
-    def bars(ax, names, values, title, unit, fmt='{:.2f}'):
+    def bars(ax, names, values, title, unit, fmt='{:.2f}', tops=None):
         xs = range(len(names))
         b = ax.bar(xs, values, color=[COLORS[n] for n in names], hatch=None)
         for n, rect in zip(names, b):
             if n in ('FG',) or n.endswith('B'):
                 rect.set_hatch('//' if n == 'FG' else '..')
-        ax.set_xticks(list(xs), [LABELS[n].replace(', ', ',\n') for n in names], fontsize=8)
+        ax.set_xticks(list(xs), [textwrap.fill(LABELS[n].replace('γ ', 'γ\u00a0'), 13) for n in names], fontsize=8)
         ax.set_title(title, fontsize=10)
         ax.set_ylabel(unit, fontsize=9)
-        for x, v in zip(xs, values):
-            ax.annotate(fmt.format(v), (x, v), ha='center', va='bottom', fontsize=8)
+        for x, v, top in zip(xs, values, tops or values):
+            ax.annotate(fmt.format(v), (x, top), xytext=(0, 2), textcoords='offset points', ha='center', va='bottom',
+                        fontsize=8)
         ax.margins(y=0.15)
+
+    def save(fig, name):
+        fig.tight_layout()
+        fig.savefig(out / f'{name}.png', dpi=150)
+        fig.savefig(out / f'{name}.svg', metadata={'Date': None})
+        plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
     fq = [a for a in ('F', 'Q') if a in A]
@@ -221,33 +301,34 @@ def charts(tables, out):
     bars(axes[1], arms, [A[a]['device_peak_bytes']['max'] / GIB for a in arms], 'Peak device memory (/health)', 'GiB',
          '{:.1f}')
     fig.suptitle('Drama 3 on one GB10: footprint', fontsize=11)
-    fig.tight_layout()
-    fig.savefig(out / 'footprint.png', dpi=150)
-    plt.close(fig)
+    save(fig, 'footprint')
 
     names = arms + built
-    fig, axes = plt.subplots(1, 4, figsize=(15, 3.8))
-    bars(axes[0], names, [A[a]['whole_warm']['rtf_p50'] for a in names], 'Real-time factor, p50 (lower is faster)',
-         'RTF')
-    bars(axes[1], names, [A[a]['stream_warm']['first_frame_s_p50'] for a in names], 'First audio when streaming, p50',
-         's')
+    fig, axes = plt.subplots(1, 4, figsize=(17, 4.2))
+    bars(axes[0], names, [A[a]['whole_warm']['rtf_p50'] for a in names], 'Real-time factor, warm p50, salt 0\n'
+         '(lower is faster)', 'RTF')
+    bars(axes[1], names, [A[a]['stream_warm']['first_frame_s_p50'] for a in names],
+         'First audio when streaming, p50, salt 0', 's')
     bars(axes[2], names, [A[a]['stream_warm']['decode_frames_per_s_median'] for a in names],
          'Decode, codec frames/s (median)', 'frames/s', '{:.1f}')
     bars(axes[3], names, [A[a]['cold_ready_s']['median'] for a in names], 'Process start to ready (cold disk)', 's',
          '{:.1f}')
     fig.suptitle('Speed: one engine binary, 24-item corpus, concurrency 1', fontsize=11)
-    fig.tight_layout()
-    fig.savefig(out / 'speed.png', dpi=150)
-    plt.close(fig)
+    save(fig, 'speed')
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 3.8))
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.2))
     wer = [Qy[a]['wer_mean'] * 100 for a in names]
-    bars(axes[0], names, wer, 'Word error rate, Whisper large-v3 (mean)', '%', '{:.1f}')
+    tops = [max([Qy[a]['wer_mean_ci95'][1]] + [v['wer_mean'] for v in Qy[a]['per_salt'].values()]) * 100
+            for a in names]
+    bars(axes[0], names, wer, 'Word error rate, Whisper large-v3 (mean,\n95 % CI over texts, dots: each salt)', '%',
+         '{:.1f}', tops)
     for x, a in enumerate(names):
         lo, hi = Qy[a]['wer_mean_ci95']
         axes[0].errorbar(x, Qy[a]['wer_mean'] * 100, yerr=[[Qy[a]['wer_mean'] * 100 - lo * 100],
                                                            [hi * 100 - Qy[a]['wer_mean'] * 100]], fmt='none',
                          ecolor='k', capsize=3, lw=1)
+        salt_wer = [v['wer_mean'] * 100 for v in Qy[a]['per_salt'].values()]
+        axes[0].scatter([x + 0.22] * len(salt_wer), salt_wer, s=10, color='k', zorder=3)
     bars(axes[1], names, [Qy[a]['failed'] / Qy[a]['takes'] * 100 for a in names], 'Failed takes (cap, WER > 0.2 '
          'or ≥ 3 s stall)', '% of takes', '{:.1f}')
     sim = [a for a in names if Qy[a].get('speaker_cosine_vs_full_mean') is not None]
@@ -257,12 +338,10 @@ def charts(tables, out):
         v = Qy.get(base, {}).get('speaker_cosine_same_model_across_salts_mean')
         if v is not None:
             axes[2].axhline(v, color='k', ls=ls, lw=1, label=f'{LABELS[base]} vs itself, other salt')
-    axes[2].legend(fontsize=7, loc='lower right')
-    axes[2].set_ylim(0, 1.05)
+    axes[2].legend(fontsize=7, loc='upper right')
+    axes[2].set_ylim(0, 1.3)
     fig.suptitle('Quality: 24 items × 4 salts per arm', fontsize=11)
-    fig.tight_layout()
-    fig.savefig(out / 'quality.png', dpi=150)
-    plt.close(fig)
+    save(fig, 'quality')
 
 
 def markdown(t):
@@ -279,11 +358,16 @@ def markdown(t):
     md += row('Host MemAvailable drop, max (GiB)', lambda a: g(A[a]['host_memavailable_drop_bytes']['max']))
     md += row('Process start to ready, median of 4 cold starts (s)', lambda a: f'{A[a]["cold_ready_s"]["median"]:.1f}')
     md += row('Engine load, median (s)', lambda a: f'{A[a]["engine_loaded_in_s"]["median"]:.1f}')
-    md += row('Real-time factor, warm p50', lambda a: f'{A[a]["whole_warm"]["rtf_p50"]:.3f}')
-    md += row('Real-time factor, warm p95', lambda a: f'{A[a]["whole_warm"]["rtf_p95"]:.3f}')
-    md += row('Whole reply, warm p50 (s)', lambda a: f'{A[a]["whole_warm"]["end_to_end_s_p50"]:.2f}')
-    md += row('First audio when streaming, p50 (s)', lambda a: f'{A[a]["stream_warm"]["first_frame_s_p50"]:.3f}')
-    md += row('Decode, codec frames/s (median)', lambda a: f'{A[a]["stream_warm"]["decode_frames_per_s_median"]:.1f}')
+    md += row('Real-time factor, warm p50, salt 0 (all warm passes)', lambda a: f'{A[a]["whole_warm"]["rtf_p50"]:.3f}')
+    md += row('Real-time factor, warm p95, salt 0 (all warm passes)', lambda a: f'{A[a]["whole_warm"]["rtf_p95"]:.3f}')
+    md += row('Real-time factor, p50 of each salt\'s first warm pass, lowest–highest', lambda a: (
+        f'{min(A[a]["whole_warm_rtf_p50_per_salt"].values()):.3f}–'
+        f'{max(A[a]["whole_warm_rtf_p50_per_salt"].values()):.3f}'))
+    md += row('Whole reply, warm p50, salt 0 (s)', lambda a: f'{A[a]["whole_warm"]["end_to_end_s_p50"]:.2f}')
+    md += row('First audio when streaming, p50, salt 0 (s)',
+              lambda a: f'{A[a]["stream_warm"]["first_frame_s_p50"]:.3f}')
+    md += row('Decode, codec frames/s, streamed, salt 0 (median)',
+              lambda a: f'{A[a]["stream_warm"]["decode_frames_per_s_median"]:.1f}')
     md += row('Prompt tokens per second to first audio (median)', lambda a: (
         f'{A[a]["stream_warm"]["prompt_tokens_per_s_to_first_frame_median"]:.0f}'
         if A[a]['stream_warm']['prompt_tokens_per_s_to_first_frame_median'] else '—'))
@@ -294,8 +378,15 @@ def markdown(t):
     md += row('Word error rate, mean [95 % CI]', lambda a: f'{Qy[a]["wer_mean"] * 100:.2f} % '
               f'[{Qy[a]["wer_mean_ci95"][0] * 100:.2f}, {Qy[a]["wer_mean_ci95"][1] * 100:.2f}]')
     md += row('Word error rate, pooled', lambda a: f'{Qy[a]["wer_pooled"] * 100:.2f} %')
-    md += row('Failed takes (of 96)', lambda a: f'{Qy[a]["failed"]} (cap {Qy[a]["capped"]}, collapsed '
-              f'{Qy[a]["collapsed"]})')
+    md += row('Word error rate, mean of each salt, lowest–highest', lambda a: (
+        f'{min(v["wer_mean"] for v in Qy[a]["per_salt"].values()) * 100:.2f}–'
+        f'{max(v["wer_mean"] for v in Qy[a]["per_salt"].values()) * 100:.2f} %'))
+    md += row('Failed takes (cap, collapsed)', lambda a: f'{Qy[a]["failed"]}/{Qy[a]["takes"]} (cap {Qy[a]["capped"]}, '
+              f'collapsed {Qy[a]["collapsed"]})')
+    md += row('Failed takes per salt (0 / 1 / 2 / 3)', lambda a: ' / '.join(
+        str(Qy[a]['per_salt'][s]['failed']) for s in sorted(Qy[a]['per_salt'])))
+    md += row('Engine finish reason, scored takes', lambda a: ', '.join(
+        f'{k if k is not None else "unmatched"} {v}' for k, v in Qy[a]['engine_finish'].items()))
     md += row('Speaker cosine to the full model\'s take', lambda a: (
         f'{Qy[a]["speaker_cosine_vs_full_mean"]:.3f}' if Qy[a].get('speaker_cosine_vs_full_mean') is not None else
         f'{Qy[a]["speaker_cosine_same_model_across_salts_mean"]:.3f} (itself, other salt)'))
@@ -309,22 +400,207 @@ def markdown(t):
     return md
 
 
+def pin_file(run, verify):
+    """The pin file a preflight verified with, found in the run or in recipe/checksums, only if its digest matches."""
+    name = Path(verify['pins']).name
+    for path in (run / name, REPO / 'recipe' / 'checksums' / name):
+        if path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() == verify['pins_sha256']:
+            return path
+    return None
+
+
+def under(paths):
+    """{top two path components or file name: count}, and whether every path is hidden (a component starts with .)."""
+    counts = {}
+    for p in paths:
+        key = '/'.join(p.split('/')[:2]) + '/' if '/' in p else p
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items())), all(any(s.startswith('.') for s in p.split('/')) for p in paths)
+
+
+def resume_record(run, first, again):
+    """What a resume repeated from the first preflight, and how its checkpoint pins changed."""
+    rec = {'started_at': again['started_at'], 'harness_commit': again['harness_commit'],
+           'harness_dirty': again['harness_dirty'],
+           'same_as_first': {k: again[k] == first[k] for k in ('binary_sha256', 'voice_sha256', 'corpus_sha256',
+                                                              'arms', 'salts')},
+           'checkpoint_pins_sha256': {k: v['verify']['pins_sha256'] for k, v in again['checkpoints'].items()},
+           'checkpoint_files_verified': {k: v['verify']['files'] for k, v in again['checkpoints'].items()},
+           'checkpoint_verify_returncode': {k: v['verify']['returncode'] for k, v in again['checkpoints'].items()},
+           'pin_changes': {}}
+    for name, v in again['checkpoints'].items():
+        a, b = first['checkpoints'][name]['verify'], v['verify']
+        if a['pins_sha256'] == b['pins_sha256']:
+            continue
+        fa, fb = pin_file(run, a), pin_file(run, b)
+        if not (fa and fb):
+            rec['pin_changes'][name] = {'pin_files_found': False}
+            continue
+        pa, pb = pins(fa), pins(fb)
+        dropped = sorted(set(pa) - set(pb))
+        dropped_under, dropped_hidden = under(dropped)
+        rec['pin_changes'][name] = {
+            'pin_files_found': True, 'entries_first': len(pa), 'entries_resume': len(pb),
+            'entries_dropped': len(dropped), 'entries_added': len(set(pb) - set(pa)),
+            'dropped_under': dropped_under, 'dropped_all_hidden': dropped_hidden,
+            'kept_entries_same_sha256': all(pa.get(k) == h for k, h in pb.items())}
+        client = fb.with_name(fb.name.replace('.sha256', '-visible.sha256'))
+        if client.exists():
+            pc = pins(client)
+            rec['pin_changes'][name]['client_pins'] = {
+                'entries': len(pc), 'hidden_entries': sum(any(s.startswith('.') for s in p.split('/')) for p in pc),
+                'same_sha256_as_resume_pins': all(pb.get(k) == h for k, h in pc.items()),
+                'resume_entries_left_out': under(sorted(set(pb) - set(pc)))[0]}
+    return rec
+
+
+def set_aside(run):
+    """Arm/salt directories a resume moved aside, with what the benchmark client refused (counts only)."""
+    out = []
+    for p in sorted(run.glob('*/resume-*-aside-*')):
+        rec = {'path': str(p.relative_to(run)), 'requests_sent': (p / 'whole' / 'samples.jsonl').exists()}
+        text = (p / 'whole.out').read_text(errors='replace') if (p / 'whole.out').exists() else ''
+        refused = re.search(r'refused: checkpoint differs from its pins: mismatched (\[.*?\]), missing (\[.*?\])', text)
+        if refused:
+            missing = ast.literal_eval(refused.group(2))
+            missing_under, missing_hidden = under(missing)
+            rec['refusal'] = {'mismatched': len(ast.literal_eval(refused.group(1))), 'missing': len(missing),
+                              'missing_under': missing_under, 'missing_all_hidden': missing_hidden}
+        out.append(rec)
+    return out
+
+
+def card(t):
+    """Model-card section: what the recipe is, the tables, the charts, how quality was scored and the run's history."""
+    A, Qy, E = t['arms'], t['quality'], t['environment']
+    F, Q, b = A['F'], A['Q'], E['engine_build']
+    g = lambda n: f'{n / GIB:.2f} GiB'  # noqa: E731
+    voice = lambda a: 'reference voice' if A[a]['reference_voice'] else 'built-in voice'  # noqa: E731
+    salts = E['salts']
+    items = Qy['F']['per_salt'][salts[0]]['takes']
+    passes = F['whole_warm_passes_per_salt']
+    md = '## Full model against this quant\n\n'
+    md += (f'One NVIDIA GB10, one engine binary for every arm, the {items} English texts of the bench corpus '
+           f'(`bench/corpus/drama-bench-en-v1.jsonl`, sha256 `{E["corpus_sha256"][:12]}…`) one request at a time, '
+           f'and {len(salts)} seed salts ({", ".join(map(str, salts))}) per arm. Every number below comes from the '
+           f'files of run `run-01` through `bench/full-vs-quant/report.py`; the per-request records are in `raw/`.\n\n')
+    md += '| Arm | Checkpoint | Voice | Engine arguments |\n|---|---|---|---|\n'
+    for a in A:
+        md += f'| {LABELS[a]} | {A[a]["checkpoint"]} | {voice(a)} | `{" ".join(A[a]["serve_args"])}` |\n'
+    held, layers = Q['engine']['routed_experts_held'], Q['engine']['nvfp4_layers']
+    md += '\n### The recipe\n\n'
+    md += (f'- **Quant.** {Q["precision"].split(";")[0]}. At start-up the engine reports '
+           f'{Q["engine"]["models_gib"]:.2f} '
+           f'GiB of model weights against {F["engine"]["models_gib"]:.2f} GiB for the full FP8 checkpoint, '
+           f'{held[0]:,} of {held[1]:,} routed experts held and NVFP4 routed experts in {layers[0]} of {layers[1]} '
+           f'layers. Weights and codec on disk: {g(Q["weights_and_codec_bytes"])} against '
+           f'{g(F["weights_and_codec_bytes"])}.\n')
+    gammas = {a: A[a]['cfg_gamma_logged'] for a in A}
+    inactive = [a for a in A if A[a]['flags'] and gammas[a] == [1.0]]
+    md += (f'- **Engine.** TensorFold native (Zig/CUDA), build `{b["describe"]}` from branch `{b["branch"]}`, '
+           f'clean tree: '
+           f'{"yes" if b["clean_tree"] else "no"}; binary sha256 `{E["engine_binary_sha256"][:12]}…`. Sampling as the '
+           f'engine reports it: {", ".join(sorted({A[a]["engine"]["sampling"] for a in A}))}. The quant is served with '
+           f'guidance γ 1.5 (`--cfg-gamma 1.5 --cfg-batched`): a second, unconditioned backbone sequence run in one '
+           f'batch with the first. The full-model arm with the same guidance (FG) separates the effect of guidance '
+           f'from the effect of the quant.'
+           + (f' With the built-in voice the engine logged γ 1.00 on every reply of {", ".join(inactive)}, so guidance '
+              f'was inactive there.' if inactive else '')
+           + ' The engine arguments in the table above are complete; none sets a redraw or retry.\n')
+    codec = E['codec_pth_sha256']
+    if None not in codec.values() and len(set(codec.values())) == 1:
+        md += (f'- **Codec.** The quant ships Drama 3\'s codec weights unchanged: `codec.pth` has the same sha256 '
+               f'(`{codec["quant"][:12]}…`) in both checkpoints\' pins. ')
+    else:
+        md += f'- **Codec.** `codec.pth` sha256 per checkpoint: {codec}. '
+    md += ('The engine binary decodes it with codec scratch kept per chunk, a host-side change (the build record is '
+           'in `tables.json` under `environment.engine_build.change`).\n\n')
+    md += '### Results\n\n' + markdown(t) + '\n'
+    md += (f'Real-time factor is client end-to-end time over audio time (lower is faster). Whole warm passes per salt: '
+           f'{" / ".join(str(passes[s]) for s in salts)}; streamed warm passes ran only in salt(s) '
+           f'{", ".join(map(str, F["streamed_salts"]))} ({F["stream_warm"]["attempted"] // items} per text). '
+           f'Rows marked salt 0 use only that salt. Quality scores only the first warm pass of '
+           f'each salt\'s whole replies: {items} takes per salt. A take fails if it reaches the 1024-frame cap or '
+           f'collapses (word error rate above 0.2, or a silence of 3 s or more inside the speech). The 95 % intervals '
+           f'resample the {items} texts 10,000 times. Speaker cosine compares ECAPA embeddings with the full model\'s '
+           f'take of the same text and salt (F for the reference voice, FB for the built-in voice); the cells marked '
+           f'"itself, other salt" are the baseline: the full model\'s takes of one text at two different salts.\n\n')
+    md += '### Charts\n\n'
+    for name, alt in (('footprint', 'Disk size and peak device memory'), ('speed', 'Speed per arm'),
+                      ('quality', 'Word error rate, failed takes and speaker similarity per arm')):
+        md += f'![{alt}](charts/{name}.svg)\n\n'
+    md += ('### How quality was scored\n\nWhisper large-v3 transcribed each take; reference and transcript went '
+           'through Whisper\'s English normalizer before a word-level edit distance. Speaker embeddings are '
+           f'SpeechBrain `spkrec-ecapa-voxceleb` at 16 kHz. Transcription ran on: '
+           f'{", ".join(t["scoring"]["asr"])}.\n\n')
+    md += '### Run history\n\n'
+    md += f'- The run started at {E["started_at"]} with harness commit `{E["harness_commit"][:7]}`.\n'
+
+    def listing(d):
+        parts = [f'{n} under `{k}`' if k.endswith('/') else f'`{k}`' for k, n in d.items()]
+        return ', '.join(parts[:-1]) + ' and ' + parts[-1] if len(parts) > 1 else ''.join(parts)
+
+    for s in E['set_aside']:
+        if 'refusal' in s:
+            f = s['refusal']
+            arm, salt = s['path'].split('/')[0], s['path'].rsplit('-s', 1)[1]
+            md += (f'- The first pass stopped at {LABELS[arm]} salt {salt}: the benchmark client refused to start it, '
+                   f'finding {f["missing"]} pinned files missing and {f["mismatched"]} mismatched. Missing: '
+                   f'{listing(f["missing_under"])}'
+                   + ('; all are hidden paths, which the client does not list' if f['missing_all_hidden'] else '')
+                   + f'. {"No request was sent." if not s["requests_sent"] else "Requests had been sent."}\n')
+    for r in E['resumed']:
+        resumed_at = datetime.strptime(r['started_at'], '%Y-%m-%dT%H:%M:%S%z').timestamp()
+        kept = [a for a in A if max(last for _, last in A[a]['request_epoch_span_per_salt'].values()) < resumed_at]
+        for name, c in r['pin_changes'].items():
+            if not c.get('pin_files_found'):
+                md += f'- The {name} checkpoint\'s pins changed at the resume; the pin files are not in the run.\n'
+                continue
+            md += (f'- Pin change (harness commit `{r["harness_commit"][:7]}`): the {name} checkpoint\'s sha256sum '
+                   f'list '
+                   f'went from {c["entries_first"]} to {c["entries_resume"]} entries. Dropped: '
+                   f'{listing(c["dropped_under"])}; added: {c["entries_added"]}; every kept entry has '
+                   f'{"the same" if c["kept_entries_same_sha256"] else "NOT the same"} sha256 as before. The resumed '
+                   f'preflight verified the {name} checkpoint\'s {r["checkpoint_files_verified"][name]} files '
+                   f'(exit {r["checkpoint_verify_returncode"][name]}).')
+            if 'client_pins' in c:
+                p = c['client_pins']
+                md += (f' The benchmark client got the same list less hidden paths: {p["entries"]} entries '
+                       f'({listing(p["resume_entries_left_out"])} left out), '
+                       f'{"all" if p["same_sha256_as_resume_pins"] else "NOT all"} with the same sha256.')
+            md += '\n'
+        same = r['same_as_first']
+        aside = ', '.join(f'`{x["path"]}`' for x in E['set_aside'])
+        md += (f'- The run resumed at {r["started_at"]}. Against the first preflight: '
+               + ', '.join(f'{k.replace("_sha256", "")} {"same" if v else "DIFFERENT"}' for k, v in same.items())
+               + '. Arms measured entirely before the resume, and kept: '
+               + f'{", ".join(LABELS[a] for a in kept) or "none"}. '
+               f'The set-aside directory ({aside}) is in no number here.\n')
+    return md
+
+
+
 def main():
     run, out = Path(sys.argv[1]), Path(sys.argv[2])
     preflight = json.loads((run / 'preflight.json').read_text())
     arms = [a for a in ('F', 'Q', 'FG', 'FB', 'QB') if (run / a / 's0' / 'whole' / 'summary.json').exists()]
+    codec = {}
+    for k, v in preflight['checkpoints'].items():
+        path = pin_file(run, v['verify'])
+        codec[k] = pins(path).get('codec.pth') if path else None
     tables = {'schema': 'full-vs-quant/1', 'arms': {}, 'environment': {
         'hardware': {k: v for k, v in preflight['hardware'].items() if k != 'host'},
-        'engine_build': {k: preflight['binary_build'][k] for k in ('commit', 'describe', 'branch', 'clean_tree', 'built')},
+        'engine_build': {k: preflight['binary_build'][k]
+                         for k in ('commit', 'describe', 'branch', 'clean_tree', 'built', 'change')},
         'engine_binary_sha256': preflight['binary_sha256'], 'corpus_sha256': preflight['corpus_sha256'],
         'voice_sha256': preflight['voice_sha256'], 'harness_commit': preflight['harness_commit'],
         'checkpoint_pins_sha256': {k: v['verify']['pins_sha256'] for k, v in preflight['checkpoints'].items()},
         'checkpoint_files_verified': {k: v['verify']['files'] for k, v in preflight['checkpoints'].items()},
+        'codec_pth_sha256': codec,
         'started_at': preflight['started_at'], 'salts': preflight['salts'],
-        'resumed': [{'started_at': r['started_at'], 'harness_commit': r['harness_commit'],
-                     'checkpoint_pins_sha256': {k: v['verify']['pins_sha256'] for k, v in r['checkpoints'].items()},
-                     'checkpoint_files_verified': {k: v['verify']['files'] for k, v in r['checkpoints'].items()}}
-                    for r in (json.loads(p.read_text()) for p in sorted(run.glob('resume-*-preflight.json')))]}}
+        'resumed': [resume_record(run, preflight, json.loads(p.read_text()))
+                    for p in sorted(run.glob('resume-*-preflight.json'))],
+        'set_aside': set_aside(run)}}
     (out / 'raw').mkdir(parents=True, exist_ok=True)
     requests, engine = [], []
     for arm in arms:
@@ -333,13 +609,17 @@ def main():
         requests += raw
         engine += eng
     scores, pairs = jl(run / 'scores.jsonl'), jl(run / 'pairs.jsonl')
-    tables['quality'], tables['paired'] = quality(scores, pairs, arms)
+    tables['scoring'] = {'asr': sorted({r.get('asr', 'not recorded') for r in scores})}
+    finishes = {(r['arm'], r['salt'], r['item']): r['finish'] for r in requests
+                if r['run'] == 'whole' and r['phase'] == 'warm' and r['round'] == 0}
+    tables['quality'], tables['paired'] = quality(scores, pairs, arms, finishes)
     (out / 'raw' / 'requests.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in requests))
     (out / 'raw' / 'engine.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in engine))
     (out / 'raw' / 'scores.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in scores))
     (out / 'raw' / 'speaker-pairs.jsonl').write_text(''.join(json.dumps(p) + '\n' for p in pairs))
     (out / 'tables.json').write_text(json.dumps(tables, indent=1) + '\n')
     (out / 'tables.md').write_text(markdown(tables))
+    (out / 'card-section.md').write_text(card(tables))
     charts(tables, out / 'charts')
     print(markdown(tables))
 

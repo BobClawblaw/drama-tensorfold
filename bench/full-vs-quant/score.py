@@ -65,7 +65,7 @@ def takes(run_dir):
                 s = json.loads(line)
                 if s['phase'] == 'warm' and s['round'] == 0:
                     out.append((arm_dir.name, int(salt_dir.name[1:]), s['item'],
-                                whole / 'bodies' / s['body_file'] if s.get('body_file') else None, s.get('body_sha256')))
+                                whole / s['body_file'] if s.get('body_file') else None, s.get('body_sha256')))
     return out
 
 
@@ -83,14 +83,15 @@ def main():
 
     texts = {json.loads(l)['id']: json.loads(l)['text'] for l in CORPUS.read_text().splitlines()}
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    asr = pipeline('automatic-speech-recognition', model=str(args.whisper), device=device,
-                   torch_dtype=torch.float16 if device != 'cpu' else torch.float32)
+    dtype = torch.float16 if device != 'cpu' else torch.float32
+    asr = pipeline('automatic-speech-recognition', model=str(args.whisper), device=device, torch_dtype=dtype)
     normalize = asr.tokenizer.normalize
     ecapa = EncoderClassifier.from_hparams(source=str(args.ecapa), overrides={'pretrained_path': str(args.ecapa)},
                                            local_strategy=LocalStrategy.NO_LINK, run_opts={'device': device})
     rows, embeddings = [], {}
     for arm, salt, item, wav, body_sha in takes(args.run_dir):
-        row = {'arm': arm, 'salt': salt, 'item': item, 'body_sha256': body_sha}
+        row = {'arm': arm, 'salt': salt, 'item': item, 'body_sha256': body_sha,
+               'asr': f'{device.split(":")[0]} {str(dtype).removeprefix("torch.")}'}
         if wav is None:
             rows.append({**row, 'failed': True, 'missing': True})
             continue
