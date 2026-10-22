@@ -320,7 +320,11 @@ def main():
         'voice_sha256': preflight['voice_sha256'], 'harness_commit': preflight['harness_commit'],
         'checkpoint_pins_sha256': {k: v['verify']['pins_sha256'] for k, v in preflight['checkpoints'].items()},
         'checkpoint_files_verified': {k: v['verify']['files'] for k, v in preflight['checkpoints'].items()},
-        'started_at': preflight['started_at'], 'salts': preflight['salts']}}
+        'started_at': preflight['started_at'], 'salts': preflight['salts'],
+        'resumed': [{'started_at': r['started_at'], 'harness_commit': r['harness_commit'],
+                     'checkpoint_pins_sha256': {k: v['verify']['pins_sha256'] for k, v in r['checkpoints'].items()},
+                     'checkpoint_files_verified': {k: v['verify']['files'] for k, v in r['checkpoints'].items()}}
+                    for r in (json.loads(p.read_text()) for p in sorted(run.glob('resume-*-preflight.json')))]}}
     (out / 'raw').mkdir(parents=True, exist_ok=True)
     requests, engine = [], []
     for arm in arms:

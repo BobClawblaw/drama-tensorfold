@@ -14,7 +14,11 @@ is up. The run holds the host's GPU window locks for its whole length (Nemotron 
 pilot takes the Drama GPU lock itself.
 
 Usage: run.py --out NEW_DIR --binary-dir DIR --full DIR --quant DIR --quant-sums FILE --voices DIR --runtime-dir DIR
-              --library-dir DIR --gpu-lock FILE [--arms F,Q,FG,QB,FB]
+              --library-dir DIR --gpu-lock FILE [--arms F,Q,FG,QB,FB] [--resume]
+
+--resume continues an interrupted run in the existing --out with the same arguments: arm/salt pairs recorded in
+status.json are kept untouched, a started but unrecorded pair's directory and admit record are moved aside, and
+every preflight check is repeated into resume-N-preflight.json, which must agree with preflight.json.
 """
 import argparse
 import fcntl
@@ -47,6 +51,7 @@ ARMS = {
     'QB': ('quant', False, GUIDED, 'NVFP4 quant, built-in voice (guidance inactive without a reference)', 21 * GIB),
     'FB': ('full', False, (), 'FP8 checkpoint, built-in voice', 40 * GIB),
 }
+HF_CACHE = '.cache/huggingface/'  # `hf download --local-dir` bookkeeping (locks, download metadata), not model files
 LOCKS = (('/tmp/nemo-gpu.lock', fcntl.LOCK_SH), ('/tmp/nemo-gpu.lock.slotA', fcntl.LOCK_EX))
 
 
@@ -70,6 +75,20 @@ def verify(pins, root):
     if done.returncode:
         raise SystemExit(f'checksum mismatch under {root}: {record["failed"][:5]} {done.stderr[-400:]}')
     return record
+
+
+def quant_pins(out, sums, prefix):
+    """Pins for the quant from the release SHA256SUMS, whose model/ lines are relative to the release folder.
+
+    Returns (all, visible): every model file except the HF_CACHE directory, for sha256sum -c; and the same less
+    hidden paths, for drama_bench, which lists only visible files and would read a hidden pin (.gitattributes) as
+    missing. Hidden files stay covered by the first."""
+    model = [(h, p[len('./model/'):]) for h, p in (l.split(None, 1) for l in sums.read_text().splitlines())
+             if p.startswith('./model/') and not p.startswith('./model/' + HF_CACHE)]
+    every, visible = out / f'{prefix}quant.sha256', out / f'{prefix}quant-visible.sha256'
+    every.write_text(''.join(f'{h}  {p}\n' for h, p in model))
+    visible.write_text(''.join(f'{h}  {p}\n' for h, p in model if not any(s.startswith('.') for s in p.split('/'))))
+    return every, visible
 
 
 def hardware():
@@ -164,13 +183,17 @@ def main():
     for name in ('out', 'binary_dir', 'full', 'quant', 'quant_sums', 'voices', 'runtime_dir', 'library_dir', 'gpu_lock'):
         ap.add_argument('--' + name.replace('_', '-'), type=Path, required=True)
     ap.add_argument('--arms', default='F,Q,FG,QB,FB')
+    ap.add_argument('--resume', action='store_true', help='continue the interrupted run in the existing --out')
     args = ap.parse_args()
     arms = args.arms.split(',')
     if any(a not in ARMS for a in arms):
         ap.error(f'arms are {",".join(ARMS)}')
     for name in ('binary_dir', 'full', 'quant', 'voices', 'runtime_dir', 'library_dir', 'gpu_lock', 'quant_sums'):
         setattr(args, name, getattr(args, name).resolve())
-    args.out.mkdir(parents=True, exist_ok=False)
+    if not args.resume:
+        args.out.mkdir(parents=True, exist_ok=False)
+    elif not (args.out / 'preflight.json').is_file():
+        raise SystemExit(f'{args.out} holds no preflight.json; nothing to resume')
     held = []
     for path, mode in LOCKS:
         f = open(path, 'a')
@@ -180,15 +203,13 @@ def main():
             raise SystemExit(f'{path} is held by another GPU job; nothing started')
         held.append(f)
 
-    # pins for the quant: the release's SHA256SUMS lists model/ files relative to the release folder
-    quant_pins = args.out / 'quant.sha256'
-    quant_pins.write_text(''.join(f'{h}  {p[len("./model/"):]}\n' for h, p in
-                                  (l.split(None, 1) for l in args.quant_sums.read_text().splitlines())
-                                  if p.startswith('./model/')))
-    pins = {'full': FULL_PINS, 'quant': quant_pins}
+    prefix = f'resume-{1 + len(list(args.out.glob("resume-*-preflight.json")))}-' if args.resume else ''
+    quant_all, quant_visible = quant_pins(args.out, args.quant_sums, prefix)
+    pins = {'full': FULL_PINS, 'quant': quant_all}
+    bench_pins = {'full': FULL_PINS, 'quant': quant_visible}
     roots = {'full': args.full, 'quant': args.quant}
     bin_sums = args.binary_dir / 'SHA256SUMS'
-    preflight = {'started_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'hardware': hardware(),
+    preflight = {'started_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'hardware': hardware(), 'argv': sys.argv,
                  'harness_commit': sh('git', '-C', str(REPO), 'rev-parse', 'HEAD').stdout.strip(),
                  'harness_dirty': bool(sh('git', '-C', str(REPO), 'status', '--porcelain').stdout.strip()),
                  'binary_build': json.loads((args.binary_dir / 'BUILD.json').read_text()),
@@ -198,18 +219,41 @@ def main():
                  'checkpoints': {k: {**tree_bytes(v), 'verify': verify(pins[k], v)} for k, v in roots.items()},
                  'arms': {a: dict(zip(('checkpoint', 'reference_voice', 'flags', 'precision', 'admit_peak_bytes'),
                                       ARMS[a])) for a in arms}, 'salts': SALTS, 'port': PORT}
-    (args.out / 'preflight.json').write_text(json.dumps(preflight, indent=1) + '\n')
-    print('preflight ok', flush=True)
-
     status = {}
+    if args.resume:
+        first = json.loads((args.out / 'preflight.json').read_text())
+        again = json.loads(json.dumps(preflight))
+        differs = [k for k in ('binary_sha256', 'binary_build', 'voice_sha256', 'corpus_sha256', 'salts', 'port')
+                   if first[k] != again[k]]
+        differs += [f'checkpoints.{k}.root' for k in roots
+                    if first['checkpoints'][k]['verify']['root'] != again['checkpoints'][k]['verify']['root']]
+        differs += [f'arms.{a}' for a in arms if a in first['arms'] and first['arms'][a] != again['arms'][a]]
+        if differs:
+            raise SystemExit(f'resume refused: {differs} differ from {args.out / "preflight.json"}; nothing started')
+        if (args.out / 'status.json').is_file():
+            status = json.loads((args.out / 'status.json').read_text())
+        preflight['resumes'] = str(args.out / 'preflight.json')
+    (args.out / f'{prefix}preflight.json').write_text(json.dumps(preflight, indent=1) + '\n')
+    print(f'{prefix}preflight ok', flush=True)
+
     for arm in arms:
         kind, voice, flags, precision, peak = ARMS[arm]
         ckpt = roots[kind]
         for salt in SALTS:
             run = args.out / arm / f's{salt}'
+            if f'{arm}/s{salt}' in status:
+                print(f'{time.strftime("%T")} {arm} salt {salt}: kept from earlier, bench exits '
+                      f'{status[f"{arm}/s{salt}"]}', flush=True)
+                continue
+            admit = args.out / f'admit-{arm}-s{salt}.json'
+            for leftover in (run, admit):
+                if args.resume and leftover.exists():
+                    aside = leftover.with_name(f'{prefix}aside-{leftover.name}')
+                    leftover.rename(aside)
+                    print(f'{time.strftime("%T")} {arm} salt {salt}: unfinished {leftover} moved to {aside}', flush=True)
             sh(sys.executable, str(BENCH / 'admit.py'), '--root', str(ckpt), '--peak-bytes', str(peak),
                '--peak-source', 'expected /health peak (smoke on this host), advisory', '--margin-bytes', str(2 * GIB),
-               '--out', str(args.out / f'admit-{arm}-s{salt}.json'))
+               '--out', str(admit))
             print(f'{time.strftime("%T")} {arm} salt {salt}: starting', flush=True)
             pilot, pid = start(args, run, ckpt, voice, flags, salt)
             poller = Poller(run / 'health.jsonl')
@@ -217,11 +261,11 @@ def main():
             try:
                 label = f'full-vs-quant-01 {arm} salt {salt}'
                 if salt == 0:
-                    codes = [bench(args, run, 'whole', ckpt, pins[kind], pid, label, precision, 'fresh', 2, 3),
-                             bench(args, run, 'stream', ckpt, pins[kind], pid, label + ' stream', precision, 'reused',
+                    codes = [bench(args, run, 'whole', ckpt, bench_pins[kind], pid, label, precision, 'fresh', 2, 3),
+                             bench(args, run, 'stream', ckpt, bench_pins[kind], pid, label + ' stream', precision, 'reused',
                                    1, 3, stream=True)]
                 else:
-                    codes = [bench(args, run, 'whole', ckpt, pins[kind], pid, label, precision, 'fresh', 0, 1)]
+                    codes = [bench(args, run, 'whole', ckpt, bench_pins[kind], pid, label, precision, 'fresh', 0, 1)]
             finally:
                 poller.halt.set()
                 stop(pilot)
