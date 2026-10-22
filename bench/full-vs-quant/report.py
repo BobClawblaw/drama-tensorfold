@@ -6,22 +6,29 @@ health.jsonl,server.sh}, scores.jsonl, pairs.jsonl) and writes OUT_DIR/tables.js
 OUT_DIR/card-section.md (a model-card section), OUT_DIR/raw/*.jsonl and OUT_DIR/charts/*.{png,svg}. Raw records keep
 numbers, item ids and body hashes only: no audio, transcripts of private material, host paths or process identities.
 
-Usage: report.py RUN_DIR OUT_DIR
+With --grill, also reads a `grill-perf media compare` result (numbers, hashes and reply headers only), copies it
+byte-for-byte to OUT_DIR/raw/grill-compare.json, records it in tables.json under `grill` and adds its section to the
+card. OUT_DIR/README.md is not written here.
+
+Usage: report.py RUN_DIR OUT_DIR [--grill COMPARE_JSON --grill-collector 'NAME VERSION'
+                                  --grill-collector-sha256 HEX --grill-arms a=FG,b=Q,a2=FG]
 """
+import argparse
 import ast
 import hashlib
 import json
 import math
 import random
 import re
-import sys
 import textwrap
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from statistics import mean, median
 
 import matplotlib
 matplotlib.use('Agg')
+matplotlib.rcParams['svg.hashsalt'] = 'full-vs-quant'  # fixed SVG element ids, so a rerun writes identical SVGs
 import matplotlib.pyplot as plt  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
@@ -356,22 +363,26 @@ def markdown(t):
     md += row('Weights + codec on disk (GiB)', lambda a: g(A[a]['weights_and_codec_bytes']))
     md += row('Peak device memory, /health (GiB)', lambda a: g(A[a]['device_peak_bytes']['max']))
     md += row('Host MemAvailable drop, max (GiB)', lambda a: g(A[a]['host_memavailable_drop_bytes']['max']))
-    md += row('Process start to ready, median of 4 cold starts (s)', lambda a: f'{A[a]["cold_ready_s"]["median"]:.1f}')
-    md += row('Engine load, median (s)', lambda a: f'{A[a]["engine_loaded_in_s"]["median"]:.1f}')
-    md += row('Real-time factor, warm p50, salt 0 (all warm passes)', lambda a: f'{A[a]["whole_warm"]["rtf_p50"]:.3f}')
-    md += row('Real-time factor, warm p95, salt 0 (all warm passes)', lambda a: f'{A[a]["whole_warm"]["rtf_p95"]:.3f}')
-    md += row('Real-time factor, p50 of each salt\'s first warm pass, lowest–highest', lambda a: (
+    md += row('Process start to ready, arithmetic median of 4 cold starts (s)',
+              lambda a: f'{A[a]["cold_ready_s"]["median"]:.1f}')
+    md += row('Engine load, arithmetic median (s)', lambda a: f'{A[a]["engine_loaded_in_s"]["median"]:.1f}')
+    md += row('Real-time factor, warm p50 nearest-rank, salt 0 (all warm passes)',
+              lambda a: f'{A[a]["whole_warm"]["rtf_p50"]:.3f}')
+    md += row('Real-time factor, warm p95 nearest-rank, salt 0 (all warm passes)',
+              lambda a: f'{A[a]["whole_warm"]["rtf_p95"]:.3f}')
+    md += row('Real-time factor, arithmetic median of each salt\'s first warm pass, lowest–highest', lambda a: (
         f'{min(A[a]["whole_warm_rtf_p50_per_salt"].values()):.3f}–'
         f'{max(A[a]["whole_warm_rtf_p50_per_salt"].values()):.3f}'))
-    md += row('Whole reply, warm p50, salt 0 (s)', lambda a: f'{A[a]["whole_warm"]["end_to_end_s_p50"]:.2f}')
-    md += row('First audio when streaming, p50, salt 0 (s)',
+    md += row('Whole reply, warm p50 nearest-rank, salt 0 (s)',
+              lambda a: f'{A[a]["whole_warm"]["end_to_end_s_p50"]:.2f}')
+    md += row('First audio when streaming, p50 nearest-rank, salt 0 (s)',
               lambda a: f'{A[a]["stream_warm"]["first_frame_s_p50"]:.3f}')
-    md += row('Decode, codec frames/s, streamed, salt 0 (median)',
+    md += row('Decode, codec frames/s, streamed, salt 0 (arithmetic median)',
               lambda a: f'{A[a]["stream_warm"]["decode_frames_per_s_median"]:.1f}')
-    md += row('Prompt tokens per second to first audio (median)', lambda a: (
+    md += row('Prompt tokens per second to first audio (arithmetic median)', lambda a: (
         f'{A[a]["stream_warm"]["prompt_tokens_per_s_to_first_frame_median"]:.0f}'
         if A[a]['stream_warm']['prompt_tokens_per_s_to_first_frame_median'] else '—'))
-    md += row('Prompt tokens per request (median)', lambda a: (
+    md += row('Prompt tokens per request (arithmetic median)', lambda a: (
         f'{A[a]["stream_warm"]["prompt_tokens_median"]:.0f}' if A[a]['stream_warm']['prompt_tokens_median'] else '—'))
     md += row('Warm requests succeeded', lambda a: f'{A[a]["whole_warm"]["succeeded"]}/{A[a]["whole_warm"]["attempted"]}'
               f' + {A[a]["stream_warm"]["succeeded"]}/{A[a]["stream_warm"]["attempted"]} streamed')
@@ -390,6 +401,12 @@ def markdown(t):
     md += row('Speaker cosine to the full model\'s take', lambda a: (
         f'{Qy[a]["speaker_cosine_vs_full_mean"]:.3f}' if Qy[a].get('speaker_cosine_vs_full_mean') is not None else
         f'{Qy[a]["speaker_cosine_same_model_across_salts_mean"]:.3f} (itself, other salt)'))
+    md += ('\nTwo median conventions. Rows marked nearest-rank are the benchmark client\'s own summaries '
+           '(`bench/drama_bench.py`, `percentiles`): the sorted value at rank ⌈p·n/100⌉, never interpolated, so a p50 '
+           'over an even count is the lower of the two middle values. Rows marked arithmetic median are computed '
+           'by `bench/full-vs-quant/report.py` with Python\'s `statistics.median`, which averages the two middle '
+           'values of an even count; the per-salt real-time-factor range is one of these (its `tables.json` key keeps '
+           'the name `whole_warm_rtf_p50_per_salt`).\n')
     md += '\n| Paired comparison | Pairs | Failed only in first | Failed only in second | Exact McNemar p | ' \
           'WER difference, mean [95 % CI over items] |\n|---|---:|---:|---:|---:|---|\n'
     for k, v in P.items():
@@ -470,6 +487,196 @@ def set_aside(run):
     return out
 
 
+def fraction(x):
+    return x['numerator'] / x['denominator']
+
+
+def grill_record(compare, collector, collector_sha256, slot_arms):
+    """The numbers of a `grill-perf media compare` result, with the collector and run-01 arm each slot served."""
+    c = json.loads(compare)
+    slots = {}
+    for a in c['acquisitions']:
+        replies = [r['reply'] for r in a['runs']]
+        headers = [dict(r['headers']) for r in replies]
+        dates = sorted(parsedate_to_datetime(h['date']) for h in headers)
+        slots[a['slot']['id']] = {
+            'status': a['status'], 'cache_mutated_during_measurement': a['cache_mutated_during_measurement'],
+            'replies': len(replies), 'seeds': sorted({r['seed'] for r in a['runs']}),
+            'http_status': sorted({r['http_status'] for r in replies}),
+            'failures': sum(r['failure'] is not None for r in replies),
+            'content_type': sorted({h.get('content-type', '') for h in headers}),
+            'x_cfg_gamma': sorted({h.get('x-cfg-gamma', '') for h in headers}),
+            'reply_date_first': dates[0].isoformat(), 'reply_date_last': dates[-1].isoformat(),
+            'body_bytes_max': max(r['body']['bytes'] for r in replies),
+            'bodies_truncated': sum(r['body']['truncated'] for r in replies),
+            'cells': {x['cell']: {'warmup_runs': x['warmup_runs'], 'measured_runs': x['measured_runs'],
+                                  'eligible': x['eligible'], 'ineligible_by_reason': x['ineligible_by_reason'],
+                                  'finish_reason_unknown': x['finish_reason_unknown'],
+                                  'deterministic_per_seed': all(d['deterministic'] for d in x['determinism_by_seed']),
+                                  'first_audio_us_median': x['first_audio_us']['median'],
+                                  'end_to_end_us_median': x['end_to_end_us']['median']} for x in a['cells']}}
+    gates, rtf = [], {}
+    for g in c['gates']:
+        cell = g['gate']['cell']
+        rs, cs = g['reference_summary'], g['candidate_summary']
+        rtf[cell] = {'reference': rs['realtime_factor'], 'candidate': cs['realtime_factor']}
+        gates.append({'cell': cell, 'metric': g['gate']['metric'], 'outcome': g['outcome'], 'reason': g['reason'],
+                      'max_adverse_bps': g['gate']['max_adverse_bps'],
+                      'max_reference_spread_bps': g['gate']['max_reference_spread_bps'],
+                      'reference_range': [fraction(x) for x in g['reference']],
+                      'candidate_range': [fraction(x) for x in g['candidate']],
+                      'adverse_bounds': g['adverse_bounds'],
+                      'reference_eligible': rs['eligible'], 'candidate_eligible': cs['eligible'],
+                      'audio_bytes_equal_across_arms': [e['equal'] for e in g['cross_arm_hash_equality']]})
+    return {'compare_sha256': hashlib.sha256(compare).hexdigest(), 'copy': 'raw/grill-compare.json',
+            'collector': collector, 'collector_binary_sha256': collector_sha256, 'slot_arms': slot_arms,
+            **{k: c[k] for k in ('kind', 'version', 'claim', 'support', 'axis', 'workload_sha256', 'outcome',
+                                 'reasons', 'reference_identity')},
+            'slots': slots, 'gates': gates, 'realtime_factor': rtf}
+
+
+# Media compare exit codes as the collector documents them (grill-perf MEDIA.md, v0.11.0).
+GRILL_EXIT = {'PASS': 0, 'ERROR': 1, 'INVALID': 1, 'INCONCLUSIVE': 2, 'REGRESSION': 3}
+GRILL_METRIC = {'first_audio_us': 'First audio', 'end_to_end_us': 'End-to-end', 'duration_ratio': 'Duration ratio'}
+
+
+def grill_card(t):
+    """Card section for The Grill's full-against-quant comparison: what it says, and how it sits beside run-01."""
+    G, A = t['grill'], t['arms']
+    S, arms = G['slots'], G['slot_arms']
+    ref, cand = arms['a'], arms['b']
+    if arms.get('a2') != ref:
+        raise SystemExit('--grill-arms: a and a2 must name the same run-01 arm')
+    cells = list(S['a']['cells'])
+    gate = {(g['cell'], g['metric']): g for g in G['gates']}
+    sec = lambda us: us / 1e6  # noqa: E731
+    pct = lambda x: f'{x * 100:+.1f} %'  # noqa: E731
+    cfg = ', '.join(sorted({v for s in S.values() for v in s['x_cfg_gamma']}))
+    ctype = ', '.join(sorted({v for s in S.values() for v in s['content_type']}))
+    seeds = ', '.join(str(x) for x in sorted({v for s in S.values() for v in s['seeds']}))
+    first = S['a']['cells'][cells[0]]
+    md = '### Speed under The Grill (separate from run-01)\n\n'
+    md += (f'Measured with The Grill: `{G["collector"]}` (binary sha256 `{G["collector_binary_sha256"][:12]}…`, as '
+           f'given to `report.py`), three `media capture` slots and one `media compare` (`{G["kind"]}`, version '
+           f'{G["version"]}). Slots a and a2 served the configuration of run-01 arm {ref} ({LABELS[ref]}, '
+           f'checkpoint {A[ref]["checkpoint"]}) and slot b that of arm {cand} ({LABELS[cand]}, checkpoint '
+           f'{A[cand]["checkpoint"]}); the comparison pools a and a2 as the reference (A + A2) against b (B). Every '
+           f'reply in the comparison carries `x-cfg-gamma: {cfg}` and `content-type: {ctype}` (streamed). Cells: '
+           f'{", ".join(cells)} from the '
+           f'bench corpus, seed {seeds}, {first["warmup_runs"]} warm-up and {first["measured_runs"]} measured requests '
+           f'per cell and slot. Capture periods (reply Date headers, UTC): '
+           + '; '.join(f'{k} {s["reply_date_first"][:10]} {s["reply_date_first"][11:19]}–{s["reply_date_last"][11:19]}'
+                       for k, s in S.items())
+           + f'. The comparison is `{G["copy"]}` (sha256 `{G["compare_sha256"][:12]}…`), byte for byte; every Grill '
+           f'number in this section comes from it, and every run-01 number from the tables above. The workload file it '
+           f'names has sha256 `{G["workload_sha256"][:12]}…`. This makes no claim about concurrent load.\n\n')
+    md += (f'- **Claim scope**, as the comparison states it: `{G["claim"]}`, on the `{G["axis"]}` axis, support level '
+           f'`{G["support"]}`: The Grill is early experimental software. Reference identity '
+           f'`{G["reference_identity"]["status"]}`: "{G["reference_identity"]["scope"]}"\n')
+    complete = all(s['status'] == 'complete' for s in S.values())
+    clean = all(s['failures'] == 0 and s['http_status'] == [200] for s in S.values())
+    eligible = all(x['eligible'] == x['measured_runs'] and not x['ineligible_by_reason']
+                   for s in S.values() for x in s['cells'].values())
+    md += (f'- **Outcome: {G["outcome"]}** (reason `{", ".join(G["reasons"])}`; exit '
+           f'{GRILL_EXIT[G["outcome"]]} in the collector\'s mapping: 0 PASS, 1 ERROR or INVALID, 2 INCONCLUSIVE, '
+           f'3 REGRESSION).')
+    if G['axis'] == 'changed-model' and G['reasons'] == ['changed_model_axis']:
+        md += (' The slots serve different models, which is the point of this comparison; on that axis the collector '
+               'reports each gate but never an overall pass, so INCONCLUSIVE is the result by design.')
+    status = ', '.join(f'{k} {s["status"]}' for k, s in S.items())
+    replies = ', '.join(f'{k} {s["replies"]}' for k, s in S.items())
+    md += (f' Captures: acquisition status {status}; replies {replies}, HTTP status '
+           f'{", ".join(map(str, sorted({c for s in S.values() for c in s["http_status"]})))}, '
+           f'{sum(s["failures"] for s in S.values())} failed; measured requests eligible in every cell and slot: '
+           f'{"all" if eligible else "NOT all"}.'
+           + (' It is not a failed capture.' if complete and clean and eligible else '') + '\n')
+    md += '\n| Cell | Gate | Adverse bound | A + A2, min–max | B, min–max | Adverse-bound interval | Outcome |\n'
+    md += '|---|---|---:|---:|---:|---:|---|\n'
+    for g in G['gates']:
+        if g['metric'] == 'duration_ratio':
+            v = lambda x: f'{x:.3f}'  # noqa: E731
+            iv = f'{g["adverse_bounds"][0]:.3f}' if g['adverse_bounds'][0] == g['adverse_bounds'][1] else \
+                f'{g["adverse_bounds"][0]:.3f} to {g["adverse_bounds"][1]:.3f}'
+        else:
+            v = lambda x: f'{sec(x):.3f} s'  # noqa: E731
+            iv = f'{pct(g["adverse_bounds"][0])} to {pct(g["adverse_bounds"][1])}'
+        bound = (f'{g["max_adverse_bps"] / 100:.2f} %' if g['metric'] != 'duration_ratio'
+                 else f'{g["max_adverse_bps"] / 10000:.3f}')
+        md += (f'| {g["cell"]} | {GRILL_METRIC.get(g["metric"], g["metric"])} | {bound} | '
+               f'{v(g["reference_range"][0])}–{v(g["reference_range"][1])} (n {g["reference_eligible"]}) | '
+               f'{v(g["candidate_range"][0])}–{v(g["candidate_range"][1])} (n {g["candidate_eligible"]}) | {iv} | '
+               f'{g["outcome"]} |\n')
+    md += ('\nTiming gates: the interval runs from B\'s minimum against A + A2\'s maximum to B\'s maximum against '
+           'their minimum, as a relative change; negative means B was lower, positive would count against the bound. '
+           'Duration ratio is B\'s audio length over A + A2\'s for the same text and seed; a length change in either '
+           'direction is adverse, against a bound of '
+           f'{gate[(cells[0], "duration_ratio")]["max_adverse_bps"] / 10000:.3f}. Every gate\'s reference-spread limit '
+           f'(`max_reference_spread_bps`) is '
+           + ', '.join(sorted({f'{g["max_reference_spread_bps"] / 100:.0f} %' for g in G['gates']}))
+           + '; the a and a2 medians are in the next table.\n\n')
+    md += ('| Cell | First audio, median a / a2 / b (s) | End-to-end, median a / a2 / b (s) | Real-time factor, '
+           'A + A2 / B (not gated) | B audio length / A + A2 |\n|---|---:|---:|---:|---:|\n')
+    for cell in cells:
+        fa = ' / '.join(f'{sec(S[k]["cells"][cell]["first_audio_us_median"]):.3f}' for k in ('a', 'a2', 'b'))
+        e2e = ' / '.join(f'{sec(S[k]["cells"][cell]["end_to_end_us_median"]):.3f}' for k in ('a', 'a2', 'b'))
+        r = G['realtime_factor'][cell]
+        md += (f'| {cell} | {fa} | {e2e} | {r["reference"]:.3f} / {r["candidate"]:.3f} | '
+               f'{gate[(cell, "duration_ratio")]["candidate_range"][0]:.3f} |\n')
+    passed = lambda m: [c for c in cells if gate[(c, m)]['outcome'] == 'PASS']  # noqa: E731
+    failed_dur = [c for c in cells if gate[(c, 'duration_ratio')]['outcome'] != 'PASS']
+    ratios = [f'{gate[(c, "duration_ratio")]["candidate_range"][0]:.3f}' for c in failed_dur]
+    adverse = [f'{gate[(c, "duration_ratio")]["adverse_bounds"][1]:.3f}' for c in failed_dur]
+    rtf_change = {c: G['realtime_factor'][c]['candidate'] / G['realtime_factor'][c]['reference'] - 1 for c in cells}
+    md += (f'\nFirst audio passes in {", ".join(passed("first_audio_us")) or "no cell"} and end-to-end time in '
+           f'{", ".join(passed("end_to_end_us")) or "no cell"}. Duration ratio '
+           + (f'is {"/".join(sorted({gate[(c, "duration_ratio")]["outcome"] for c in failed_dur}))} in '
+              f'{" and ".join(failed_dur)}: B\'s audio is {" and ".join(ratios)} of A + A2\'s length there, an '
+              f'adverse deviation of {" and ".join(adverse)} against a bound of '
+              f'{gate[(failed_dur[0], "duration_ratio")]["max_adverse_bps"] / 10000:.3f}'
+              if failed_dur else 'passes in every cell')
+           + (f'; it passes in {", ".join(passed("duration_ratio"))} ('
+              + ', '.join(f'{gate[(c, "duration_ratio")]["candidate_range"][0]:.3f}' for c in passed('duration_ratio'))
+              + ')' if failed_dur and passed('duration_ratio') else '')
+           + '. Shorter audio is not a speed-up: end-to-end time grows with the audio produced, so where B\'s audio is '
+           'shorter part of its lower end-to-end time is less audio, not faster synthesis. The real-time factor '
+           '(end-to-end time over audio time, reported by the collector, not gated) is the length-normalised figure: '
+           f'B against A + A2 {", ".join(f"{pct(rtf_change[c])} in {c}" for c in cells)}. ')
+    equal = [e for g in G['gates'] for e in g['audio_bytes_equal_across_arms']]
+    determ = all(x['deterministic_per_seed'] for s in S.values() for x in s['cells'].values())
+    unknown = sum(x['finish_reason_unknown'] for s in S.values() for x in s['cells'].values())
+    body_max = max(s['body_bytes_max'] for s in S.values())
+    md += (f'B\'s audio bytes are {"never" if not any(equal) else "sometimes"} equal to A\'s for the same seed, as '
+           f'expected across a model change; within each slot every cell was '
+           f'{"deterministic per seed" if determ else "NOT deterministic per seed"}. The finish reason is unknown on '
+           f'{unknown} measured replies (the engine sends it as an HTTP trailer and the collector reads headers), so '
+           f'the collector cannot flag a clipped reply; the largest body is {body_max:,} bytes, below the '
+           f'{1024 * FRAME * 2:,} bytes of a 1024-frame reply.\n\n')
+    md += ('- **What it is not.** It measures its own declared cells and bounds only; it says nothing about output '
+           f'quality (for these two configurations see the {cand} and {ref} columns above), and none of its numbers is '
+           f'pooled into run-01\'s tables or charts.\n')
+    rows = (('real-time factor p50', lambda a: A[a]['whole_warm']['rtf_p50'], '{:.3f}'),
+            ('first audio p50', lambda a: A[a]['stream_warm']['first_frame_s_p50'], '{:.3f} s'),
+            ('whole reply p50', lambda a: A[a]['whole_warm']['end_to_end_s_p50'], '{:.2f} s'))
+    run01 = [(n, f(cand), f(ref), fmt) for n, f, fmt in rows]
+    grill_lower = all(g['adverse_bounds'][1] < 0 for g in G['gates'] if g['metric'] != 'duration_ratio') and \
+        all(v < 0 for v in rtf_change.values())
+    run01_lower = all(c < r for _, c, r, _ in run01)
+    md += ('- **Beside run-01.** For the same two configurations run-01\'s salt-0 rows '
+           + (f'point the same way, lower for {cand}' if grill_lower and run01_lower else
+              'do NOT all point the same way as The Grill')
+           + f': {cand} against {ref}, '
+           + ', '.join(f'{n} {fmt.format(c)} against {fmt.format(r)} ({pct(c / r - 1)})' for n, c, r, fmt in run01)
+           + f'; {cand}\'s warm whole replies at salt 0 hold {A[cand]["whole_warm"]["audio_s_total"]:.0f} s of audio '
+           f'against {A[ref]["whole_warm"]["audio_s_total"]:.0f} s '
+           f'({pct(A[cand]["whole_warm"]["audio_s_total"] / A[ref]["whole_warm"]["audio_s_total"] - 1)}). The '
+           f'workloads differ, so the sizes are not interchangeable: run-01 is '
+           f'{t["quality"][ref]["per_salt"][0]["takes"]} texts at seed salt 0, whole WAV replies for the real-time '
+           f'factor and whole-reply rows and streamed replies for first audio, with nearest-rank p50s; The Grill is '
+           f'{len(cells)} texts at seed {seeds}, streamed PCM replies only, a and a2 pooled, with the collector\'s '
+           f'medians and min–max ranges.\n\n')
+    return md
+
+
 def card(t):
     """Model-card section: what the recipe is, the tables, the charts, how quality was scored and the run's history."""
     A, Qy, E = t['arms'], t['quality'], t['environment']
@@ -483,7 +690,9 @@ def card(t):
     md += (f'One NVIDIA GB10, one engine binary for every arm, the {items} English texts of the bench corpus '
            f'(`bench/corpus/drama-bench-en-v1.jsonl`, sha256 `{E["corpus_sha256"][:12]}…`) one request at a time, '
            f'and {len(salts)} seed salts ({", ".join(map(str, salts))}) per arm. Every number below comes from the '
-           f'files of run `run-01` through `bench/full-vs-quant/report.py`; the per-request records are in `raw/`.\n\n')
+           f'files of run `run-01` through `bench/full-vs-quant/report.py`'
+           + ('; The Grill\'s section takes its own from `raw/grill-compare.json`' if 'grill' in t else '')
+           + '; the per-request records are in `raw/`.\n\n')
     md += '| Arm | Checkpoint | Voice | Engine arguments |\n|---|---|---|---|\n'
     for a in A:
         md += f'| {LABELS[a]} | {A[a]["checkpoint"]} | {voice(a)} | `{" ".join(A[a]["serve_args"])}` |\n'
@@ -529,6 +738,10 @@ def card(t):
     for name, alt in (('footprint', 'Disk size and peak device memory'), ('speed', 'Speed per arm'),
                       ('quality', 'Word error rate, failed takes and speaker similarity per arm')):
         md += f'![{alt}](charts/{name}.svg)\n\n'
+    md += ('In the speed chart the real-time-factor and first-audio bars are the nearest-rank p50 rows of the table; '
+           'decode and start-to-ready are arithmetic medians.\n\n')
+    if 'grill' in t:
+        md += grill_card(t)
     md += ('### How quality was scored\n\nWhisper large-v3 transcribed each take; reference and transcript went '
            'through Whisper\'s English normalizer before a word-level edit distance. Speaker embeddings are '
            f'SpeechBrain `spkrec-ecapa-voxceleb` at 16 kHz. Transcription ran on: '
@@ -579,9 +792,21 @@ def card(t):
     return md
 
 
-
 def main():
-    run, out = Path(sys.argv[1]), Path(sys.argv[2])
+    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    ap.add_argument('run', type=Path, help='run.py run directory, scored')
+    ap.add_argument('out', type=Path, help='output directory')
+    ap.add_argument('--grill', type=Path, help='`grill-perf media compare` JSON for the full-against-quant speed row')
+    ap.add_argument('--grill-collector', help='collector name and version, e.g. "grill-perf 0.11.0"')
+    ap.add_argument('--grill-collector-sha256', help='sha256 of the collector binary')
+    ap.add_argument('--grill-arms', help='run-01 arm whose configuration each slot served, e.g. a=FG,b=Q,a2=FG')
+    args = ap.parse_args()
+    grill_opts = (args.grill_collector, args.grill_collector_sha256, args.grill_arms)
+    if args.grill and not all(grill_opts):
+        ap.error('--grill needs --grill-collector, --grill-collector-sha256 and --grill-arms')
+    if not args.grill and any(grill_opts):
+        ap.error('--grill-collector, --grill-collector-sha256 and --grill-arms need --grill')
+    run, out = args.run, args.out
     preflight = json.loads((run / 'preflight.json').read_text())
     arms = [a for a in ('F', 'Q', 'FG', 'FB', 'QB') if (run / a / 's0' / 'whole' / 'summary.json').exists()]
     codec = {}
@@ -613,6 +838,13 @@ def main():
     finishes = {(r['arm'], r['salt'], r['item']): r['finish'] for r in requests
                 if r['run'] == 'whole' and r['phase'] == 'warm' and r['round'] == 0}
     tables['quality'], tables['paired'] = quality(scores, pairs, arms, finishes)
+    if args.grill:
+        compare = args.grill.read_bytes()
+        slot_arms = dict(x.split('=', 1) for x in args.grill_arms.split(','))
+        if not set(slot_arms) == {'a', 'b', 'a2'} or not set(slot_arms.values()) <= set(arms):
+            ap.error(f'--grill-arms must map a, b and a2 to arms of this run ({", ".join(arms)})')
+        tables['grill'] = grill_record(compare, args.grill_collector, args.grill_collector_sha256, slot_arms)
+        (out / 'raw' / 'grill-compare.json').write_bytes(compare)
     (out / 'raw' / 'requests.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in requests))
     (out / 'raw' / 'engine.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in engine))
     (out / 'raw' / 'scores.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in scores))

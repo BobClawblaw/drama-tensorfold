@@ -13,14 +13,30 @@ binary for every arm, from run `run-01` of `bench/full-vs-quant/run.py`. Five ar
 
 | File | What it holds |
 |---|---|
-| [`card-section.md`](card-section.md) | The model-card section: the recipe (quant, engine, codec), the tables, the charts and the run history, including the resume |
+| [`card-section.md`](card-section.md) | The model-card section: the recipe (quant, engine, codec), the tables, the charts, The Grill's speed comparison and the run history, including the resume |
 | [`tables.md`](tables.md) | The per-arm table and the paired comparisons |
-| [`tables.json`](tables.json) | Every number in the tables, the environment, the resume record and the pin change |
+| [`tables.json`](tables.json) | Every number in the tables, the environment, the resume record, the pin change and, under `grill`, The Grill's comparison |
 | [`charts/`](charts) | `footprint`, `speed` and `quality`, each as PNG and SVG |
-| [`raw/`](raw) | Per-request records, engine log lines, per-take scores (with transcripts of the public bench corpus) and speaker-similarity pairs |
+| [`raw/`](raw) | Per-request records, engine log lines, per-take scores (with transcripts of the public bench corpus), speaker-similarity pairs and `grill-compare.json`, The Grill's comparison byte for byte (numbers, hashes and reply headers only) |
 
-`tables.json` SHA-256 `fcd56bce…`, from merged scores SHA-256 `9e13c6a9…` and speaker pairs SHA-256 `88b72ca4…`
-(byte-identical to `raw/scores.jsonl` and `raw/speaker-pairs.jsonl`).
+`tables.json` SHA-256 `f3c96e49…`, from merged scores SHA-256 `9e13c6a9…` and speaker pairs SHA-256 `88b72ca4…`
+(byte-identical to `raw/scores.jsonl` and `raw/speaker-pairs.jsonl`) and The Grill's comparison SHA-256 `ba79d2c9…`
+(byte-identical to `raw/grill-compare.json`).
+
+`report.py` writes every file here except this README, which is maintained by hand. A rerun of the command below with
+the same matplotlib reproduces the other files byte for byte, the SVGs included (fixed `svg.hashsalt`, no date). The
+tables mark which rows are nearest-rank percentiles from the benchmark client's summaries and which are arithmetic
+medians computed by `report.py`.
+
+## The Grill
+
+A separate speed comparison of the FG configuration (slots a and a2) against Q (slot b) with The Grill
+(`grill-perf 0.11.0`, `media compare`): overall INCONCLUSIVE (exit 2) because the model changes between slots by
+design, not because a capture failed; first audio and end-to-end PASS in short-07, medium-01 and long-01, duration
+ratio REGRESSION in short-07 and long-01 (the quant's audio 0.821 and 0.876 of the full model's length). It measures
+its own three cells and bounds, not output quality, and is not pooled into run-01. Numbers, claim scope and how it sits
+beside run-01's rows: `card-section.md`, section "Speed under The Grill". Only the comparison is here; the three
+captures hold prompts and audio and stay on the GPU host.
 
 ## Run history
 
@@ -46,5 +62,8 @@ for v in fq builtin; do
 done; wait
 cat runs/score-views/{fq,builtin}/scores.jsonl > runs/run-01/scores.jsonl
 cat runs/score-views/{fq,builtin}/pairs.jsonl > runs/run-01/pairs.jsonl
-bench/full-vs-quant/report.py runs/run-01 results/full-vs-quant-01
+bench/full-vs-quant/report.py runs/run-01 results/full-vs-quant-01 \
+  --grill GRILL_RESULTS/compare.json --grill-collector 'grill-perf 0.11.0' \
+  --grill-collector-sha256 4491eedb76d90215a7990b92419ad98c23667854805a1e175beb7ab105f7981a \
+  --grill-arms a=FG,b=Q,a2=FG
 ```
