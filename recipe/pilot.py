@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import socket
 import subprocess
@@ -20,6 +22,56 @@ HEADROOM = 30 * GIB
 STOP_MARGIN = 4 * GIB
 CGROUP_CAP = 54 * GIB
 CUDA_HOME = Path(os.environ.get('CUDA_HOME', '/usr/local/cuda'))
+RECIPE = Path(__file__).resolve().parent
+REPO = RECIPE.parent
+# What --weights chooses: the pinned checkpoint (a sources.json entry) and its local directory and pins, the engine
+# build scripts/build-engine.sh makes for it, and the serve flags it was measured with (results/full-vs-quant-01).
+WEIGHTS = {
+    'full': {'source': 'checkpoint', 'dir': 'drama-3', 'pins': 'checkpoint.sha256', 'build': 'tensorfold',
+             'serve': ()},
+    'nvfp4': {'source': 'nvfp4_checkpoint', 'dir': 'drama-3-NVFP4-Pruned', 'pins': 'nvfp4.sha256',
+              'build': 'tensorfold-nvfp4', 'serve': ('--cfg-gamma', '1.5', '--cfg-batched')},
+}
+# A serve flag after -- that sets guidance replaces the measured guidance flags as a whole.
+GUIDANCE_FLAGS = ('--cfg-gamma', '--cfg-allow-request-gamma', '--cfg-batched')
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as file:
+        for block in iter(lambda: file.read(1 << 24), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def fetch_checkpoint(choice: str) -> Path:
+    """The pinned checkpoint for --weights CHOICE: downloaded on first use, verified against its pins once."""
+    spec = WEIGHTS[choice]
+    source = json.loads((RECIPE / 'sources.json').read_text())[spec['source']]
+    target = REPO / spec['dir']
+    pins = RECIPE / 'checksums' / spec['pins']
+    stamp = target / '.recipe-verified'
+    pinned = pins.read_text()
+    if stamp.is_file() and stamp.read_text() == pinned:
+        return target
+    entries = [line.split(None, 1) for line in pinned.splitlines() if line.strip()]
+
+    def mismatched() -> list[str]:
+        return [name for digest, name in entries
+                if not (target / name).is_file() or sha256(target / name) != digest]
+
+    if mismatched():
+        hf = shutil.which('hf')
+        if hf is None:
+            raise SystemExit('pilot: the hf command is missing; install it with: python3 -m pip install -U huggingface_hub')
+        print(f'Downloading {source["repository"]} at {source["revision"][:8]} into {target}', flush=True)
+        subprocess.run([hf, 'download', source['repository'], '--revision', source['revision'],
+                        '--local-dir', str(target)], check=True)
+        if bad := mismatched():
+            raise SystemExit(f'pilot: {target} does not match {pins}: {", ".join(bad)}; delete it and run again')
+    stamp.write_text(pinned)
+    print(f'{target} matches {pins.relative_to(REPO)}', flush=True)
+    return target
 
 
 def memory_available() -> int:
@@ -31,13 +83,19 @@ def memory_available() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--weights', choices=tuple(WEIGHTS),
+                        help='Download (first run), verify and serve these pinned weights with the engine '
+                             'scripts/build-engine.sh --weights builds for them; nvfp4 also applies its measured '
+                             'guidance, --cfg-gamma 1.5 --cfg-batched, unless a guidance flag follows --')
     parser.add_argument('--backend', choices=('native', 'sglang-omni'), default='native')
-    parser.add_argument('--native-bin', type=Path, help='Patched tensorfold-native executable')
+    parser.add_argument('--native-bin', type=Path,
+                        help='tensorfold-native executable (default with --weights: its build in build/)')
     parser.add_argument('--library-dir', type=Path, action='append', default=[],
                         help='Isolated shared-library directory; may be repeated')
     parser.add_argument('--runtime-dir', type=Path, required=True,
                         help='Isolated runtime and cache directory')
-    parser.add_argument('--checkpoint', type=Path, required=True)
+    parser.add_argument('--checkpoint', type=Path,
+                        help='Checkpoint directory, verified beforehand (default with --weights: its download)')
     parser.add_argument('--gpu-lock', type=Path, required=True,
                         help='Existing lock file that every GPU workload on this host takes; never a second lock')
     parser.add_argument('--evidence-dir', type=Path, required=True)
@@ -48,23 +106,26 @@ def main() -> int:
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error('Port must be between 1 and 65535')
+    if args.weights is None and args.checkpoint is None:
+        parser.error('Pass --weights nvfp4 or --weights full, or --checkpoint DIR')
+    if args.weights == 'nvfp4' and args.backend != 'native':
+        parser.error('Only the native backend serves the NVFP4 weights')
     root = args.runtime_dir.resolve()
-    checkpoint = args.checkpoint.resolve()
+    checkpoint = (args.checkpoint or REPO / WEIGHTS[args.weights]['dir']).resolve()
     evidence = args.evidence_dir.resolve()
-    evidence.mkdir(parents=True, exist_ok=False)
-    weights = sum(p.stat().st_size for p in checkpoint.glob('*.safetensors'))
-    weights += (checkpoint / 'codec.pth').stat().st_size
-    if weights <= (checkpoint / 'codec.pth').stat().st_size:
-        parser.error('No backbone safetensors found')
     if args.backend == 'native':
-        if args.native_bin is None:
-            parser.error('The native backend requires --native-bin')
-        executable = args.native_bin.resolve()
+        if args.native_bin is None and args.weights is None:
+            parser.error('The native backend requires --native-bin, or --weights')
+        native_bin = args.native_bin or REPO / 'build' / WEIGHTS[args.weights]['build'] / 'zig-out/native/bin/tensorfold-native'
+        executable = native_bin.resolve()
+        serve_args = list(args.serve_args)
+        if args.weights and not any(a.split('=', 1)[0] in GUIDANCE_FLAGS for a in serve_args):
+            serve_args[:0] = WEIGHTS[args.weights]['serve']
         working_directory = root
         server_command = [str(executable), 'serve', str(checkpoint), '--host', '127.0.0.1',
                           '--port', str(args.port), '--name', 'fishaudio/drama-3',
                           '--context', '8192', '--parallel', '1', '--no-drafts',
-                          '--prompt-cache-gib', '0', '--keep-warm', '0', *args.serve_args]
+                          '--prompt-cache-gib', '0', '--keep-warm', '0', *serve_args]
         backend_environment = ['TENSORFOLD_MEMORY_RESERVE_GIB=34',
                                'TENSORFOLD_CUDA_MEMORY_LIMIT_GB=54']
         allocator_caps = {'tracked_cuda_and_pinned_host_buffers': 54}
@@ -82,7 +143,8 @@ def main() -> int:
         backend_environment = []
         allocator_caps = {'preprocessing': 4, 'tts_engine': 44, 'vocoder': 6}
     if not executable.is_file() or not os.access(executable, os.X_OK):
-        parser.error(f'Missing executable server: {executable}')
+        hint = f'; build it with scripts/build-engine.sh --weights {args.weights}' if args.weights and not args.native_bin else ''
+        parser.error(f'Missing executable server: {executable}{hint}')
     if args.library_dir:
         directories = [p.resolve() for p in args.library_dir]
         if any(not p.is_dir() for p in directories):
@@ -90,6 +152,13 @@ def main() -> int:
         backend_environment.append('LD_LIBRARY_PATH=' + ':'.join(map(str, directories)))
     if not args.gpu_lock.is_file():
         parser.error('The operator-specified shared GPU lock must already exist')
+    if args.checkpoint is None:
+        fetch_checkpoint(args.weights)
+    evidence.mkdir(parents=True, exist_ok=False)
+    weights = sum(p.stat().st_size for p in checkpoint.glob('*.safetensors'))
+    weights += (checkpoint / 'codec.pth').stat().st_size
+    if weights <= (checkpoint / 'codec.pth').stat().st_size:
+        parser.error('No backbone safetensors found')
 
     with args.gpu_lock.open('r+') as lock:
         try:
