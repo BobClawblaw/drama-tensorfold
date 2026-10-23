@@ -17,6 +17,7 @@ published; the JSON files keep the numbers exactly as measured.
 | [`native-voice-encoder.json`](native-voice-encoder.json) | The native voice encoder's codes, memory and time against the reference encoder's, and clones made from each |
 | [`clip-speaker-check.json`](clip-speaker-check.json) | The clip speaker check's calibration on model-invented voices and mixes of them: every case's split and decision |
 | [`silence-guard-floor.json`](silence-guard-floor.json) | The silence guard's -40 dBFS floor replayed over renders of the built-in and model-invented voices, and checked on whispered and soft speech |
+| [`full-vs-quant-01/`](full-vs-quant-01/README.md) | Full FP8 against the NVFP4 quant, with and without guidance and voice: size, speed, word error rate, failed takes, speaker similarity, and a model-card section |
 
 ## Speed stages
 

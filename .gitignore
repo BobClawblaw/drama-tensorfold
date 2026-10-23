@@ -6,6 +6,7 @@
 *.gguf
 checkpoint/
 drama-3/
+drama-3-NVFP4-Pruned/
 drama3-checkpoint/
 
 # Engine checkout and build output from scripts/build-engine.sh

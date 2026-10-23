@@ -10,7 +10,9 @@ TensorFold
 ----------
 The engine patches apply to TensorFold (https://github.com/ashhart/TensorFold), which is licensed under the
 Apache License, Version 2.0. scripts/build-engine.sh clones TensorFold at the commit pinned in engine/UPSTREAM
-and applies the patches with `git am`.
+and applies the patches with `git am`. With --weights nvfp4 it clones instead the TensorFold fork
+https://github.com/plotarmordev/TensorFold at the commit pinned in engine/nvfp4/UPSTREAM, also Apache-2.0, and
+applies no patches.
 
 The patches modify TensorFold files. They add opt-in serving features and Drama 3 fixes: new files under
 zig/src/server/, zig/src/core/, zig/src/native/, docs/ and tools/zig/, and changes to existing TensorFold files in
@@ -43,8 +45,9 @@ Fish Audio
 Built with Fish Audio.
 
 This repository contains no Fish Audio model weights and no codec checkpoint. Users download the Drama 3 weights
-and codec checkpoint separately from Hugging Face (https://huggingface.co/fishaudio/drama-3). Those files are
-licensed under the Fish Audio Community License, Version 1.0
+and codec checkpoint separately from Hugging Face (https://huggingface.co/fishaudio/drama-3), or the NVFP4 pruned
+derivative (https://huggingface.co/plotarmordev/drama-3-NVFP4-Pruned) that recipe/pilot.py downloads. Those
+files are licensed under the Fish Audio Community License, Version 1.0
 (https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE), not under this
 repository's license. Anyone who redistributes them must keep this attribution notice with them, as that
 license's Section IV(a) requires:
