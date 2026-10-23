@@ -82,6 +82,7 @@ are served without guidance. To use a voice, encode a clip of one you may use (y
 or one the model made) and serve it as the default, so a request that names no voice gets it:
 
 ```sh
+mkdir -p voices
 python3 build/tensorfold-nvfp4/tools/zig/drama_voice.py --native build/tensorfold-nvfp4/zig-out/native/bin/tensorfold-native \
   --checkpoint drama-3-NVFP4-Pruned --audio clip.wav --text clip.txt --out voices/NAME.json \
   --source-kind owner --source-note "my own voice, recorded 2026-10-23"
