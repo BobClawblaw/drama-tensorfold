@@ -4,13 +4,20 @@
 cleanly. It needs Linux, user systemd and Python 3 (standard library only).
 
 ```sh
-python3 recipe/pilot.py \
-  --native-bin build/tensorfold/zig-out/native/bin/tensorfold-native \
+python3 recipe/pilot.py --weights nvfp4 \
   --runtime-dir "$RUNTIME_DIR" \
-  --checkpoint "$CHECKPOINT_DIR" \
   --gpu-lock "$GPU_LOCK" \
   --evidence-dir "$EVIDENCE_DIR"
 ```
+
+`--weights nvfp4` or `--weights full` picks the pinned checkpoint, `checksums/nvfp4.sha256` or
+`checksums/checkpoint.sha256`, and its engine build in `build/tensorfold-nvfp4` or `build/tensorfold` from
+`scripts/build-engine.sh --weights …`. On first use the launcher downloads the checkpoint with `hf download` at the
+revision in `sources.json`, into `drama-3-NVFP4-Pruned/` or `drama-3/` at the repository root. Every start then
+hashes every pinned file and refuses, before it takes the GPU lock, if one is missing or changed. With `nvfp4` it adds
+`--cfg-gamma 1.5 --cfg-batched`, the guidance the quant was measured with, unless a `--cfg-gamma`,
+`--cfg-allow-request-gamma` or `--cfg-batched` of your own follows `--`. `--checkpoint` and `--native-bin` override
+the directory and the executable; without `--weights`, pass both, and nothing is downloaded or added.
 
 For the SGLang-Omni reference, replace `--native-bin …` with `--backend sglang-omni`. The reference also needs
 `venv/` (with `sgl-omni` installed) and an `sglang-omni/` checkout at the revision in `sources.json`, both inside
@@ -20,7 +27,7 @@ path. `CUDA_HOME` (default `/usr/local/cuda`) puts the toolkit's `bin/` on the s
 | Argument | Meaning |
 |---|---|
 | `--runtime-dir` | An existing working directory; holds every Hugging Face, Triton, TorchInductor, CUDA and FlashInfer cache |
-| `--checkpoint` | The downloaded `fishaudio/drama-3` directory; verify it with `checksums/checkpoint.sha256` first |
+| `--checkpoint` | A downloaded checkpoint directory, verified beforehand; with `--weights`, default its download |
 | `--gpu-lock` | The host's existing shared lock file, the one every GPU job on the machine takes, so two models never load at once. Only on a host without one, create it with `touch` and have the other GPU jobs take it too. |
 | `--evidence-dir` | New directory for `session.json`, `ready.json`, `memory.jsonl`, `server.log` and `completion.json` |
 | `--port` | Loopback port, default 18793 |
@@ -29,7 +36,7 @@ path. `CUDA_HOME` (default `/usr/local/cuda`) puts the toolkit's `bin/` on the s
 
 | Quantity | GiB |
 |---|---:|
-| Checkpoint weights plus codec, on disk (not runtime memory) | 38.63 |
+| Checkpoint weights plus codec, on disk (not runtime memory): full / NVFP4 | 38.63 / 20.76 |
 | Unit memory cap (`MemoryMax`), swap disabled | 54 |
 | Host headroom floor | 30 |
 | Abort threshold on `MemAvailable` | 34 |
@@ -67,4 +74,6 @@ rejects a byte budget. Its 44 GiB engine allocator cap is unchanged.
 - `reference/drama3-gb10.yaml`: the sglang-omni pipeline config used for every reference measurement.
 - `checksums/checkpoint.sha256`: SHA-256 of the codec, the eight weight shards and the tokenizer at checkpoint
   revision `e0a9218a`.
+- `checksums/nvfp4.sha256`: SHA-256 of the codec, the eight weight shards, their index, the configs and the
+  tokenizer files of `plotarmordev/drama-3-NVFP4-Pruned` at revision `494db084`.
 - `sources.json`: the pinned reference and checkpoint revisions.
