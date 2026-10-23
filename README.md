@@ -1,14 +1,29 @@
 # drama-tensorfold
 
-> [!IMPORTANT]
-> **Being tested.** The recipe now builds upstream TensorFold plus opt-in patches instead of the old patched engine.
-> An end-to-end comparison against the previous engine is running; this note goes once it completes.
-
 [![code: Apache-2.0](https://img.shields.io/badge/code-Apache--2.0-0969da?style=flat-square)](LICENSE)
 [![model: FACL v1.0](https://img.shields.io/badge/model-FACL_v1.0-8250df?style=flat-square)](https://huggingface.co/fishaudio/drama-3/blob/e0a9218aa48888270f06ef1ed9ea67622c0e17d2/LICENSE)
 [![GPU: GB10 sm_121](https://img.shields.io/badge/GPU-GB10_sm__121-76b900?style=flat-square)](#quickstart)
 [![CUDA 13](https://img.shields.io/badge/CUDA-13-76b900?style=flat-square)](#quickstart)
-[![status: being tested](https://img.shields.io/badge/status-being_tested-a16207?style=flat-square)](#the-patches)
+[![status: not yet compared](https://img.shields.io/badge/status-not_yet_compared-a16207?style=flat-square)](#the-patches)
+[![weights: NVFP4 recommended](https://img.shields.io/badge/weights-NVFP4_recommended-76b900?style=flat-square)](https://huggingface.co/plotarmordev/drama-3-NVFP4-Pruned)
+
+> [!TIP]
+> **We recommend the [NVFP4 pruned weights](https://huggingface.co/plotarmordev/drama-3-NVFP4-Pruned).** About half
+> the memory of the full model, with the same measured quality: 19.35 GiB peak GPU memory against 36.95 GiB, 20.76 GiB
+> on disk against 38.63 GiB, and a word error rate of 1.31 % against 1.42 % (paired difference -0.11 pp
+> [-0.35, +0.08], 0 failed takes of 96 on either). First audio arrives sooner, 1.955 s against 2.428 s at p50. The
+> trade-offs: a cold start takes 26.3 s against 5.9 s, and only 7,369 of the 10,240 routed experts are kept. Measured
+> on one GB10 over 24 English texts with a reference voice: [full model against quant](results/full-vs-quant-01/README.md).
+>
+> The quant runs on branch `drama-nvfp4` of [plotarmordev/TensorFold](https://github.com/plotarmordev/TensorFold),
+> not on the engine this recipe builds; follow its
+> [run guide](https://github.com/plotarmordev/TensorFold/blob/drama-nvfp4/docs/drama-3-nvfp4.md). Serve it with
+> guidance γ 1.5 and batched guidance (`--cfg-gamma 1.5 --cfg-batched`): that is how it was measured, and guidance
+> acts only on requests with a reference voice.
+>
+> **Built with Fish Audio.** The quant is a modified version of
+> [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3) under the Fish Audio Community License v1.0
+> ([License](#license)). The [Quickstart](#quickstart) below serves the full model, the alternative.
 
 **Fish Audio's Drama 3 text-to-speech on an NVIDIA GB10, on TensorFold's native Zig/CUDA engine.**
 
@@ -18,6 +33,11 @@ server with an OpenAI-style `/v1/audio/speech` route, whole or streamed.
 
 **Built with Fish Audio.** The model weights are not in this repository; you download them from
 [Hugging Face](https://huggingface.co/fishaudio/drama-3) under Fish Audio's own [license](#license).
+
+> [!NOTE]
+> The engine this recipe builds, upstream TensorFold plus the opt-in patches below, has no published end-to-end
+> comparison against the previous patched engine yet, and the [qualification gates](qualification/README.md) have
+> not been rerun on it: they measure the previous engine.
 
 ## Quickstart
 
