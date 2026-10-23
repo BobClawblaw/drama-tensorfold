@@ -15,51 +15,55 @@
 > trade-offs: a cold start takes 26.3 s against 5.9 s, and only 7,369 of the 10,240 routed experts are kept. Measured
 > on one GB10 over 24 English texts with a reference voice: [full model against quant](results/full-vs-quant-01/README.md).
 >
-> The quant runs on branch `drama-nvfp4` of [plotarmordev/TensorFold](https://github.com/plotarmordev/TensorFold),
-> not on the engine this recipe builds; follow its
-> [run guide](https://github.com/plotarmordev/TensorFold/blob/drama-nvfp4/docs/drama-3-nvfp4.md). Serve it with
-> guidance γ 1.5 and batched guidance (`--cfg-gamma 1.5 --cfg-batched`): that is how it was measured, and guidance
-> acts only on requests with a reference voice.
+> The [Quickstart](#quickstart) serves them with `--weights nvfp4`: it builds their engine, downloads the weights
+> on first run and applies the guidance they were measured with.
 >
 > **Built with Fish Audio.** The quant is a modified version of
 > [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3) under the Fish Audio Community License v1.0
-> ([License](#license)). The [Quickstart](#quickstart) below serves the full model, the alternative.
+> ([License](#license)). `--weights full` serves the full model, the alternative.
 
 **Fish Audio's Drama 3 text-to-speech on an NVIDIA GB10, on TensorFold's native Zig/CUDA engine.**
 
 [TensorFold](https://github.com/ashhart/TensorFold) runs Drama 3 natively since v1.1.0. This repository pins
-upstream TensorFold and adds a small series of opt-in patches. It builds the engine and starts a local speech
-server with an OpenAI-style `/v1/audio/speech` route, whole or streamed.
+upstream TensorFold and adds a small series of opt-in patches for the full model; for the NVFP4 weights it pins
+the TensorFold engine they were measured on. It builds the engine and starts a local speech server with an
+OpenAI-style `/v1/audio/speech` route, whole or streamed.
 
-**Built with Fish Audio.** The model weights are not in this repository; you download them from
-[Hugging Face](https://huggingface.co/fishaudio/drama-3) under Fish Audio's own [license](#license).
+**Built with Fish Audio.** The model weights are not in this repository; the launcher downloads them from
+[Hugging Face](https://huggingface.co/plotarmordev/drama-3-NVFP4-Pruned) under Fish Audio's own
+[license](#license).
 
 > [!NOTE]
-> The engine this recipe builds, upstream TensorFold plus the opt-in patches below, has no published end-to-end
-> comparison against the previous patched engine yet, and the [qualification gates](qualification/README.md) have
-> not been rerun on it: they measure the previous engine.
+> The full-model engine this recipe builds, upstream TensorFold plus the opt-in patches below, has no published
+> end-to-end comparison against the previous patched engine yet, and the
+> [qualification gates](qualification/README.md) have not been rerun on it: they measure the previous engine.
 
 ## Quickstart
 
-You need Linux with user systemd, CUDA 13, [Zig 0.17.0](https://ziglang.org/download/) and 88 GiB of free memory
-at load (the server is capped at 54 GiB). The checkpoint alone takes about 39 GiB of disk; the engine checkout,
-build and runtime caches need more.
+You need Linux with user systemd, CUDA 13, [Zig 0.17.0](https://ziglang.org/download/), the `hf` command
+(`python3 -m pip install -U huggingface_hub`) and 88 GiB of free memory at load (the server is capped at 54 GiB).
+The NVFP4 weights take about 21 GiB of disk, the full model about 39 GiB; the engine checkout, build and runtime
+caches need more.
 
 The launcher takes your host's shared GPU lock, the one every GPU job on the machine already uses, so two models
 never load at once. Set `GPU_LOCK` to that file. Only if the host has none, create one with `touch` and make
 your other GPU jobs use it too.
 
 ```sh
-hf download fishaudio/drama-3 --revision e0a9218aa48888270f06ef1ed9ea67622c0e17d2 --local-dir drama-3
-(cd drama-3 && sha256sum -c ../recipe/checksums/checkpoint.sha256)
-ZIG=/path/to/zig-0.17.0/zig NVCC=/usr/local/cuda/bin/nvcc scripts/build-engine.sh
+ZIG=/path/to/zig-0.17.0/zig NVCC=/usr/local/cuda/bin/nvcc scripts/build-engine.sh --weights nvfp4
 GPU_LOCK=/path/to/your/shared/gpu.lock && mkdir -p runtime
-python3 recipe/pilot.py --native-bin build/tensorfold/zig-out/native/bin/tensorfold-native \
-  --checkpoint drama-3 --runtime-dir runtime --gpu-lock "$GPU_LOCK" --evidence-dir runs/pilot-01
+python3 recipe/pilot.py --weights nvfp4 --runtime-dir runtime --gpu-lock "$GPU_LOCK" --evidence-dir runs/pilot-01
 ```
 
-`scripts/build-engine.sh` checks out the commit pinned in [`engine/UPSTREAM`](engine/UPSTREAM), applies
-[`engine/patches`](engine/patches) in order and builds `tensorfold-native` and `drama3-generate`.
+For the full model, write `--weights full` in both commands.
+
+The first start downloads the weights at the revision pinned in [`recipe/sources.json`](recipe/sources.json),
+into `drama-3-NVFP4-Pruned/` or `drama-3/`. Every start checks them against [`recipe/checksums`](recipe/checksums)
+and refuses missing or changed files; for the 21 GiB NVFP4 weights that takes about 11 seconds on a GB10.
+With `--weights nvfp4`, `scripts/build-engine.sh` builds the engine pinned in
+[`engine/nvfp4/UPSTREAM`](engine/nvfp4/UPSTREAM) and the launcher serves with guidance γ 1.5 and batched guidance,
+as measured; a `--cfg-gamma` of your own after `--` replaces both. With `--weights full` it checks out the commit
+pinned in [`engine/UPSTREAM`](engine/UPSTREAM) and applies [`engine/patches`](engine/patches) in order.
 
 When it prints `DRAMA_PILOT_READY`, synthesize from another terminal. The second command streams and plays as
 it arrives:
@@ -72,15 +76,35 @@ curl -sSN http://127.0.0.1:18793/v1/audio/speech -H 'Content-Type: application/j
   | aplay -q -f S16_LE -r 44100 -c 1
 ```
 
+### A reference voice
+
+The NVFP4 results above were measured with a reference voice; requests in the built-in voice, like the two above,
+are drawn without guidance, though their replies still say the server's γ in `X-Cfg-Gamma`. To use a voice, encode
+a clip of one you may use (your own, one recorded with consent, or one the model made) and serve it as the default,
+so a request that names no voice gets it:
+
+```sh
+mkdir -p voices
+python3 build/tensorfold-nvfp4/tools/zig/drama_voice.py --native build/tensorfold-nvfp4/zig-out/native/bin/tensorfold-native \
+  --checkpoint drama-3-NVFP4-Pruned --audio clip.wav --text clip.txt --out voices/NAME.json \
+  --source-kind owner --source-note "my own voice, recorded 2026-10-23"
+python3 recipe/pilot.py --weights nvfp4 --runtime-dir runtime --gpu-lock "$GPU_LOCK" --evidence-dir runs/pilot-02 \
+  -- --voices "$PWD/voices" --default-voice NAME
+```
+
+`clip.txt` holds the clip's exact words. Encode while no model holds the GPU. The voice file format and the
+encoder's options are in `build/tensorfold-nvfp4/docs/drama-voices.md`.
+
 ### Try it with your coding agent
 
 ```text
 Help me run Fish Audio Drama 3 locally with https://github.com/plotarmordev/drama-tensorfold on this GB10.
 Read its README, recipe/README.md and the Fish Audio Community License first, and follow them.
 
-1. Check the requirements: CUDA 13 with nvcc, Zig 0.17.0, user systemd, disk space and free memory.
-2. Download fishaudio/drama-3 at the pinned revision and verify recipe/checksums/checkpoint.sha256.
-3. Build the engine with scripts/build-engine.sh and start it with recipe/pilot.py on loopback.
+1. Check the requirements: CUDA 13 with nvcc, Zig 0.17.0, the hf command, user systemd, disk space and free
+   memory.
+2. Build the engine with scripts/build-engine.sh --weights nvfp4.
+3. Start it with recipe/pilot.py --weights nvfp4 on loopback; the first start downloads and verifies the weights.
 4. Synthesize one sentence as WAV, then stream it, and tell me the X-Finish-Reason header.
 
 Ask me which GPU lock file this host already uses before starting, and before stopping anything already
@@ -94,6 +118,9 @@ the license's Section III(c), which needs a separate license from Fish Audio.
 `POST /v1/audio/speech` takes `model` (`fishaudio/drama-3`), `input` (at most 4096 characters), `voice`
 (`default`, or a name loaded with `--voices`), `response_format` (`wav` or `pcm`) and `stream` (`true` needs
 `pcm`). Request-supplied references and other synthesis modifiers are refused. `GET /v1/voices` lists the voices.
+With `--weights nvfp4`, `--voices` takes the `drama3-voice` files its encoder writes, a request may also send its
+own `references` as codec codes (audio is refused), and every reply carries the server's γ in an `X-Cfg-Gamma`
+header, though only a request with a voice is drawn with guidance.
 
 - **Whole reply:** `Content-Length` framing and an `X-Finish-Reason` header: `stop`, `length` or, with the silence
   guard on, `silence`.
@@ -106,11 +133,11 @@ the license's Section III(c), which needs a separate license from Fish Audio.
 
 ## The patches
 
-Upstream TensorFold already serves Drama 3. Each patch below adds one feature that stays off until you pass its
-flag, so a server started without them answers as upstream does. The exceptions are the first two: batched
-prefill is on by default (`TF_DRAMA_PREFILL_ROWS=1` restores upstream's single-row prefill) and the replay fix is
-a bug fix. The patches stack and apply in order; each one's notes are in the engine tree's `CHANGELOG.md` or
-`docs/`.
+The patches build the full-model engine (`--weights full`). Upstream TensorFold already serves Drama 3. Each patch
+below adds one feature that stays off until you pass its flag, so a server started without them answers as
+upstream does. The exceptions are the first two: batched prefill is on by default (`TF_DRAMA_PREFILL_ROWS=1`
+restores upstream's single-row prefill) and the replay fix is a bug fix. The patches stack and apply in order;
+each one's notes are in the engine tree's `CHANGELOG.md` or `docs/`.
 
 | Patch | Adds | Opt in with | Upstream |
 |---|---|---|---|
