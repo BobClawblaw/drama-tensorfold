@@ -13,8 +13,8 @@ python3 recipe/pilot.py --weights nvfp4 \
 `--weights nvfp4` or `--weights full` picks the pinned checkpoint, `checksums/nvfp4.sha256` or
 `checksums/checkpoint.sha256`, and its engine build in `build/tensorfold-nvfp4` or `build/tensorfold` from
 `scripts/build-engine.sh --weights …`. On first use the launcher downloads the checkpoint with `hf download` at the
-revision in `sources.json`, into `drama-3-NVFP4-Pruned/` or `drama-3/` at the repository root, verifies every
-pinned file and records that in `.recipe-verified`, so later starts skip the check. With `nvfp4` it adds
+revision in `sources.json`, into `drama-3-NVFP4-Pruned/` or `drama-3/` at the repository root. Every start then
+hashes every pinned file and refuses, before it takes the GPU lock, if one is missing or changed. With `nvfp4` it adds
 `--cfg-gamma 1.5 --cfg-batched`, the guidance the quant was measured with, unless a `--cfg-gamma`,
 `--cfg-allow-request-gamma` or `--cfg-batched` of your own follows `--`. `--checkpoint` and `--native-bin` override
 the directory and the executable; without `--weights`, pass both, and nothing is downloaded or added.

@@ -58,7 +58,8 @@ python3 recipe/pilot.py --weights nvfp4 --runtime-dir runtime --gpu-lock "$GPU_L
 For the full model, write `--weights full` in both commands.
 
 The first start downloads the weights at the revision pinned in [`recipe/sources.json`](recipe/sources.json),
-into `drama-3-NVFP4-Pruned/` or `drama-3/`, and checks them against [`recipe/checksums`](recipe/checksums).
+into `drama-3-NVFP4-Pruned/` or `drama-3/`. Every start checks them against [`recipe/checksums`](recipe/checksums)
+and refuses missing or changed files; for the 21 GiB NVFP4 weights that takes about 11 seconds on a GB10.
 With `--weights nvfp4`, `scripts/build-engine.sh` builds the engine pinned in
 [`engine/nvfp4/UPSTREAM`](engine/nvfp4/UPSTREAM) and the launcher serves with guidance γ 1.5 and batched guidance,
 as measured; a `--cfg-gamma` of your own after `--` replaces both. With `--weights full` it checks out the commit
@@ -78,8 +79,9 @@ curl -sSN http://127.0.0.1:18793/v1/audio/speech -H 'Content-Type: application/j
 ### A reference voice
 
 The NVFP4 results above were measured with a reference voice; requests in the built-in voice, like the two above,
-are served without guidance. To use a voice, encode a clip of one you may use (your own, one recorded with consent,
-or one the model made) and serve it as the default, so a request that names no voice gets it:
+are drawn without guidance, though their replies still say the server's γ in `X-Cfg-Gamma`. To use a voice, encode
+a clip of one you may use (your own, one recorded with consent, or one the model made) and serve it as the default,
+so a request that names no voice gets it:
 
 ```sh
 mkdir -p voices
@@ -117,7 +119,8 @@ the license's Section III(c), which needs a separate license from Fish Audio.
 (`default`, or a name loaded with `--voices`), `response_format` (`wav` or `pcm`) and `stream` (`true` needs
 `pcm`). Request-supplied references and other synthesis modifiers are refused. `GET /v1/voices` lists the voices.
 With `--weights nvfp4`, `--voices` takes the `drama3-voice` files its encoder writes, a request may also send its
-own `references` as codec codes (audio is refused), and a guided reply carries an `X-Cfg-Gamma` header.
+own `references` as codec codes (audio is refused), and every reply carries the server's γ in an `X-Cfg-Gamma`
+header, though only a request with a voice is drawn with guidance.
 
 - **Whole reply:** `Content-Length` framing and an `X-Finish-Reason` header: `stop`, `length` or, with the silence
   guard on, `silence`.

@@ -45,32 +45,27 @@ def sha256(path: Path) -> str:
 
 
 def fetch_checkpoint(choice: str) -> Path:
-    """The pinned checkpoint for --weights CHOICE: downloaded on first use, verified against its pins once."""
+    """The pinned checkpoint for --weights CHOICE: downloaded on first use, checked against its pins on every start."""
     spec = WEIGHTS[choice]
     source = json.loads((RECIPE / 'sources.json').read_text())[spec['source']]
     target = REPO / spec['dir']
     pins = RECIPE / 'checksums' / spec['pins']
-    stamp = target / '.recipe-verified'
-    pinned = pins.read_text()
-    if stamp.is_file() and stamp.read_text() == pinned:
-        return target
-    entries = [line.split(None, 1) for line in pinned.splitlines() if line.strip()]
-
-    def mismatched() -> list[str]:
-        return [name for digest, name in entries
-                if not (target / name).is_file() or sha256(target / name) != digest]
-
-    if mismatched():
+    entries = [line.split(None, 1) for line in pins.read_text().splitlines() if line.strip()]
+    if not target.exists():
         hf = shutil.which('hf')
         if hf is None:
             raise SystemExit('pilot: the hf command is missing; install it with: python3 -m pip install -U huggingface_hub')
         print(f'Downloading {source["repository"]} at {source["revision"][:8]} into {target}', flush=True)
         subprocess.run([hf, 'download', source['repository'], '--revision', source['revision'],
                         '--local-dir', str(target)], check=True)
-        if bad := mismatched():
-            raise SystemExit(f'pilot: {target} does not match {pins}: {", ".join(bad)}; delete it and run again')
-    stamp.write_text(pinned)
-    print(f'{target} matches {pins.relative_to(REPO)}', flush=True)
+    print(f'Checking {target} against {pins.relative_to(REPO)}', flush=True)
+    started = time.monotonic()
+    bad = [name for digest, name in entries if not (target / name).is_file() or sha256(target / name) != digest]
+    if bad:
+        raise SystemExit(f'pilot: {target} does not match {pins}: {", ".join(bad)} missing or changed; no model was '
+                         f'started. Repair it with: hf download {source["repository"]} --revision '
+                         f'{source["revision"]} --local-dir {target}, or delete it and run again')
+    print(f'{target} matches {pins.relative_to(REPO)} ({time.monotonic() - started:.0f} s)', flush=True)
     return target
 
 
